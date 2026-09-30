@@ -40,7 +40,7 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
     const v: string[] = (e.value || []).filter(Boolean);
     if (v.length && !handled) cb(v);
     handled = false;
-    schedule(250);                                   // restart only now: the result has been delivered
+    schedule(120);                                   // restart only now: the result has been delivered
   };
   Voice.onSpeechEnd = () => {                        // the result normally follows within a moment; if it never comes, restart anyway
     clearTimeout(guard);
@@ -52,7 +52,7 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
     const quiet = code === 6 || code === 7;          // timeout / nothing heard: normal while silent
     if (!quiet) errs++;
     try { await Voice.cancel(); } catch {}
-    schedule(quiet ? 250 : Math.min(900 + errs * 600, 6000));
+    schedule(quiet ? 100 : Math.min(600 + errs * 400, 3000));
   };
   notify(true);
   begin();
