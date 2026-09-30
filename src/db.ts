@@ -187,6 +187,42 @@ async function findTopicIn(d: DB, q: string, chatId: number, exact: boolean): Pr
   return none([...new Set([...dec.options, ...ranked.slice(0, 3).map((x) => x.name)])].slice(0, 3));
 }
 
+// Best source excerpts for a QUESTION (this chat's sources only; MCQ / question chunks are never used)
+export const searchSources = (q: string, chatId: number, limit = 3) => run(async (d) => {
+  const out: { name: string; body: string }[] = [];
+  const toks = queryTokens(q);
+  if (!toks.length || !chatId) return out;
+  const ex = expandAbbr(toks);
+  const ftsToks = [...new Set([...toks, ...ex].filter((t) => t.length >= 3))];
+  if (!ftsToks.length) return out;
+  let rows: Row[] = [];
+  try {
+    rows = await d.getAllAsync<Row>(
+      `SELECT fts.topic_id AS topic_id, t.name AS name FROM fts JOIN topics t ON t.id = fts.topic_id JOIN sources s ON s.id = t.source_id
+       WHERE fts MATCH ? AND s.chat_id = ? AND s.status = 'ready' ORDER BY bm25(fts,10.0,1.0) LIMIT 12`, [ftsToks.map((t) => `"${t}"*`).join(' OR '), chatId]);
+  } catch {}
+  const gq = gramQuery(ftsToks);
+  if (triOk && gq) {
+    try {
+      rows = rows.concat(await d.getAllAsync<Row>(
+        `SELECT fts_tri.topic_id AS topic_id, t.name AS name FROM fts_tri JOIN topics t ON t.id = fts_tri.topic_id JOIN sources s ON s.id = t.source_id
+         WHERE fts_tri MATCH ? AND s.chat_id = ? AND s.status = 'ready' ORDER BY bm25(fts_tri,20.0,1.0) LIMIT 12`, [gq, chatId]));
+    } catch {}
+  }
+  const seen = new Set<number>();
+  for (const r of rows) {
+    if (out.length >= limit) break;
+    if (seen.has(r.topic_id) || isQuestionName(r.name)) continue;
+    seen.add(r.topic_id);
+    const one = await d.getFirstAsync<{ name: string; body: string }>('SELECT name, body FROM topics WHERE id=?', [r.topic_id]);
+    if (!one || isQuestionBody(one.body)) continue;
+    const text = stripQuestions(focus(one.body, ex).body);
+    if (text.length < 30 || isQuestionBody(text)) continue;
+    out.push({ name: isJunkHeading(one.name) ? 'Source' : one.name, body: text });
+  }
+  return out;
+});
+
 const NOTES_V = 3;   // bump when the notes format changes: old cached notes are rebuilt
 // mode 'llm' wants smart notes for the same marks; mode 'rule' accepts whatever is cached
 export const getNotes = (topicId: number, mode: 'rule' | 'llm' = 'rule', marks = 5): Promise<Point[] | null> => run(async (d) => {
