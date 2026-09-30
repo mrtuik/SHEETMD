@@ -1,5 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 import type { Point } from './notes';
+import { norm, excerpt } from './mdsplit';
 
 let _db: SQLite.SQLiteDatabase | null = null;
 export async function db() {
@@ -26,12 +27,12 @@ export async function addSource(name: string, type: string, status = 'ready', in
 export async function updateSource(id: number, status: string, info: string) {
   await (await db()).runAsync('UPDATE sources SET status=?, info=? WHERE id=?', [status, info, id]);
 }
-export async function addTopics(sourceId: number, topics: { name: string; body: string }[]) {
+export async function addTopics(sourceId: number, topics: { name: string; body: string; own?: string }[]) {
   const d = await db();
   await d.withTransactionAsync(async () => {
     for (const t of topics) {
       const r = await d.runAsync('INSERT INTO topics(source_id,name,body) VALUES(?,?,?)', [sourceId, t.name, t.body]);
-      await d.runAsync('INSERT INTO fts(name,body,topic_id) VALUES(?,?,?)', [t.name, t.body, r.lastInsertRowId]);
+      await d.runAsync('INSERT INTO fts(name,body,topic_id) VALUES(?,?,?)', [norm(t.name), norm(t.own ?? t.body), r.lastInsertRowId]);
     }
   });
 }
@@ -49,31 +50,46 @@ export async function removeSource(id: number) {
   });
 }
 
-// FR-2/FR-4: search across all sources; same-name topics from different books are merged
+// FR-2/FR-4: search across all sources. Topics whose NAME has every query word win; otherwise body match.
 export async function findTopic(q: string) {
   const d = await db();
-  const toks = q.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+  const toks = norm(q).match(/[\p{L}\p{N}]+/gu) || [];
   if (!toks.length) return null;
   const match = toks.map((t) => `"${t}"*`).join(' OR ');
   const rows = await d.getAllAsync<{ topic_id: number; name: string }>(
-    'SELECT topic_id, name FROM fts WHERE fts MATCH ? ORDER BY bm25(fts,10.0,1.0) LIMIT 6', [match]);
+    'SELECT fts.topic_id AS topic_id, t.name AS name FROM fts JOIN topics t ON t.id = fts.topic_id WHERE fts MATCH ? ORDER BY bm25(fts,10.0,1.0) LIMIT 30', [match]);
   if (!rows.length) {
     const alts = await d.getAllAsync<{ name: string }>(
       'SELECT DISTINCT name FROM topics WHERE name LIKE ? LIMIT 3', [`%${toks[0].slice(0, 3)}%`]);
     return { id: 0, name: '', body: '', alts: alts.map((a) => a.name), found: false };
   }
+  const hit = (n: string) => toks.filter((t) => norm(n).includes(t)).length;
+  rows.sort((a, b) => {
+    const x = hit(a.name), y = hit(b.name);
+    if (x !== y) return y - x;
+    return x === toks.length ? a.name.length - b.name.length : 0;
+  });
   const best = rows[0];
-  const same = await d.getAllAsync<{ body: string }>('SELECT body FROM topics WHERE lower(name)=lower(?)', [best.name]);
   const alts = [...new Set(rows.map((r) => r.name).filter((n) => n.toLowerCase() !== best.name.toLowerCase()))].slice(0, 3);
-  return { id: best.topic_id, name: best.name, body: same.map((s) => s.body).join('\n'), alts, found: true };
+  const same = await d.getAllAsync<{ body: string }>('SELECT body FROM topics WHERE lower(name)=lower(?)', [best.name]);
+  const body = same.map((s) => s.body).join('\n');
+  if (hit(best.name) < toks.length) {            // matched through the text of a big file: read only the relevant part
+    const ex = excerpt(body, toks);
+    if (ex) return { id: 0, name: ex.name, body: ex.body, alts, found: true };   // id 0 = do not cache
+  }
+  return { id: best.topic_id, name: best.name, body, alts, found: true };
 }
 
+const NOTES_V = 2;   // bump when the notes format changes: old cached notes are rebuilt
 export async function getNotes(topicId: number): Promise<Point[] | null> {
+  if (!topicId) return null;
   const r = await (await db()).getFirstAsync<{ points_json: string }>('SELECT points_json FROM notes WHERE topic_id=?', [topicId]);
-  return r ? JSON.parse(r.points_json) : null;
+  if (!r) return null;
+  try { const j = JSON.parse(r.points_json); return j && j.v === NOTES_V ? j.pts : null; } catch { return null; }
 }
 export async function saveNotes(topicId: number, pts: Point[]) {
-  await (await db()).runAsync('INSERT OR REPLACE INTO notes VALUES(?,?,?)', [topicId, JSON.stringify(pts), Date.now()]);
+  if (!topicId) return;
+  await (await db()).runAsync('INSERT OR REPLACE INTO notes VALUES(?,?,?)', [topicId, JSON.stringify({ v: NOTES_V, pts }), Date.now()]);
 }
 export async function topicName(id: number) {
   const r = await (await db()).getFirstAsync<{ name: string }>('SELECT name FROM topics WHERE id=?', [id]);
