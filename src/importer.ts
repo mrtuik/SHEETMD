@@ -95,7 +95,7 @@ async function importOne(a: { name: string; uri: string }, say: Say): Promise<{ 
   throw new Error('Unsupported file type');
 }
 
-export async function pickAndImport(onChange: () => void): Promise<string | void> {
+export async function pickAndImport(onChange: () => void, chatId: number): Promise<string | void> {
   let res: Awaited<ReturnType<typeof DocumentPicker.getDocumentAsync>>;
   try { res = await DocumentPicker.getDocumentAsync({ type: '*/*', multiple: true, copyToCacheDirectory: true }); }
   catch (e: any) { throw new Error('file picker: ' + (e?.message || e)); }
@@ -105,7 +105,7 @@ export async function pickAndImport(onChange: () => void): Promise<string | void
     const k = kindOf(a.name);
     if (!k) { done.push(`${a.name}: unsupported type`); continue; }
     let id: number;
-    try { id = await addSource(a.name, k, 'indexing', 'starting'); }
+    try { id = await addSource(a.name, k, 'indexing', 'starting', chatId); }
     catch (e: any) { throw new Error('database: ' + (e?.message || e)); }
     onChange();
     const say: Say = async (s) => { await updateSource(id, 'indexing', s); onChange(); };
