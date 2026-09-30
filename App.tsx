@@ -1,19 +1,20 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Modal, StyleSheet, ScrollView, Pressable, Switch,
-  Platform, PermissionsAndroid, StatusBar, Linking, Image, Keyboard, Alert,
+  Platform, PermissionsAndroid, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
-import { parse } from './src/commands';
-import { makeNotes } from './src/notes';
+import { parse, OK_END, CANCEL_Q } from './src/commands';
+import { makeNotes, Point } from './src/notes';
 import * as R from './src/reader';
 import {
-  findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck,
+  findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
   listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
 } from './src/db';
-import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, splitMarks, MODELS } from './src/llm';
+import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, splitMarks, MODELS, Basis } from './src/llm';
+import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
 import { startListening, stopListening } from './src/listener';
@@ -27,7 +28,9 @@ const CHOICE = '\u2063C\u2063';                 // hidden marker: this reply is 
 const C = { bg: '#FFFFFF', surf: '#F6F6F5', bd: '#E4E4E2', tx: '#0A0A0A', sec: '#737373', acc: '#0A0A0A', on: '#4338ca', ok: '#16a34a', bad: '#dc2626', dis: '#EDEDEB', disI: '#A3A3A3' };
 const LANG_LABEL = { auto: 'Auto', en: 'English', bn: 'Bangla' } as const;
 const COMMANDS: [string, string][] = [
-  ['topic <name>', 'Say the topic, then read it point by point'],
+  ['topic <name>', 'Read that topic from your sources, point by point'],
+  ['explain <name>', 'Explain it from my own knowledge + web (not your sources)'],
+  ['question ... okay', 'Say "question", then your full question, then "okay": I think, use your sources, add my own knowledge'],
   ['pause  /  continue', 'Hold, or carry on from the same sentence'],
   ['next  /  previous', 'Jump to the next or earlier point'],
   ['repeat  /  repeat 3', 'Read this point (or point 3) again'],
@@ -45,6 +48,8 @@ export default function App() {
 
 function Main() {
   const ins = useSafeAreaInsets();
+  const { height: winH } = useWindowDimensions();
+  const sheetMax = Math.max(220, Math.round(winH * 0.88) - 150 - ins.bottom);   // scroll area of a bottom sheet: real pixels, so it always scrolls to the end
   const rootRef = useRef<View>(null);
   const [kbPad, setKbPad] = useState(0);
   useEffect(() => {
@@ -69,7 +74,9 @@ function Main() {
   const [renaming, setRenaming] = useState<Chat | null>(null);
   const [renameText, setRenameText] = useState('');
   const [smart, setSmartOn] = useState(true);
-  const [making, setMaking] = useState(false);
+  const [working, setWorking] = useState('');
+  const [asking, setAsking] = useState(false);
+  const qRef = useRef<{ parts: string[]; timer: any } | null>(null);   // a spoken question being dictated (ends with "okay")
   const choicesRef = useRef<string[] | null>(null);        // the 3 options waiting for a tap / "one, two, three"
   const choiceMarks = useRef(5);
   const choiceSpeaking = useRef(false);
@@ -214,9 +221,9 @@ function Main() {
     if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
     let pts = await getNotes(f.id, useLlm ? 'llm' : 'rule', sm.marks);   // id 0 (part of a big file) is never cached
     if (!pts && useLlm) {
-      makingRef.current = true; setMaking(true);
+      makingRef.current = true; setWorking('Writing notes…');
       const r = await llmNotes(f.name, f.body, sm.marks).catch(() => ({ pts: null, notInSource: false }));
-      makingRef.current = false; setMaking(false);
+      makingRef.current = false; setWorking('');
       if (r.notInSource) { notFound(f.alts); return; }                   // the model found nothing about it in the source
       if (r.pts) { pts = r.pts; await saveNotes(f.id, pts, 'llm', sm.marks); }
     }
@@ -226,9 +233,95 @@ function Main() {
     push('app', TOPIC + f.name);
     R.startTopic(f.id, f.name, pts);
   };
+  // ---------------------------------------------------------------------------------------------------------------
+  // explain <topic>: the model's OWN knowledge (+ a web lookup). Sources are NOT used.
+  const explainTopic = async (qRaw: string) => {
+    if (makingRef.current) { push('app', 'Still writing, one moment.'); return; }
+    const sm = splitMarks(qRaw);
+    const name = sm.q.trim();
+    if (!name) { push('app', 'Say or type: explain <topic name>'); return; }
+    makingRef.current = true; setWorking('Explaining…');
+    try {
+      const useLlm = smart && llm.phase === 'ready';
+      if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
+      const web = await wikiLookup(name).catch(() => null);
+      let pts: Point[] | null = null;
+      let label = '';
+      if (useLlm) {
+        pts = await llmExplain(name, sm.marks, web?.text || '');
+        label = web ? 'Explained from my own knowledge + the web (not from your sources)' : 'Explained from my own knowledge (not from your sources)';
+      }
+      if (!pts && web) { pts = makeNotes(web.title, web.text); label = 'From the web (Wikipedia). The smart model is not ready yet'; }
+      if (!pts) { push('app', 'I cannot explain this now: no internet, and the smart model is not downloaded (Settings > Smart notes).'); return; }
+      rowY.current = {}; cardY.current = null;
+      push('app', label);
+      const nm = 'Explain: ' + name;
+      push('app', TOPIC + nm);
+      R.startTopic(0, nm, pts, `Explaining ${name}. ${pts.length} points.`);
+    } finally { makingRef.current = false; setWorking(''); }
+  };
+
+  // A question (spoken "question ... okay", or anything typed): think, use the sources where they fit, add own knowledge
+  const answerQuestion = async (q: string) => {
+    if (makingRef.current) { push('app', 'Still writing, one moment.'); return; }
+    makingRef.current = true; setWorking('Thinking…');
+    try {
+      const chunks = await searchSources(q, chatRef.current, 3).catch(() => []);
+      const useLlm = smart && llm.phase === 'ready';
+      if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
+      let pts: Point[] | null = null;
+      let basis: Basis = 'own';
+      if (useLlm) { const r = await llmAnswer(q, chunks); pts = r.pts; basis = r.basis; }
+      let label = basis === 'source' ? 'Answer from your sources'
+        : basis === 'mixed' ? 'Answer: your sources + my own knowledge'
+        : 'Not in your sources. Answered from my own knowledge';
+      if (!pts && chunks.length) { pts = makeNotes(chunks[0].name, chunks[0].body); label = 'The smart model is not ready. Closest part of your sources'; }
+      if (!pts) {
+        const w = await wikiLookup(q).catch(() => null);
+        if (w) { pts = makeNotes(w.title, w.text); label = 'Nothing in your sources. From the web (Wikipedia)'; }
+      }
+      if (!pts) { push('app', 'I could not answer: nothing in your sources, and the smart model is not downloaded (Settings > Smart notes).'); return; }
+      rowY.current = {}; cardY.current = null;
+      push('app', label);
+      const nm = 'Answer: ' + (q.length > 60 ? q.slice(0, 57) + '...' : q);
+      push('app', TOPIC + nm);
+      R.startTopic(0, nm, pts, `Answer. ${pts.length} points.`);
+    } finally { makingRef.current = false; setWorking(''); }
+  };
+
+  // spoken question: "question" -> say the whole question -> "okay"
+  const endQ = () => { if (qRef.current) clearTimeout(qRef.current.timer); qRef.current = null; setAsking(false); };
+  const armQ = () => {
+    if (!qRef.current) return;
+    clearTimeout(qRef.current.timer);
+    qRef.current.timer = setTimeout(() => { if (qRef.current) { endQ(); push('app', 'Question cancelled (nothing heard for a while).'); } }, 90000);
+  };
+  const feedQuestion = (raw: string) => {
+    const q = qRef.current; if (!q) return;
+    const t = raw.trim();
+    if (CANCEL_Q.test(t.replace(/[.!?।,]+$/, ''))) { endQ(); push('app', 'Question cancelled.'); return; }
+    const done = OK_END.test(t);
+    const part = t.replace(OK_END, '').trim();
+    if (part) { q.parts.push(part); push('you', part); }
+    armQ();
+    if (done) {
+      const full = q.parts.join(' ').trim();
+      endQ();
+      if (full) answerQuestion(full); else push('app', 'I did not hear a question. Say "question" and try again.');
+    }
+  };
+  const startQuestion = (rest?: string) => {
+    follow.current = true;
+    try { R.pause(); } catch {}
+    qRef.current = { parts: [], timer: null }; setAsking(true);
+    push('app', 'Say your full question, then say "okay".');
+    armQ();
+    if (rest) feedQuestion(rest);
+  };
+
   const pickName = async (nm: string) => { choicesRef.current = null; await openTopic(nm, true, choiceMarks.current); };
 
-  const exec = async (text: string) => {
+  const exec = async (text: string, via: 'voice' | 'text' = 'voice') => {
     if (!text.trim()) return;
     const c = parse(text);
     follow.current = true;
@@ -243,15 +336,23 @@ function Main() {
       case 'slower': R.setRate(-0.1); break;
       case 'faster': R.setRate(0.1); break;
     }
+    if (c.t === 'question' && via === 'voice') { startQuestion(c.q); return; }
     push('you', text);
     if (c.t === 'topic') await openTopic(c.q);
+    else if (c.t === 'explain') await explainTopic(c.q);
+    else if (c.t === 'question') { if (c.q) await answerQuestion(c.q); else push('app', 'Type your question and send it.'); }
     else if (c.t === 'pick') {
       const names = choicesRef.current;
       if (!names || !names[c.n - 1]) push('app', 'Nothing to choose.');
       else await pickName(names[c.n - 1]);
-    } else if (c.t === 'unknown') push('app', 'Try: topic <name>, pause, next, repeat 2, continue.');
+    } else if (c.t === 'unknown') {
+      // typed text is a normal chat: answered from your sources + the model's own knowledge.
+      // (Spoken words that are not a command are ignored, so talking nearby never triggers anything.)
+      if (via === 'text') await answerQuestion(text);
+      else push('app', 'Try: topic <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
+    }
   };
-  const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t); };
+  const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t, 'text'); };
 
   const addFiles = async () => {
     setBusy(true);
@@ -263,22 +364,30 @@ function Main() {
   execRef.current = exec;
   // Mic stays on; only real commands are accepted, and anything the app is itself speaking is ignored
   const heardSelf = (t: string) => R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim());
-  const onVoice = (t: string) => {
-    const c = parse(t);
-    if (c.t === 'unknown') return;
+  const onVoice = (alts: string[]) => {
+    if (!alts.length || choiceSpeaking.current) return;
+    if (qRef.current) { feedQuestion(alts[0]); return; }          // dictating a question: everything is part of it until "okay"
+    let t = alts[0];
+    let c = parse(t);
+    if (c.t === 'unknown') {                                      // the recognizer's 2nd-5th guesses: only for "say a name" commands
+      const a = alts.slice(1).find((x) => ['topic', 'explain', 'question'].includes(parse(x).t));
+      if (!a) return;
+      t = a; c = parse(a);
+    }
     if (c.t === 'pick' && !choicesRef.current) return;             // "one / two" only means something while options are waiting
-    if (choiceSpeaking.current || heardSelf(t)) return;
+    if (heardSelf(t)) return;
     execRef.current(t);
   };
   // one-word playback commands run the moment they are heard (no waiting for the recognizer to finish)
   const FAST = new Set(['pause', 'stop', 'next', 'prev', 'continue', 'slower', 'faster']);
   const onPartial = (t: string) => {
+    if (qRef.current) return false;                                // never while a question is being dictated
     if (!FAST.has(parse(t).t) || choiceSpeaking.current || heardSelf(t)) return false;
     execRef.current(t);
     return true;
   };
   const mic = async () => {
-    if (listening) { await stopListening(); return; }
+    if (listening) { endQ(); await stopListening(); return; }
     const g = await PermissionsAndroid.request('android.permission.RECORD_AUDIO' as any);
     if (g !== 'granted') return;
     const ok = await startListening(onVoice, () => (R.state.lang === 'bn' ? 'bn-BD' : 'en-US'), setListening, onPartial);
@@ -388,7 +497,7 @@ function Main() {
         <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
         <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
       </View>
-      <View style={st.chip}><Text style={st.sub}>{making ? 'Writing notes…' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? '  •  listening' : ''}</Text></View>
+      <View style={st.chip}><Text style={st.sub}>{working ? working : asking ? 'Listening to your question · say okay when done' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? '  •  listening' : ''}</Text></View>
 
       <ScrollView
         ref={list} style={{ flex: 1 }} contentContainerStyle={{ padding: 16, gap: 12 }}
@@ -404,7 +513,7 @@ function Main() {
       <View style={[st.dock, { paddingBottom: kbPad > 0 ? 10 : ins.bottom + 12 }]}>
         <View style={st.box}>
           <TextInput style={st.boxInput} value={input} onChangeText={setInput} multiline
-            placeholder="Type or speak · e.g. topic anemia" placeholderTextColor="#8A8A8A" />
+            placeholder="Ask anything · or: topic anemia, explain anemia" placeholderTextColor="#8A8A8A" />
           <View style={st.boxRow}>
             <TouchableOpacity style={st.boxPlus} onPress={() => setShowSrc(true)}><Icon n="plus" size={24} /></TouchableOpacity>
             <View style={{ flex: 1 }} />
@@ -483,7 +592,7 @@ function Main() {
           <Icon n="plus" size={20} color="#fff" /><Text style={st.addT}>Add files</Text>
         </TouchableOpacity>
         <Text style={[st.sub, { textAlign: 'center' }]}>PDF, .md, .txt, .jpg, .zip</Text>
-        <ScrollView style={{ flexShrink: 1 }} showsVerticalScrollIndicator={false}>
+        <ScrollView style={{ maxHeight: sheetMax }} nestedScrollEnabled showsVerticalScrollIndicator={false}>
           {sources.length === 0 && <Text style={[st.sub, { textAlign: 'center', paddingVertical: 24 }]}>No sources yet</Text>}
           {sources.map((x) => (
             <View key={x.id} style={st.srcRow}>
@@ -501,7 +610,7 @@ function Main() {
       </Sheet>
 
       <Sheet visible={showSet} onClose={() => setShowSet(false)} title="Voice settings" bottom={ins.bottom}>
-        <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ gap: 10, paddingBottom: 6 }} showsVerticalScrollIndicator={false}>
+        <ScrollView style={{ maxHeight: sheetMax }} nestedScrollEnabled contentContainerStyle={{ gap: 10, paddingBottom: 28 }} showsVerticalScrollIndicator={false}>
           <View style={st.group}>
             <StepRow icon="speed" label="Speed" value={`${s.rate.toFixed(1)}x`} onMinus={() => R.setRate(-0.1)} onPlus={() => R.setRate(0.1)} />
             <View style={st.sep} />
@@ -594,7 +703,7 @@ function Main() {
                 <View style={st.cmdRow}><Text style={st.cmd}>{c}</Text><Text style={st.cmdD}>{d}</Text></View>
               </View>))}
           </View>
-          <Text style={[st.sub, { paddingHorizontal: 4 }]}>Bangla mode also understands: থামো, পরের, আগের, আবার, চালু</Text>
+          <Text style={[st.sub, { paddingHorizontal: 4 }]}>Bangla mode also understands: থামো, পরের, আগের, আবার, চালু{'\n'}Voice only reacts to these commands. Anything you TYPE is a normal chat question: answered from your sources + my own knowledge.</Text>
         </ScrollView>
       </Sheet>
     </View>
