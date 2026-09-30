@@ -1,13 +1,13 @@
 import * as Speech from 'expo-speech';
-import { cleanForSpeech } from './cleaner';
+import { cleanForSpeech, speechChunks } from './cleaner';
 import { saveSession } from './db';
 import type { Point } from './notes';
 
 export type RState = {
-  topicId: number; topic: string; points: Point[]; idx: number;
+  topicId: number; topic: string; points: Point[]; idx: number; chunk: number;
   status: 'idle' | 'reading' | 'paused'; rate: number; pauseSec: number; lang: 'auto' | 'en' | 'bn';
 };
-export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto' };
+export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto' };
 
 const subs = new Set<() => void>();
 export const subscribe = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
@@ -17,59 +17,95 @@ let token = 0;
 let after: number | null = null;
 let slow = false;
 let spoken = '';
+let resumeAt = 0;
+let release: (() => void) | null = null;
 export const getSpoken = () => spoken;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function say(text: string): Promise<void> {
+// chunk 0 = "Point 2. Principle." ; chunk 1.. = the sentences (the screen highlights the same chunks)
+export function pointChunks(p: Point): string[] {
+  const body = speechChunks(p.text);
+  const t = cleanForSpeech(p.title).replace(/[.]+$/, '').toLowerCase();
+  const dup = !!t && !!body[0] && body[0].toLowerCase().startsWith(t);
+  return [dup ? `Point ${p.n}.` : cleanForSpeech(`Point ${p.n}. ${p.title}`), ...body];
+}
+
+function halt() {
+  Speech.stop();
+  const r = release; release = null;
+  r?.();                                   // never leave a reader loop waiting on a stopped utterance
+}
+
+// Queue every chunk at once (gapless, "streaming"); resolves when the last one finishes or is stopped.
+function say(parts: string[], from = 0, track = false): Promise<void> {
   return new Promise((res) => {
-    const bn = state.lang === 'bn' || (state.lang === 'auto' && /[\u0980-\u09FF]/.test(text));
+    const todo = parts.slice(from);
+    if (!todo.length) { res(); return; }
     const rate = slow ? state.rate * 0.9 : state.rate;
     slow = false;
-    spoken = cleanForSpeech(text);
-    Speech.speak(cleanForSpeech(text), {
-      language: bn ? 'bn-BD' : 'en-US', rate,
-      onDone: () => res(), onStopped: () => res(), onError: () => res(),
+    let left = todo.length;
+    release = () => res();
+    todo.forEach((text, k) => {
+      let done = false;
+      const fin = () => { if (done) return; done = true; if (--left <= 0) { release = null; res(); } };
+      const bn = state.lang === 'bn' || (state.lang === 'auto' && /[\u0980-\u09FF]/.test(text));
+      Speech.speak(text, {
+        language: bn ? 'bn-BD' : 'en-US', rate,
+        onStart: () => { spoken = track ? parts.join(' ') : text; if (track) { state.chunk = from + k; emit(); } },
+        onDone: fin, onStopped: fin, onError: fin,
+      });
     });
   });
 }
 
-async function run(from: number, intro?: string) {
+async function run(from: number, intro?: string, chunk = 0) {
   const my = ++token;
-  Speech.stop();
-  state.idx = from; state.status = 'reading'; emit();
-  if (intro) { await say(intro); if (my !== token) return; }
+  halt();
+  state.idx = from; state.chunk = chunk; state.status = 'reading'; emit();
+  if (intro) { await say(speechChunks(intro)); if (my !== token) return; }
+  let start = chunk;
   while (my === token && state.idx < state.points.length) {
     const p = state.points[state.idx];
-    emit();
+    state.chunk = start; emit();
     saveSession(state.topicId, p.n, state.rate).catch(() => {});
-    await say(`${p.n}. ${p.title}. ${p.text}`);
+    await say(pointChunks(p), start, true);
+    start = 0;
     if (my !== token) return;
     await sleep(state.pauseSec * 1000);   // time to write
     if (my !== token) return;
     if (after !== null) { state.idx = after; after = null; } else state.idx++;
   }
-  if (my === token) { state.idx = Math.max(0, state.points.length - 1); state.status = 'idle'; emit(); }
+  if (my === token) { state.idx = Math.max(0, state.points.length - 1); state.chunk = 0; state.status = 'idle'; emit(); }
 }
 
-export function startTopic(id: number, name: string, points: Point[], announce = false) {
-  state.topicId = id; state.topic = name; state.points = points; after = null;
-  run(0, announce ? `Topic ${name}` : undefined);
+// Always says the topic name first, then reads point by point until you interrupt.
+export function startTopic(id: number, name: string, points: Point[]) {
+  state.topicId = id; state.topic = name; state.points = points; after = null; resumeAt = 0;
+  run(0, `Topic ${name}. ${points.length} points.`);
 }
 export function restore(id: number, name: string, points: Point[], n: number, rate: number) {
-  Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), rate, status: 'paused' });
+  Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), chunk: 0, rate, status: 'paused' });
+  resumeAt = 0;
   emit();
 }
 export function pause() {
   if (state.status !== 'reading') return;
-  token++; Speech.stop(); state.status = 'paused'; emit();
+  resumeAt = state.chunk;
+  token++; halt(); state.status = 'paused'; emit();
 }
 export function resume() {
   if (!state.points.length) return;
-  after = null; slow = true; run(state.idx);   // restart current point, a bit slower
+  after = null;
+  if (state.status === 'idle') { resumeAt = 0; run(0); return; }      // finished or stopped: play again from the start
+  slow = true;
+  const c = state.status === 'paused' ? resumeAt : 0;
+  resumeAt = 0;
+  run(state.idx, undefined, c);                                        // continue from the sentence where it paused
 }
-export function stop() { token++; Speech.stop(); state.status = 'idle'; state.idx = 0; emit(); }
-export function next() { after = null; run(Math.min(state.idx + 1, state.points.length - 1)); }
-export function prev() { after = null; run(Math.max(state.idx - 1, 0)); }
+export function stop() { token++; halt(); resumeAt = 0; state.status = 'idle'; state.idx = 0; state.chunk = 0; emit(); }
+export function goto(i: number) { if (!state.points.length) return; after = null; resumeAt = 0; run(Math.min(Math.max(i, 0), state.points.length - 1)); }
+export function next() { goto(Math.min(state.idx + 1, state.points.length - 1)); }
+export function prev() { goto(Math.max(state.idx - 1, 0)); }
 export function repeat(arg?: string) {
   if (!state.points.length) return;
   let i = state.idx;
@@ -80,6 +116,7 @@ export function repeat(arg?: string) {
   }
   i = Math.min(Math.max(i, 0), state.points.length - 1);
   const back = Math.min(state.idx + 1, state.points.length);
+  resumeAt = 0;
   run(i);
   after = back;
 }
