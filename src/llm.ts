@@ -1,0 +1,252 @@
+// Smart notes: Qwen2.5 Instruct (GGUF, Q4_K_M) running on the phone through llama.rn.
+//  - The model is NOT inside the app. It is downloaded ONCE from the official Qwen Hugging Face repos
+//    (Wi-Fi + free-storage check, progress, resume), stored in the app's private folder, then everything is offline.
+//  - 1.5B by default; a phone with little RAM gets 0.5B (also used if 1.5B fails to load).
+//  - Notes = topper's exam copy built ONLY from the source text; every point is checked against the source.
+import * as FS from 'expo-file-system/legacy';
+import * as Network from 'expo-network';
+import * as Device from 'expo-device';
+import { getMeta, setMeta } from './db';
+import type { Point } from './notes';
+
+export type ModelId = 'q15' | 'q05';
+export const MODELS: Record<ModelId, { label: string; file: string; url: string; bytes: number }> = {
+  q15: {
+    label: 'Qwen2.5 1.5B Instruct',
+    file: 'qwen2.5-1.5b-instruct-q4_k_m.gguf',
+    url: 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf',
+    bytes: 1_117_000_000,                      // ~1.12 GB (official repo listing)
+  },
+  q05: {
+    label: 'Qwen2.5 0.5B Instruct',
+    file: 'qwen2.5-0.5b-instruct-q4_k_m.gguf',
+    url: 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf',
+    bytes: 491_000_000,                        // ~491 MB (official repo listing)
+  },
+};
+
+export type LlmState = {
+  phase: 'none' | 'checking' | 'downloading' | 'paused' | 'ready' | 'error';
+  model: ModelId; got: number; total: number; msg: string;
+};
+export const llm: LlmState = { phase: 'none', model: 'q15', got: 0, total: MODELS.q15.bytes, msg: '' };
+const subs = new Set<() => void>();
+export const subscribeLlm = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
+const emit = () => subs.forEach((f) => f());
+const set = (p: Partial<LlmState>) => { Object.assign(llm, p); emit(); };
+
+const DIR = () => `${FS.documentDirectory}models/`;
+const finalPath = (m: ModelId) => DIR() + MODELS[m].file;
+const partPath = (m: ModelId) => finalPath(m) + '.part';
+const sizeOf = async (uri: string) => { const i: any = await FS.getInfoAsync(uri); return i.exists ? Number(i.size || 0) : 0; };
+
+// RAM decides the model (phones with about 4 GB or less get 0.5B)
+const pickModel = async (): Promise<ModelId> => {
+  const saved = (await getMeta('llm_model').catch(() => '')) as ModelId;
+  if (saved === 'q15' || saved === 'q05') return saved;
+  const ram = Number((Device as any).totalMemory || 0);
+  const m: ModelId = ram && ram < 4.5e9 ? 'q05' : 'q15';
+  await setMeta('llm_model', m).catch(() => {});
+  return m;
+};
+
+const isGguf = async (uri: string) => {
+  try { return (await FS.readAsStringAsync(uri, { encoding: FS.EncodingType.Base64, position: 0, length: 4 })) === 'R0dVRg=='; }   // "GGUF"
+  catch { return false; }
+};
+const sane = (m: ModelId, size: number) => size > MODELS[m].bytes * 0.93 && size < MODELS[m].bytes * 1.07;
+
+// App start: is the model already on the phone (or half downloaded)?
+export async function initLlm() {
+  const m = await pickModel();
+  set({ model: m, total: MODELS[m].bytes, got: 0, msg: '' });
+  const fin = await sizeOf(finalPath(m));
+  if (fin && sane(m, fin) && (await isGguf(finalPath(m)))) { set({ phase: 'ready', got: fin }); return; }
+  const part = await sizeOf(partPath(m));
+  set({ phase: part ? 'paused' : 'none', got: part });
+}
+
+export type Pre = { ok: boolean; reason?: 'offline' | 'wifi' | 'space'; needMB?: number; freeMB?: number };
+export async function preflight(allowMobile: boolean): Promise<Pre> {
+  const m = llm.model;
+  let net: any = null;
+  try { net = await Network.getNetworkStateAsync(); } catch {}
+  if (!net || !net.isConnected || net.isInternetReachable === false) return { ok: false, reason: 'offline' };
+  if (!allowMobile && String(net.type).toUpperCase() !== 'WIFI') return { ok: false, reason: 'wifi' };
+  const need = Math.max(0, MODELS[m].bytes - (await sizeOf(partPath(m)))) * 1.15 + 150e6;
+  let free = Infinity;
+  try { free = await FS.getFreeDiskStorageAsync(); } catch {}
+  if (free < need) return { ok: false, reason: 'space', needMB: Math.ceil(need / 1e6), freeMB: Math.floor(free / 1e6) };
+  return { ok: true };
+}
+
+let job: FS.DownloadResumable | null = null;
+let poll: any = null;
+let userStop: 'pause' | 'cancel' | '' = '';
+let running = false;
+
+// Checks Wi-Fi + storage first (returned at once), then downloads in the background with automatic resume.
+export async function startDownload(allowMobile = false): Promise<Pre> {
+  if (running || llm.phase === 'ready') return { ok: true };
+  set({ phase: 'checking', msg: '' });
+  const pf = await preflight(allowMobile);
+  if (!pf.ok) { set({ phase: (await sizeOf(partPath(llm.model))) ? 'paused' : 'none' }); return pf; }
+  running = true; userStop = '';
+  download().catch((e) => set({ phase: 'error', msg: String(e?.message || e).slice(0, 100) })).finally(() => { running = false; });
+  return pf;
+}
+
+async function download() {
+  const id = llm.model, m = MODELS[id];
+  await FS.makeDirectoryAsync(DIR(), { intermediates: true }).catch(() => {});
+  set({ phase: 'downloading', msg: '' });
+  poll = setInterval(async () => { const n = await sizeOf(partPath(id)); if (llm.phase === 'downloading') set({ got: n }); }, 1000);
+  let ok = false, err = '';
+  try {
+    for (let attempt = 0; attempt < 5 && !userStop && !ok; attempt++) {
+      const have = await sizeOf(partPath(id));
+      if (have > m.bytes * 1.07) await FS.deleteAsync(partPath(id), { idempotent: true });      // bad leftover
+      const resume = await sizeOf(partPath(id));
+      job = FS.createDownloadResumable(m.url, partPath(id), {}, undefined, resume > 0 ? String(resume) : undefined);
+      try {
+        const r: any = await job.downloadAsync();
+        if (userStop) break;
+        if (r && (r.status === 200 || r.status === 206)) ok = true; else err = `HTTP ${r?.status ?? '?'}`;
+      } catch (e: any) { if (userStop) break; err = String(e?.message || e); }
+      if (!ok && !userStop) await new Promise((res) => setTimeout(res, 2000 * (attempt + 1)));      // wait, then resume
+    }
+  } finally { clearInterval(poll); job = null; }
+
+  if (userStop === 'cancel') { await FS.deleteAsync(partPath(id), { idempotent: true }); set({ phase: 'none', got: 0 }); return; }
+  if (userStop === 'pause') { set({ phase: 'paused', got: await sizeOf(partPath(id)) }); return; }
+  if (!ok) { set({ phase: 'paused', got: await sizeOf(partPath(id)), msg: err.slice(0, 100) || 'download stopped - tap Resume' }); return; }
+
+  const size = await sizeOf(partPath(id));
+  if (!sane(id, size) || !(await isGguf(partPath(id)))) {                       // wrong size / not a GGUF file: start clean
+    await FS.deleteAsync(partPath(id), { idempotent: true });
+    set({ phase: 'error', got: 0, msg: 'Downloaded file is damaged - tap Download again' });
+    return;
+  }
+  await FS.deleteAsync(finalPath(id), { idempotent: true });
+  await FS.moveAsync({ from: partPath(id), to: finalPath(id) });
+  set({ phase: 'ready', got: size, msg: '' });
+}
+
+export async function pauseDownload() { userStop = 'pause'; try { await job?.pauseAsync(); } catch {} }
+export async function cancelDownload() {
+  userStop = 'cancel';
+  try { await job?.pauseAsync(); } catch {}
+  if (!running) { await FS.deleteAsync(partPath(llm.model), { idempotent: true }); set({ phase: 'none', got: 0 }); }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Running the model
+let ctx: any = null;
+let idle: any = null;
+const touch = () => { clearTimeout(idle); idle = setTimeout(() => { try { ctx?.release?.(); } catch {} ctx = null; }, 180000); };   // free RAM after 3 min
+
+async function getCtx(): Promise<any | null> {
+  if (llm.phase !== 'ready') return null;
+  if (ctx) { touch(); return ctx; }
+  try {
+    const { initLlama } = require('llama.rn');
+    ctx = await initLlama({ model: finalPath(llm.model).replace(/^file:\/\//, ''), n_ctx: 3072, n_threads: 4, n_gpu_layers: 0, use_mlock: false });
+    touch();
+    return ctx;
+  } catch {
+    ctx = null;
+    if (llm.model === 'q15') {                     // not enough memory for 1.5B: fall back to 0.5B (downloaded once, automatically)
+      await FS.deleteAsync(finalPath('q15'), { idempotent: true }).catch(() => {});
+      await setMeta('llm_model', 'q05').catch(() => {});
+      set({ model: 'q05', total: MODELS.q05.bytes, got: 0, phase: 'none', msg: 'Phone memory is low: switching to the 0.5B model' });
+      startDownload(false).catch(() => {});
+    } else set({ phase: 'error', msg: 'Model could not start on this phone' });
+    return null;
+  }
+}
+
+// "anemia 10 marks" -> { q: 'anemia', marks: 10 }   (default 5 marks)
+const WORDN: Record<string, number> = { two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, ten: 10, twelve: 12 };
+export function splitMarks(q: string): { q: string; marks: number } {
+  const m = q.match(/\b(\d{1,2}|two|three|four|five|six|seven|eight|ten|twelve)\s*(?:marks?|m)\b/i);
+  if (!m) return { q: q.trim(), marks: 5 };
+  const n = /^\d/.test(m[1]) ? parseInt(m[1], 10) : WORDN[m[1].toLowerCase()];
+  return { q: q.replace(m[0], ' ').replace(/\s+/g, ' ').trim(), marks: Math.min(15, Math.max(2, n || 5)) };
+}
+const range = (marks: number): [number, number] =>
+  marks <= 2 ? [3, 4] : marks <= 4 ? [4, 6] : marks <= 7 ? [6, 8] : marks <= 9 ? [8, 11] : [10, 14];
+
+const SYSTEM = (lo: number, hi: number) => `You write university exam answers exactly like a topper's exam copy (medical lab technology).
+Use ONLY the SOURCE text. Never add a fact, number or name that is not in the SOURCE. Write in the language of the SOURCE.
+Format: numbered points, one per line, exactly like:
+1. **Keyword**: short line
+Rules: no introduction, no conclusion, no filler words. Each line at most 18 words. Bold only the keyword. Keep numbers, units and names exactly as in the SOURCE.
+Order (SKIP every section the SOURCE does not cover): Definition, Classification, Etiology, Pathogenesis, Clinical features, Lab diagnosis, Complications, Treatment.
+Write ${lo} to ${hi} points (fewer if the SOURCE has less).
+If the SOURCE has nothing about the topic, reply exactly: NOT_IN_SOURCE`;
+
+const flat = (s: string) => s.toLowerCase().replace(/ae/g, 'e');
+function supported(line: string, srcN: string, srcWords: Set<string>): boolean {
+  const nums = line.match(/\d+(?:\.\d+)?/g) || [];
+  for (const n of nums) if (!srcN.includes(n)) return false;                     // an invented number
+  const ws = (flat(line).match(/\p{L}{4,}/gu) || []);
+  if (!ws.length) return true;
+  let hit = 0;
+  for (const w of ws) if (srcWords.has(w) || srcN.includes(w.slice(0, Math.max(4, w.length - 2)))) hit++;
+  return hit / ws.length >= 0.6;                                                 // most words must come from the source
+}
+
+function parseAnswer(text: string, src: string, hi: number): Point[] {
+  const srcN = flat(src);
+  const srcWords = new Set(srcN.match(/\p{L}{4,}/gu) || []);
+  const pts: Omit<Point, 'n'>[] = [];
+  for (const raw of text.replace(/\r/g, '').split('\n')) {
+    const m = raw.match(/^\s*(?:\d+[.)]|[-*•])\s*(.+)$/);
+    if (!m) continue;
+    let title = '', body = m[1].trim();
+    const b = body.match(/^\*\*(.+?)\*\*\s*[:\-–—]?\s*(.*)$/);
+    if (b) { title = b[1]; body = b[2]; }
+    else { const c = body.match(/^([^:]{2,40}):\s+(.+)$/); if (c) { title = c[1]; body = c[2]; } else { title = body.split(/\s+/).slice(0, 4).join(' '); } }
+    title = title.replace(/\*+/g, '').replace(/[:.]+$/, '').trim();
+    body = body.replace(/\*+/g, '').trim();
+    if (!title) continue;
+    const line = `${title} ${body}`;
+    if (!supported(line, srcN, srcWords)) continue;
+    pts.push({ title, text: /[.!?।]$/.test(body || title) ? (body || title) : (body || title) + '.' });
+    if (pts.length >= hi) break;
+  }
+  return pts.map((p, i) => ({ n: i + 1, ...p }));
+}
+
+export type LlmResult = { pts: Point[] | null; notInSource: boolean };
+const MAXSRC = () => (llm.model === 'q05' ? 3200 : 5200);
+
+// null pts = the model was not usable / gave nothing good -> caller uses the rule-based notes
+export async function llmNotes(name: string, body: string, marks: number): Promise<LlmResult> {
+  const c = await getCtx();
+  if (!c) return { pts: null, notInSource: false };
+  const [lo, hi] = range(marks);
+  const src = body.replace(/\n{3,}/g, '\n\n').slice(0, MAXSRC());
+  let timer: any;
+  try {
+    const run = c.completion({
+      messages: [
+        { role: 'system', content: SYSTEM(lo, hi) },
+        { role: 'user', content: `Topic: ${name}\nMarks: ${marks}\n\nSOURCE:\n${src}\n\nWrite the answer.` },
+      ],
+      n_predict: marks >= 10 ? 800 : 500, temperature: 0.1, top_p: 0.9, penalty_repeat: 1.1,
+      stop: ['<|im_end|>', '<|endoftext|>'],
+    });
+    const out: any = await Promise.race([
+      run,
+      new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
+    ]);
+    clearTimeout(timer);
+    touch();
+    const text = String(out?.text || '').trim();
+    if (!text) return { pts: null, notInSource: false };
+    if (/NOT_IN_SOURCE/.test(text)) return { pts: null, notInSource: true };
+    const pts = parseAnswer(text, src, hi);
+    return { pts: pts.length >= 2 ? pts : null, notInSource: false };
+  } catch { clearTimeout(timer); return { pts: null, notInSource: false }; }
+}
