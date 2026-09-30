@@ -70,7 +70,7 @@ async function importPdf(name: string, uri: string, tick: () => void) {
     sp.flush(); await addTopics(id, sp.drain());
     await updateSource(id, 'ready', `${total} pages` + (ocr ? `, ${ocr} OCR (low quality)` : ''));
   } catch (e: any) {
-    await updateSource(id, 'failed', String(e?.message || e).slice(0, 60));
+    try { await updateSource(id, 'failed', String(e?.message || e).slice(0, 60)); } catch {}
   } finally { try { await Pdf.close(); } catch {} tick(); }
 }
 
@@ -81,7 +81,7 @@ async function importImage(name: string, uri: string) {
     const topics = splitTopics(name, text);
     await addTopics(id, topics.length ? topics : [{ name: name.replace(/\.[^.]+$/, ''), body: text }]);
     await updateSource(id, 'ready', 'OCR (low quality)');
-  } catch (e: any) { await updateSource(id, 'failed', String(e?.message || e).slice(0, 60)); }
+  } catch (e: any) { try { await updateSource(id, 'failed', String(e?.message || e).slice(0, 60)); } catch {} }
 }
 
 async function indexText(name: string, text: string, type: string) {
@@ -117,8 +117,13 @@ export async function pickAndImport(tick: () => void = () => {}): Promise<string
         continue;
       } else { await addSource(n, 'unsupported', 'skipped', 'unsupported type'); bad++; continue; }
       ok++;
-    } catch (e: any) { await addSource(n, 'error', 'failed', String(e?.message || e).slice(0, 60)); bad++; }
-    await FS.deleteAsync(a.uri, { idempotent: true }).catch(() => {});   // text is indexed; free the cache copy
+    } catch (e: any) {
+      bad++;
+      try { await addSource(n, 'error', 'failed', String(e?.message || e).slice(0, 60)); } catch {}
+      tick();
+      continue;                                                          // keep the copy, go on with the next file
+    }
+    await FS.deleteAsync(a.uri, { idempotent: true }).catch(() => {});   // indexed and saved; free the cache copy
     tick();
   }
   return `${ok} imported` + (bad ? `, ${bad} failed` : '');
