@@ -78,6 +78,12 @@ class SheetForegroundService : Service() {
     }
   }
 
+  // Custom notification icons (assets/icons/ic_tuik_notif_*.png copied to res/drawable by the build); falls back to system icons
+  private fun ic(name: String, fallback: Int): Int {
+    val id = resources.getIdentifier(name, "drawable", packageName)
+    return if (id != 0) id else fallback
+  }
+
   private fun pi(action: String, code: Int): PendingIntent =
     PendingIntent.getBroadcast(this, code, Intent(action).setPackage(packageName),
       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -87,14 +93,14 @@ class SheetForegroundService : Service() {
       PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE)
     }
     return NotificationCompat.Builder(this, CH)
-      .setSmallIcon(android.R.drawable.ic_media_play)
+      .setSmallIcon(ic("ic_tuik_notif_small", android.R.drawable.ic_media_play))
       .setContentTitle(title).setContentText(text)
       .setOngoing(true).setSilent(true).setOnlyAlertOnce(true)
       .setContentIntent(open)
       .addAction(
-        if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+        if (playing) ic("ic_tuik_notif_pause", android.R.drawable.ic_media_pause) else ic("ic_tuik_notif_play", android.R.drawable.ic_media_play),
         if (playing) "Pause" else "Play", pi(ACT_TOGGLE, 1))
-      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", pi(ACT_STOP, 2))
+      .addAction(ic("ic_tuik_notif_stop", android.R.drawable.ic_menu_close_clear_cancel), "Stop", pi(ACT_STOP, 2))
       .build()
   }
 
