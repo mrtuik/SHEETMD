@@ -3,10 +3,15 @@
 
 export const words = (s: string): string[] => s.match(/[\p{L}\p{N}]+/gu) || [];
 
+const GC = new Map<string, Set<string>>();          // speed: the 3-letter pieces of a word are computed once
 export function grams(w: string): Set<string> {
+  const c = GC.get(w);
+  if (c) return c;
   const p = `  ${w} `;
   const g = new Set<string>();
   for (let i = 0; i + 3 <= p.length; i++) g.add(p.slice(i, i + 3));
+  if (GC.size > 20000) GC.clear();
+  GC.set(w, g);
   return g;
 }
 
@@ -14,6 +19,7 @@ export function grams(w: string): Set<string> {
 export function dice(a: string, b: string): number {
   if (a === b) return 1;
   if (a.length < 3 || b.length < 3) return 0;
+  if (Math.abs(a.length - b.length) > 4) return 0;     // speed: very different lengths never match
   const x = grams(a), y = grams(b);
   let hit = 0;
   x.forEach((k) => { if (y.has(k)) hit++; });
