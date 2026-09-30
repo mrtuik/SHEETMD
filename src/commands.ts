@@ -1,5 +1,5 @@
 export type Cmd =
-  | { t: 'topic'; q: string } | { t: 'repeat'; arg?: string }
+  | { t: 'topic'; q: string } | { t: 'repeat'; arg?: string } | { t: 'pick'; n: number }
   | { t: 'continue' | 'pause' | 'stop' | 'next' | 'prev' | 'slower' | 'faster' | 'unknown' };
 
 const NUM: Record<string, string> = {
@@ -8,8 +8,17 @@ const NUM: Record<string, string> = {
 };
 
 // English + a few Bangla words (for Bangla voice mode)
+// "one / two / three" answers the 3-options question (only acted on while options are waiting)
+const PICK: Record<string, number> = {
+  one: 1, won: 1, first: 1, '1': 1, ek: 1, 'এক': 1, 'প্রথম': 1, '১': 1,
+  two: 2, to: 2, too: 2, second: 2, '2': 2, dui: 2, 'দুই': 2, 'দ্বিতীয়': 2, '২': 2,
+  three: 3, tree: 3, free: 3, third: 3, '3': 3, tin: 3, 'তিন': 3, 'তৃতীয়': 3, '৩': 3,
+};
+
 export function parse(s: string): Cmd {
   const x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
+  const pk = x.match(/^(?:option|number|no|choose|select|pick|নম্বর)?\s*(\S+)$/);
+  if (pk && PICK[pk[1]]) return { t: 'pick', n: PICK[pk[1]] };
   let m = x.match(/^(?:topic|টপিক)\s*:?\s+(.+)$/);
   if (m) return { t: 'topic', q: m[1] };
   m = x.match(/^(?:repeat|again|আবার)(?:\s+(?:point\s+)?(.+))?$/);
