@@ -3,6 +3,7 @@
 // Repeating page headers/footers and page numbers are removed first.
 
 import { GENERIC } from './mdsplit';
+import { isJunkHeading } from './match';
 
 const SMALL = new Set('a,an,and,as,at,by,for,from,in,of,on,or,the,to,vs,with,via,per,is,are'.split(','));
 
@@ -41,6 +42,12 @@ const titleCase = (l: string) => {
 type Head = { level: number; text: string } | null;
 
 function headingOf(l: string, prev: string, next: string): Head {
+  const h = headingOf0(l, prev, next);
+  // figure captions ("Fig 3.2 ...") and sentence-like OCR lines are body text, never a topic heading
+  return h && isJunkHeading(h.text) ? null : h;
+}
+
+function headingOf0(l: string, prev: string, next: string): Head {
   const t = l.trim();
   if (t.length < 3 || t.length > 80) return null;
   if (isBullet(t) || /[.,;?!]$/.test(t)) return null;
