@@ -1,130 +1,126 @@
-import * as FS from 'expo-file-system/legacy';
-import * as DocumentPicker from 'expo-document-picker';
-import JSZip from 'jszip';
-import { addSource, addTopics, updateSource } from './db';
-import * as Pdf from './pdfnative';
-import { splitTopics } from './mdsplit';
+import * as Speech from 'expo-speech';
+import { cleanForSpeech, speechChunks } from './cleaner';
+import { saveSession } from './db';
+import type { Point } from './notes';
 
-const TEXT = /\.(md|txt)$/i, PDF = /\.pdf$/i, IMG = /\.(jpe?g|png)$/i;
-type T = { name: string; body: string; own?: string };
+export type RState = {
+  topicId: number; topic: string; points: Point[]; idx: number; chunk: number;
+  status: 'idle' | 'reading' | 'paused'; rate: number; pauseSec: number; lang: 'auto' | 'en' | 'bn';
+};
+export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto' };
 
-// ---- PDF heading detection + streaming splitter (works page by page, so any size) ----
-function isHeading(l: string) {
-  const t = l.trim(), words = t.split(/\s+/).length;
-  if (t.length < 3 || t.length > 70 || /[.,;]$/.test(t)) return false;
-  if (/^(chapter|unit|lesson|section)\s+[\dIVXivx]+/i.test(t)) return true;
-  if (/^\d+(\.\d+)+[.)]?\s+\S/.test(t) && words <= 10) return true;
-  const letters = t.replace(/[^A-Za-z]/g, '');
-  return letters.length >= 4 && t === t.toUpperCase() && words <= 8;
+const subs = new Set<() => void>();
+export const subscribe = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
+const emit = () => subs.forEach((f) => f());
+
+let token = 0;
+let after: number | null = null;
+let slow = false;
+let spoken = '';
+let resumeAt = 0;
+let release: (() => void) | null = null;
+export const getSpoken = () => spoken;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// chunk 0 = "Point 2. Principle." ; chunk 1.. = the sentences (the screen highlights the same chunks)
+export function pointChunks(p: Point): string[] {
+  const body = speechChunks(p.text);
+  const t = cleanForSpeech(p.title).replace(/[.]+$/, '').toLowerCase();
+  const dup = !!t && !!body[0] && body[0].toLowerCase().startsWith(t);
+  return [dup ? `Point ${p.n}.` : cleanForSpeech(`Point ${p.n}. ${p.title}`), ...body];
 }
-function joinLines(lines: string[]) {
-  const out: string[] = [];
-  for (const l of lines) {
-    if (!l) { out.push(''); continue; }
-    const prev = out[out.length - 1];
-    if (prev === undefined || prev === '' || /^([-•▪*]|\d+[.)])\s/.test(l)) out.push(l);
-    else if (/[A-Za-z]-$/.test(prev)) out[out.length - 1] = prev.slice(0, -1) + l;
-    else out[out.length - 1] = prev + ' ' + l;
+
+function halt() {
+  Speech.stop();
+  const r = release; release = null;
+  r?.();                                   // never leave a reader loop waiting on a stopped utterance
+}
+
+// Queue every chunk at once (gapless, "streaming"); resolves when the last one finishes or is stopped.
+function say(parts: string[], from = 0, track = false): Promise<void> {
+  return new Promise((res) => {
+    const todo = parts.slice(from);
+    if (!todo.length) { res(); return; }
+    const rate = slow ? state.rate * 0.9 : state.rate;
+    slow = false;
+    let left = todo.length;
+    release = () => res();
+    todo.forEach((text, k) => {
+      let done = false;
+      const fin = () => { if (done) return; done = true; if (--left <= 0) { release = null; res(); } };
+      const bn = state.lang === 'bn' || (state.lang === 'auto' && /[\u0980-\u09FF]/.test(text));
+      Speech.speak(text, {
+        language: bn ? 'bn-BD' : 'en-US', rate,
+        onStart: () => { spoken = track ? parts.join(' ') : text; if (track) { state.chunk = from + k; emit(); } },
+        onDone: fin, onStopped: fin, onError: fin,
+      });
+    });
+  });
+}
+
+async function run(from: number, intro?: string, chunk = 0) {
+  const my = ++token;
+  halt();
+  state.idx = from; state.chunk = chunk; state.status = 'reading'; emit();
+  if (intro) { await say(speechChunks(intro)); if (my !== token) return; }
+  let start = chunk;
+  while (my === token && state.idx < state.points.length) {
+    const p = state.points[state.idx];
+    state.chunk = start; emit();
+    saveSession(state.topicId, p.n, state.rate).catch(() => {});
+    await say(pointChunks(p), start, true);
+    start = 0;
+    if (my !== token) return;
+    await sleep(state.pauseSec * 1000);   // time to write
+    if (my !== token) return;
+    if (after !== null) { state.idx = after; after = null; } else state.idx++;
   }
-  return out.filter(Boolean).join('\n');
+  if (my === token) { state.idx = Math.max(0, state.points.length - 1); state.chunk = 0; state.status = 'idle'; emit(); }
 }
-class Splitter {
-  ready: T[] = [];
-  title: string; name: string; part = 1; body: string[] = []; len = 0;
-  constructor(base: string) { this.title = base; this.name = base; }
-  feed(text: string) {
-    for (const raw of text.replace(/\r/g, '').split('\n')) {
-      const l = raw.trim();
-      if (/^\d{1,4}$/.test(l)) continue;              // page numbers
-      if (l && isHeading(l)) { this.flush(); this.title = this.name = l; this.part = 1; continue; }
-      this.body.push(l); this.len += l.length;
-      if (this.len > 5000 && /[.!?।]$/.test(l)) { this.flush(); this.name = `${this.title} (part ${++this.part})`; }
-    }
+
+// Always says the topic name first, then reads point by point until you interrupt.
+export function startTopic(id: number, name: string, points: Point[]) {
+  state.topicId = id; state.topic = name; state.points = points; after = null; resumeAt = 0;
+  run(0, `Topic ${name}. ${points.length} points.`);
+}
+export function restore(id: number, name: string, points: Point[], n: number, rate: number) {
+  Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), chunk: 0, rate, status: 'paused' });
+  resumeAt = 0;
+  emit();
+}
+export function pause() {
+  if (state.status !== 'reading') return;
+  resumeAt = state.chunk;
+  token++; halt(); state.status = 'paused'; emit();
+}
+export function resume() {
+  if (!state.points.length) return;
+  after = null;
+  if (state.status === 'idle') { resumeAt = 0; run(0); return; }      // finished or stopped: play again from the start
+  slow = true;
+  const c = state.status === 'paused' ? resumeAt : 0;
+  resumeAt = 0;
+  run(state.idx, undefined, c);                                        // continue from the sentence where it paused
+}
+export function reset() { token++; halt(); resumeAt = 0; after = null; Object.assign(state, { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle' }); emit(); }
+export function stop() { token++; halt(); resumeAt = 0; state.status = 'idle'; state.idx = 0; state.chunk = 0; emit(); }
+export function goto(i: number) { if (!state.points.length) return; after = null; resumeAt = 0; run(Math.min(Math.max(i, 0), state.points.length - 1)); }
+export function next() { goto(Math.min(state.idx + 1, state.points.length - 1)); }
+export function prev() { goto(Math.max(state.idx - 1, 0)); }
+export function repeat(arg?: string) {
+  if (!state.points.length) return;
+  let i = state.idx;
+  if (arg) {
+    const n = parseInt(arg, 10);
+    if (!isNaN(n)) i = n - 1;
+    else { const f = state.points.findIndex((p) => p.title.toLowerCase().includes(arg.toLowerCase())); if (f >= 0) i = f; }
   }
-  flush() {
-    const b = joinLines(this.body);
-    if (b.length > 20) this.ready.push({ name: this.name, body: b });
-    this.body = []; this.len = 0;
-  }
-  drain() { const r = this.ready; this.ready = []; return r; }
+  i = Math.min(Math.max(i, 0), state.points.length - 1);
+  const back = Math.min(state.idx + 1, state.points.length);
+  resumeAt = 0;
+  run(i);
+  after = back;
 }
-
-async function importPdf(name: string, uri: string, tick: () => void) {
-  const id = await addSource(name, 'pdf', 'indexing', '0%');
-  try {
-    const total = await Pdf.open(uri);
-    const sp = new Splitter(name.replace(/\.[^.]+$/, ''));
-    let ocr = 0;
-    for (let p = 1; p <= total; p += 8) {
-      const end = Math.min(p + 7, total);
-      const pages = await Pdf.readPages(p, end);
-      for (let i = 0; i < pages.length; i++) {
-        let t = pages[i];
-        if (t.trim().length < 30) { try { t = await Pdf.ocrPdfPage(uri, p + i); ocr++; } catch {} }  // scanned page
-        sp.feed(t);
-      }
-      await addTopics(id, sp.drain());               // topics usable while the rest is still indexing
-      await updateSource(id, 'indexing', `${Math.round((end / total) * 100)}%`);
-      tick();
-    }
-    sp.flush(); await addTopics(id, sp.drain());
-    await updateSource(id, 'ready', `${total} pages` + (ocr ? `, ${ocr} OCR (low quality)` : ''));
-  } catch (e: any) {
-    try { await updateSource(id, 'failed', String(e?.message || e).slice(0, 60)); } catch {}
-  } finally { try { await Pdf.close(); } catch {} tick(); }
-}
-
-async function importImage(name: string, uri: string) {
-  const id = await addSource(name, 'image', 'indexing', 'OCR…');
-  try {
-    const text = await Pdf.ocrImage(uri);
-    const topics = splitTopics(name, text);
-    await addTopics(id, topics.length ? topics : [{ name: name.replace(/\.[^.]+$/, ''), body: text }]);
-    await updateSource(id, 'ready', 'OCR (low quality)');
-  } catch (e: any) { try { await updateSource(id, 'failed', String(e?.message || e).slice(0, 60)); } catch {} }
-}
-
-async function indexText(name: string, text: string, type: string) {
-  const id = await addSource(name, type, 'indexing');
-  const topics = splitTopics(name, text);
-  await addTopics(id, topics);
-  await updateSource(id, 'ready', `${topics.length} topics`);
-}
-
-export async function pickAndImport(tick: () => void = () => {}): Promise<string> {
-  const res = await DocumentPicker.getDocumentAsync({ multiple: true, type: '*/*', copyToCacheDirectory: true });
-  if (res.canceled) return '';
-  let ok = 0, bad = 0;
-  for (const a of res.assets) {
-    const n = a.name;
-    try {
-      if (TEXT.test(n)) await indexText(n, await FS.readAsStringAsync(a.uri), 'text');
-      else if (PDF.test(n)) await importPdf(n, a.uri, tick);
-      else if (IMG.test(n)) await importImage(n, a.uri);
-      else if (/\.zip$/i.test(n)) {
-        const zip = await JSZip.loadAsync(await FS.readAsStringAsync(a.uri, { encoding: FS.EncodingType.Base64 }), { base64: true });
-        for (const [p, f] of Object.entries(zip.files)) {
-          if (f.dir) continue;
-          if (TEXT.test(p)) await indexText(p, await f.async('string'), 'zip');
-          else if (PDF.test(p) || IMG.test(p)) {
-            const tmp = FS.cacheDirectory + 'z_' + Date.now() + '_' + p.split('/').pop();
-            await FS.writeAsStringAsync(tmp, await f.async('base64'), { encoding: FS.EncodingType.Base64 });
-            PDF.test(p) ? await importPdf(p, tmp, tick) : await importImage(p, tmp);
-            await FS.deleteAsync(tmp, { idempotent: true });
-          } else continue;
-          ok++;
-        }
-        continue;
-      } else { await addSource(n, 'unsupported', 'skipped', 'unsupported type'); bad++; continue; }
-      ok++;
-    } catch (e: any) {
-      bad++;
-      try { await addSource(n, 'error', 'failed', String(e?.message || e).slice(0, 60)); } catch {}
-      tick();
-      continue;                                                          // keep the copy, go on with the next file
-    }
-    await FS.deleteAsync(a.uri, { idempotent: true }).catch(() => {});   // indexed and saved; free the cache copy
-    tick();
-  }
-  return `${ok} imported` + (bad ? `, ${bad} failed` : '');
-}
+export function setRate(d: number) { state.rate = Math.min(1.2, Math.max(0.3, +(state.rate + d).toFixed(1))); emit(); }
+export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(1, state.pauseSec + d)); emit(); }
+export function setLang(l: RState['lang']) { state.lang = l; emit(); }
