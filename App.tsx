@@ -5,13 +5,15 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
+import * as Speech from 'expo-speech';
 import { parse } from './src/commands';
 import { makeNotes } from './src/notes';
 import * as R from './src/reader';
 import {
   findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck,
-  listChats, newChat, deleteChat, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
+  listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
 } from './src/db';
+import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, splitMarks, MODELS } from './src/llm';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
 import { startListening, stopListening } from './src/listener';
@@ -20,6 +22,7 @@ import { ICONS, IconName } from './src/icons';
 
 type Msg = { id: number; who: 'you' | 'app'; text: string };
 const TOPIC = '\u2063T\u2063';                  // hidden marker: this reply is a topic card
+const CHOICE = '\u2063C\u2063';                 // hidden marker: this reply is the "did you mean" list (top 3 topics)
 
 const C = { bg: '#FFFFFF', surf: '#F6F6F5', bd: '#E4E4E2', tx: '#0A0A0A', sec: '#737373', acc: '#0A0A0A', on: '#4338ca', ok: '#16a34a', bad: '#dc2626', dis: '#EDEDEB', disI: '#A3A3A3' };
 const LANG_LABEL = { auto: 'Auto', en: 'English', bn: 'Bangla' } as const;
@@ -63,6 +66,14 @@ function Main() {
   const [chatId, setChatId] = useState(0);
   const chatRef = useRef(0);
   const [listening, setListening] = useState(false);
+  const [renaming, setRenaming] = useState<Chat | null>(null);
+  const [renameText, setRenameText] = useState('');
+  const [smart, setSmartOn] = useState(true);
+  const [making, setMaking] = useState(false);
+  const choicesRef = useRef<string[] | null>(null);        // the 3 options waiting for a tap / "one, two, three"
+  const choiceMarks = useRef(5);
+  const choiceSpeaking = useRef(false);
+  const askedDl = useRef(false);
   const [awake, setAwake] = useState(true);
   const [voices, setVoices] = useState<Vc[]>([]);
   const [, force] = useState(0);
@@ -71,7 +82,7 @@ function Main() {
   const follow = useRef(true);
   const rowY = useRef<Record<number, number>>({});
   const cardY = useRef<number | null>(null);
-  const refresh = useCallback(async () => { try { setSources(await listSources()); } catch {} }, []);
+  const refresh = useCallback(async () => { try { setSources(chatRef.current ? await listSources(chatRef.current) : []); } catch {} }, []);
   const refreshChats = useCallback(async () => { try { setChats(await listChats()); } catch {} }, []);
   // every message is saved to the current chat
   const push = (who: Msg['who'], text: string) => {
@@ -79,7 +90,8 @@ function Main() {
     if (chatRef.current) addMsg(chatRef.current, who, text).then(refreshChats).catch(() => {});
   };
   const showChat = async (id: number) => {
-    chatRef.current = id; setChatId(id); rowY.current = {};
+    chatRef.current = id; setChatId(id); rowY.current = {}; choicesRef.current = null;
+    refresh();                                              // each chat shows only its own sources
     const m = await loadMsgs(id);
     idRef.current = (m.length ? Math.max(...m.map((x) => x.id)) : 0) + 1;
     setMsgs(m);
@@ -99,7 +111,7 @@ function Main() {
     if (id === chatRef.current) return;
     await resetReader(); await showChat(id);
   };
-  const removeChat = (c: Chat) => Alert.alert('Delete chat?', c.title, [
+  const removeChat = (c: Chat) => Alert.alert('Delete chat?', c.title + '\n\nIts sources, topics, notes and search index are deleted too.', [
     { text: 'Cancel', style: 'cancel' },
     { text: 'Delete', style: 'destructive', onPress: async () => {
       await deleteChat(c.id);
@@ -112,11 +124,19 @@ function Main() {
     } },
   ]);
 
+  const askRename = (c: Chat) => { setRenameText(c.title); setRenaming(c); };
+  const saveRename = async () => {
+    const c = renaming; setRenaming(null);
+    if (c && renameText.trim()) { await renameChat(c.id, renameText); refreshChats(); }
+  };
+
   useEffect(() => {
     const un = R.subscribe(() => force((x) => x + 1));
+    const un2 = subscribeLlm(() => force((x) => x + 1));
     (async () => {
       await cleanupStuck().catch(() => {});
-      refresh();
+      initLlm().catch(() => {});
+      setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
       try {                                           // clearest installed voice, unless one was chosen before
         const all = await loadVoices();
         setVoices(all);
@@ -127,6 +147,7 @@ function Main() {
       } catch {}
       let cs = await listChats();
       const id = cs.length ? cs[0].id : await newChat();
+      await adoptOldSources().catch(() => {});                  // old sources go to the oldest chat
       await showChat(id);
       refreshChats();
       const s = await loadSession();
@@ -135,7 +156,7 @@ function Main() {
         if (pts) R.restore(s.topic_id, await topicName(s.topic_id), pts, s.point_n, s.speed);
       }
     })().catch(() => {});
-    return un;
+    return () => { un(); un2(); };
   }, []);
   useEffect(() => { awake ? activateKeepAwakeAsync() : deactivateKeepAwake(); }, [awake]);
   useEffect(() => {
@@ -149,23 +170,70 @@ function Main() {
     });
   }, []);
 
+  // "did you mean": show the 3 names, read them out, then wait for a tap or "one / two / three"
+  const showChoices = (names: string[], marks: number) => {
+    choicesRef.current = names; choiceMarks.current = marks; rowY.current = {};
+    push('app', CHOICE + JSON.stringify(names));
+    const line = 'Did you mean: ' + names.map((n, i) => `${['one', 'two', 'three'][i]}, ${n}`).join('. ') + '. Say one, two or three.';
+    try { R.stop(); } catch {}
+    choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
+    const done = () => setTimeout(() => { choiceSpeaking.current = false; }, 500);
+    Speech.speak(line, { language: /[\u0980-\u09FF]/.test(line) ? 'bn-BD' : 'en-US', rate: 0.95, onDone: done, onStopped: done, onError: done });
+  };
+
+  const beginDownload = async (mobile = false) => {
+    const r = await startDownload(mobile);                          // Wi-Fi + storage are checked first
+    if (r.ok) return;
+    if (r.reason === 'wifi') Alert.alert('Wi-Fi needed', `Connect to Wi-Fi to download the model (~${Math.round(llm.total / 1e6)} MB).`, [
+      { text: 'Cancel', style: 'cancel' }, { text: 'Use mobile data', onPress: () => beginDownload(true) }]);
+    else if (r.reason === 'space') Alert.alert('Not enough storage', `About ${r.needMB} MB is needed, only ${r.freeMB} MB is free.`);
+    else Alert.alert('No internet', 'Connect to the internet and try again.');
+  };
+  const offerDownload = () => {
+    askedDl.current = true;
+    const m = MODELS[llm.model];
+    Alert.alert('Smart notes', `Download the offline ${m.label} model once (${Math.round(m.bytes / 1e6)} MB, Wi-Fi)? Until then notes use the basic method.`, [
+      { text: 'Later', style: 'cancel' }, { text: 'Download', onPress: () => beginDownload() }]);
+  };
+  const toggleSmart = (v: boolean) => {
+    setSmartOn(v); setMeta('smart', v ? '1' : '0').catch(() => {});
+    if (v && llm.phase === 'none') { askedDl.current = true; beginDownload(); }            // first Smart use: check + download
+  };
+
+  const notFound = (alts: string[]) => push('app', 'Not found in your sources.' + (alts.length ? ` Closest: ${alts.join(', ')}` : ''));
+  const makingRef = useRef(false);
+  const openTopic = async (qRaw: string, exact = false, marksIn = 5) => {
+    if (makingRef.current) { push('app', 'Still writing notes, one moment.'); return; }
+    const sm = exact ? { q: qRaw, marks: marksIn } : splitMarks(qRaw);
+    const f = await findTopic(sm.q, chatRef.current, exact);
+    if (f.kind === 'pick' && f.options?.length) { showChoices(f.options, sm.marks); return; }
+    if (!f.found) { notFound(f.alts); return; }
+    choicesRef.current = null;
+
+    const useLlm = smart && llm.phase === 'ready';
+    if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
+    let pts = await getNotes(f.id, useLlm ? 'llm' : 'rule', sm.marks);   // id 0 (part of a big file) is never cached
+    if (!pts && useLlm) {
+      makingRef.current = true; setMaking(true);
+      const r = await llmNotes(f.name, f.body, sm.marks).catch(() => ({ pts: null, notInSource: false }));
+      makingRef.current = false; setMaking(false);
+      if (r.notInSource) { notFound(f.alts); return; }                   // the model found nothing about it in the source
+      if (r.pts) { pts = r.pts; await saveNotes(f.id, pts, 'llm', sm.marks); }
+    }
+    if (!pts) { pts = makeNotes(f.name, f.body); await saveNotes(f.id, pts, 'rule', 0); }
+    rowY.current = {};
+    cardY.current = null;
+    push('app', TOPIC + f.name);
+    R.startTopic(f.id, f.name, pts);
+  };
+  const pickName = async (nm: string) => { choicesRef.current = null; await openTopic(nm, true, choiceMarks.current); };
+
   const exec = async (text: string) => {
     if (!text.trim()) return;
-    push('you', text);
     const c = parse(text);
     follow.current = true;
+    // playback commands act FIRST (no waiting for the database); the chat history is written right after
     switch (c.t) {
-      case 'topic': {
-        const f = await findTopic(c.q);
-        if (!f || !f.found) { push('app', 'Topic not found.' + (f?.alts.length ? ` Closest: ${f.alts.join(', ')}` : '')); break; }
-        let pts = await getNotes(f.id);            // id 0 (part of a big file) is never cached
-        if (!pts) { pts = makeNotes(f.name, f.body); await saveNotes(f.id, pts); }
-        rowY.current = {};
-        cardY.current = null;
-        push('app', TOPIC + f.name);
-        R.startTopic(f.id, f.name, pts);
-        break;
-      }
       case 'repeat': R.repeat(c.arg); break;
       case 'continue': R.resume(); break;
       case 'pause': R.pause(); break;
@@ -174,30 +242,46 @@ function Main() {
       case 'prev': R.prev(); break;
       case 'slower': R.setRate(-0.1); break;
       case 'faster': R.setRate(0.1); break;
-      default: push('app', 'Try: topic <name>, pause, next, repeat 2, continue.');
     }
+    push('you', text);
+    if (c.t === 'topic') await openTopic(c.q);
+    else if (c.t === 'pick') {
+      const names = choicesRef.current;
+      if (!names || !names[c.n - 1]) push('app', 'Nothing to choose.');
+      else await pickName(names[c.n - 1]);
+    } else if (c.t === 'unknown') push('app', 'Try: topic <name>, pause, next, repeat 2, continue.');
   };
   const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t); };
 
   const addFiles = async () => {
     setBusy(true);
-    try { const r = await pickAndImport(refresh); if (r) push('app', r); } catch (e: any) { push('app', 'Import failed: ' + e.message); }
+    try { const r = await pickAndImport(refresh, chatRef.current); if (r) push('app', r); } catch (e: any) { push('app', 'Import failed: ' + e.message); }
     setBusy(false); refresh();
   };
 
   const execRef = useRef(exec);
   execRef.current = exec;
   // Mic stays on; only real commands are accepted, and anything the app is itself speaking is ignored
+  const heardSelf = (t: string) => R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim());
   const onVoice = (t: string) => {
-    if (parse(t).t === 'unknown') return;
-    if (R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim())) return;
+    const c = parse(t);
+    if (c.t === 'unknown') return;
+    if (c.t === 'pick' && !choicesRef.current) return;             // "one / two" only means something while options are waiting
+    if (choiceSpeaking.current || heardSelf(t)) return;
     execRef.current(t);
+  };
+  // one-word playback commands run the moment they are heard (no waiting for the recognizer to finish)
+  const FAST = new Set(['pause', 'stop', 'next', 'prev', 'continue', 'slower', 'faster']);
+  const onPartial = (t: string) => {
+    if (!FAST.has(parse(t).t) || choiceSpeaking.current || heardSelf(t)) return false;
+    execRef.current(t);
+    return true;
   };
   const mic = async () => {
     if (listening) { await stopListening(); return; }
     const g = await PermissionsAndroid.request('android.permission.RECORD_AUDIO' as any);
     if (g !== 'granted') return;
-    const ok = await startListening(onVoice, () => (R.state.lang === 'bn' ? 'bn-BD' : 'en-US'), setListening);
+    const ok = await startListening(onVoice, () => (R.state.lang === 'bn' ? 'bn-BD' : 'en-US'), setListening, onPartial);
     if (!ok) push('app', 'Voice module not available.');
   };
   useEffect(() => () => { stopListening(); }, []);
@@ -208,6 +292,18 @@ function Main() {
   const cycleLang = () => R.setLang(s.lang === 'auto' ? 'en' : s.lang === 'en' ? 'bn' : 'auto');
   const hasText = input.trim().length > 0;
   const playing = s.status === 'reading';
+  const mb = (n: number) => Math.round(n / 1e6);
+  const llmPct = Math.min(100, Math.round((llm.got / Math.max(1, llm.total)) * 100));
+  const mLabel = MODELS[llm.model].label;
+  const llmLine = [
+    llm.phase === 'ready' ? `${mLabel} · ready · works offline`
+      : llm.phase === 'downloading' ? `Downloading ${mLabel}: ${llmPct}% (${mb(llm.got)}/${mb(llm.total)} MB)`
+      : llm.phase === 'paused' ? `Paused at ${llmPct}% - tap Resume`
+      : llm.phase === 'checking' ? 'Checking Wi-Fi and storage…'
+      : llm.phase === 'error' ? 'Download problem'
+      : `One-time download ~${mb(llm.total)} MB on Wi-Fi, then fully offline`,
+    llm.msg,
+  ].filter(Boolean).join(' · ');
 
   // Foreground service lives while reading/paused or while the mic is on
   useEffect(() => {
@@ -240,7 +336,7 @@ function Main() {
       const live = i === lastTopic && s.points.length > 0 && s.topic === name;
       if (!live) {                                              // older topic replies stay as a small title row
         return (
-          <TouchableOpacity key={m.id} style={st.card} activeOpacity={0.6} onPress={() => { follow.current = true; exec('topic ' + name); }}>
+          <TouchableOpacity key={m.id} style={st.card} activeOpacity={0.6} onPress={() => { follow.current = true; openTopic(name, true); }}>
             <View style={st.cardHead}><Icon n="file" size={18} /><Text style={st.cardT} numberOfLines={1}>{name}</Text></View>
           </TouchableOpacity>);
       }
@@ -267,6 +363,18 @@ function Main() {
           })}
         </View>);
     }
+    if (m.text.startsWith(CHOICE)) {
+      let names: string[] = [];
+      try { names = JSON.parse(m.text.slice(CHOICE.length)); } catch {}
+      return (
+        <View key={m.id} style={st.card}>
+          <Text style={[st.sub, { marginBottom: 4 }]}>Did you mean? Tap one, or say one / two / three</Text>
+          {names.map((n, k) => (
+            <TouchableOpacity key={k} activeOpacity={0.7} style={st.opt} onPress={() => { follow.current = true; pickName(n); }}>
+              <Text style={st.ptN}>{k + 1}</Text><Text style={st.optT} numberOfLines={2}>{n}</Text>
+            </TouchableOpacity>))}
+        </View>);
+    }
     return m.who === 'you'
       ? <View key={m.id} style={st.you}><Text style={st.youT}>{m.text}</Text></View>
       : <Text key={m.id} style={st.reply}>{m.text}</Text>;
@@ -280,7 +388,7 @@ function Main() {
         <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
         <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
       </View>
-      <View style={st.chip}><Text style={st.sub}>{indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? '  •  listening' : ''}</Text></View>
+      <View style={st.chip}><Text style={st.sub}>{making ? 'Writing notes…' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? '  •  listening' : ''}</Text></View>
 
       <ScrollView
         ref={list} style={{ flex: 1 }} contentContainerStyle={{ padding: 16, gap: 12 }}
@@ -345,14 +453,28 @@ function Main() {
               {chats.length === 0 && <Text style={[st.sub, { padding: 12 }]}>No chats yet</Text>}
               {chats.map((c) => (
                 <View key={c.id} style={[st.chatRow, c.id === chatId && st.chatRowOn]}>
-                  <TouchableOpacity style={{ flex: 1, paddingVertical: 12 }} onPress={() => openChat(c.id)}>
-                    <Text style={[st.txt, c.id === chatId && { fontWeight: '700' }]} numberOfLines={1}>{c.title}</Text>
+                  <TouchableOpacity style={{ flex: 1, paddingVertical: 20 }} onPress={() => openChat(c.id)}>
+                    <Text style={[st.txt, c.id === chatId && { fontWeight: '700' }]} numberOfLines={2}>{c.title}</Text>
                   </TouchableOpacity>
+                  <TouchableOpacity style={st.hBtn} onPress={() => askRename(c)}><Icon n="file" size={18} color={C.sec} /></TouchableOpacity>
                   <TouchableOpacity style={st.hBtn} onPress={() => removeChat(c)}><Icon n="trash" size={18} color={C.sec} /></TouchableOpacity>
                 </View>))}
             </ScrollView>
           </View>
           <Pressable style={{ flex: 1 }} onPress={() => setShowMenu(false)} />
+        </View>
+      </Modal>
+
+      <Modal visible={!!renaming} transparent statusBarTranslucent animationType="fade" onRequestClose={() => setRenaming(null)}>
+        <View style={st.dlgBg}>
+          <View style={st.dlg}>
+            <Text style={st.sheetT}>Rename chat</Text>
+            <TextInput style={st.dlgInput} value={renameText} onChangeText={setRenameText} autoFocus selectTextOnFocus maxLength={60} onSubmitEditing={saveRename} />
+            <View style={st.dlgRow}>
+              <TouchableOpacity style={st.dlgBtn} onPress={() => setRenaming(null)}><Text style={st.txt}>Cancel</Text></TouchableOpacity>
+              <TouchableOpacity style={[st.dlgBtn, { backgroundColor: C.acc }]} onPress={saveRename}><Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>Save</Text></TouchableOpacity>
+            </View>
+          </View>
         </View>
       </Modal>
 
@@ -418,6 +540,37 @@ function Main() {
               <Icon n="speed" size={20} /><Text style={[st.txt, { flex: 1 }]}>Get a clearer voice (phone TTS settings)</Text>
               <Icon n="chevronDown" size={16} color={C.sec} style={{ transform: [{ rotate: '-90deg' }] }} />
             </TouchableOpacity>
+          </View>
+
+          <Text style={st.secT}>Smart notes</Text>
+          <View style={st.group}>
+            <View style={st.line}>
+              <Icon n="file" size={20} />
+              <View style={{ flex: 1 }}><Text style={st.txt}>Smart notes (offline AI)</Text><Text style={st.val}>{llmLine}</Text></View>
+              <Switch value={smart} onValueChange={toggleSmart} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+            {(llm.phase === 'downloading' || llm.phase === 'paused') && (
+              <View style={st.barBg}><View style={[st.barFg, { width: `${llmPct}%` }]} /></View>)}
+            {llm.phase !== 'ready' && (
+              <>
+                <View style={st.sep} />
+                <View style={[st.line, { gap: 8 }]}>
+                  {llm.phase === 'checking' ? <Text style={st.sub}>Checking Wi-Fi and storage…</Text>
+                    : llm.phase === 'downloading' ? (
+                      <>
+                        <TouchableOpacity style={st.miniBtn} onPress={() => pauseDownload()}><Text style={st.txt}>Pause</Text></TouchableOpacity>
+                        <TouchableOpacity style={st.miniBtn} onPress={() => cancelDownload()}><Text style={st.txt}>Cancel</Text></TouchableOpacity>
+                      </>
+                    ) : (
+                      <>
+                        <TouchableOpacity style={[st.miniBtn, { backgroundColor: C.acc }]} onPress={() => beginDownload()}>
+                          <Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>{llm.phase === 'paused' ? 'Resume' : 'Download'}</Text>
+                        </TouchableOpacity>
+                        {llm.phase === 'paused' && <TouchableOpacity style={st.miniBtn} onPress={() => cancelDownload()}><Text style={st.txt}>Cancel</Text></TouchableOpacity>}
+                      </>
+                    )}
+                </View>
+              </>)}
           </View>
 
           <Text style={st.secT}>Background</Text>
@@ -527,7 +680,7 @@ const st = StyleSheet.create({
   drawerH: { flexDirection: 'row', alignItems: 'center', paddingBottom: 6 },
   drawerBtn: { flexDirection: 'row', alignItems: 'center', gap: 12, height: 50, borderRadius: 16, backgroundColor: C.surf, paddingHorizontal: 14 },
   drawerBtnT: { flex: 1, fontSize: 16, fontWeight: '600', color: C.tx },
-  chatRow: { flexDirection: 'row', alignItems: 'center', borderRadius: 12, paddingLeft: 12 },
+  chatRow: { flexDirection: 'row', alignItems: 'center', borderRadius: 12, paddingLeft: 12, minHeight: 68 },
   chatRowOn: { backgroundColor: C.surf },
   sheetBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'flex-end' },
   sheet: { backgroundColor: C.bg, borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 18, paddingTop: 10, gap: 12, maxHeight: '88%', elevation: 16 },
@@ -552,6 +705,16 @@ const st = StyleSheet.create({
   segOn: { backgroundColor: C.acc },
   segT: { fontSize: 14, fontWeight: '600', color: C.tx },
   voiceRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11 },
+  opt: { flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 8, borderRadius: 3, backgroundColor: C.surf, marginTop: 6 },
+  optT: { flex: 1, fontSize: 15, fontWeight: '600', color: C.tx },
+  barBg: { height: 6, borderRadius: 3, backgroundColor: C.bd, overflow: 'hidden', marginBottom: 12 },
+  barFg: { height: 6, borderRadius: 3, backgroundColor: C.acc },
+  miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 12, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
+  dlgBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'center', paddingHorizontal: 24 },
+  dlg: { backgroundColor: C.bg, borderRadius: 20, padding: 18, gap: 14, elevation: 16 },
+  dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.tx },
+  dlgRow: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
+  dlgBtn: { height: 42, paddingHorizontal: 20, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surf },
   cmdRow: { paddingVertical: 10 },
   cmd: { fontSize: 15, fontWeight: '600', color: C.tx },
   cmdD: { fontSize: 13, color: C.sec, marginTop: 1 },
