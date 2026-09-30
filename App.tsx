@@ -6,14 +6,15 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
-import { parse, OK_END, CANCEL_Q } from './src/commands';
+import { parse, isGreeting, OK_END, CANCEL_Q } from './src/commands';
+import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
 import * as R from './src/reader';
 import {
   findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
   listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
 } from './src/db';
-import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, splitMarks, MODELS, Basis } from './src/llm';
+import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis } from './src/llm';
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
@@ -209,8 +210,15 @@ function Main() {
 
   const notFound = (alts: string[]) => push('app', 'Not found in your sources.' + (alts.length ? ` Closest: ${alts.join(', ')}` : ''));
   const makingRef = useRef(false);
+  // a newer request cancels the job that is still running (no more "Still writing, one moment")
+  const freeUp = async (): Promise<boolean> => {
+    if (!makingRef.current) return true;
+    cancelGen();
+    for (let i = 0; i < 25 && makingRef.current; i++) await new Promise((r) => setTimeout(r, 120));
+    return !makingRef.current;
+  };
   const openTopic = async (qRaw: string, exact = false, marksIn = 5) => {
-    if (makingRef.current) { push('app', 'Still writing notes, one moment.'); return; }
+    if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
     const sm = exact ? { q: qRaw, marks: marksIn } : splitMarks(qRaw);
     const f = await findTopic(sm.q, chatRef.current, exact);
     if (f.kind === 'pick' && f.options?.length) { showChoices(f.options, sm.marks); return; }
@@ -222,8 +230,9 @@ function Main() {
     let pts = await getNotes(f.id, useLlm ? 'llm' : 'rule', sm.marks);   // id 0 (part of a big file) is never cached
     if (!pts && useLlm) {
       makingRef.current = true; setWorking('Writing notes…');
-      const r = await llmNotes(f.name, f.body, sm.marks).catch(() => ({ pts: null, notInSource: false }));
+      const r: any = await llmNotes(f.name, f.body, sm.marks, (i, n) => { if (n > 1) setWorking(`Writing notes… part ${i}/${n}`); }).catch(() => ({ pts: null, notInSource: false }));
       makingRef.current = false; setWorking('');
+      if (r.cancelled) return;                                            // you said stop / asked something newer
       if (r.notInSource) { notFound(f.alts); return; }                   // the model found nothing about it in the source
       if (r.pts) { pts = r.pts; await saveNotes(f.id, pts, 'llm', sm.marks); }
     }
@@ -236,10 +245,15 @@ function Main() {
   // ---------------------------------------------------------------------------------------------------------------
   // explain <topic>: the model's OWN knowledge (+ a web lookup). Sources are NOT used.
   const explainTopic = async (qRaw: string) => {
-    if (makingRef.current) { push('app', 'Still writing, one moment.'); return; }
+    if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
     const sm = splitMarks(qRaw);
     const name = sm.q.trim();
     if (!name) { push('app', 'Say or type: explain <topic name>'); return; }
+    // the topic is in your sources (even if the words were heard a little wrong, e.g. "institution" for "estimation"):
+    // read THAT topic, complete, from your books
+    const hit = await findTopic(name, chatRef.current).catch(() => null);
+    if (hit && hit.kind === 'pick' && hit.options?.length) { showChoices(hit.options, sm.marks); return; }
+    if (hit && hit.kind === 'ok' && hit.found) { await openTopic(qRaw); return; }
     makingRef.current = true; setWorking('Explaining…');
     try {
       const useLlm = smart && llm.phase === 'ready';
@@ -248,7 +262,9 @@ function Main() {
       let pts: Point[] | null = null;
       let label = '';
       if (useLlm) {
-        pts = await llmExplain(name, sm.marks, web?.text || '');
+        const r = await llmExplain(name, sm.marks, web?.text || '');
+        if (r.cancelled) return;
+        pts = r.pts;
         label = web ? 'Explained from my own knowledge + the web (not from your sources)' : 'Explained from my own knowledge (not from your sources)';
       }
       if (!pts && web) { pts = makeNotes(web.title, web.text); label = 'From the web (Wikipedia). The smart model is not ready yet'; }
@@ -263,7 +279,7 @@ function Main() {
 
   // A question (spoken "question ... okay", or anything typed): think, use the sources where they fit, add own knowledge
   const answerQuestion = async (q: string) => {
-    if (makingRef.current) { push('app', 'Still writing, one moment.'); return; }
+    if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
     makingRef.current = true; setWorking('Thinking…');
     try {
       const chunks = await searchSources(q, chatRef.current, 3).catch(() => []);
@@ -271,7 +287,7 @@ function Main() {
       if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
       let pts: Point[] | null = null;
       let basis: Basis = 'own';
-      if (useLlm) { const r = await llmAnswer(q, chunks); pts = r.pts; basis = r.basis; }
+      if (useLlm) { const r = await llmAnswer(q, chunks); if (r.cancelled) return; pts = r.pts; basis = r.basis; }
       let label = basis === 'source' ? 'Answer from your sources'
         : basis === 'mixed' ? 'Answer: your sources + my own knowledge'
         : 'Not in your sources. Answered from my own knowledge';
@@ -330,7 +346,7 @@ function Main() {
       case 'repeat': R.repeat(c.arg); break;
       case 'continue': R.resume(); break;
       case 'pause': R.pause(); break;
-      case 'stop': R.stop(); break;
+      case 'stop': R.stop(); cancelGen(); choicesRef.current = null; setWorking(''); break;
       case 'next': R.next(); break;
       case 'prev': R.prev(); break;
       case 'slower': R.setRate(-0.1); break;
@@ -348,7 +364,10 @@ function Main() {
     } else if (c.t === 'unknown') {
       // typed text is a normal chat: answered from your sources + the model's own knowledge.
       // (Spoken words that are not a command are ignored, so talking nearby never triggers anything.)
-      if (via === 'text') await answerQuestion(text);
+      if (via === 'text') {
+        if (isGreeting(text) || !queryTokens(text).length) push('app', 'Hi! Say or type: topic <name>, explain <name>, or ask a question.');
+        else await answerQuestion(text);
+      }
       else push('app', 'Try: topic <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
     }
   };
@@ -363,7 +382,7 @@ function Main() {
   const execRef = useRef(exec);
   execRef.current = exec;
   // Mic stays on; only real commands are accepted, and anything the app is itself speaking is ignored
-  const heardSelf = (t: string) => R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim());
+  const heardSelf = (t: string) => t.trim().split(/\s+/).length >= 3 && R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim());
   const onVoice = (alts: string[]) => {
     if (!alts.length || choiceSpeaking.current) return;
     if (qRef.current) { feedQuestion(alts[0]); return; }          // dictating a question: everything is part of it until "okay"
