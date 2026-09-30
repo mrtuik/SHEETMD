@@ -1,14 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList, Modal, StyleSheet, ScrollView, Pressable, Switch,
-  KeyboardAvoidingView, Platform, PermissionsAndroid, StatusBar, Linking, Image, Keyboard,
+  Platform, PermissionsAndroid, StatusBar, Linking, Image, Keyboard, Alert,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { parse } from './src/commands';
 import { makeNotes } from './src/notes';
 import * as R from './src/reader';
-import { findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, topicName, Source } from './src/db';
+import {
+  findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck,
+  listChats, newChat, deleteChat, loadMsgs, addMsg, Source, Chat,
+} from './src/db';
 import { pickAndImport } from './src/importer';
 import { startListening, stopListening } from './src/listener';
 import { updateService, stopService, onServiceAction } from './src/service';
@@ -37,10 +40,14 @@ export default function App() {
 
 function Main() {
   const ins = useSafeAreaInsets();
-  const [kb, setKb] = useState(false);
+  const rootRef = useRef<View>(null);
+  const [kbPad, setKbPad] = useState(0);
   useEffect(() => {
-    const a = Keyboard.addListener('keyboardDidShow', () => setKb(true));
-    const b = Keyboard.addListener('keyboardDidHide', () => setKb(false));
+    // bottom padding = exactly how much of the screen the keyboard covers, so the input sits right on top of it
+    const a = Keyboard.addListener('keyboardDidShow', (e) => {
+      rootRef.current?.measureInWindow((_x, y, _w, h) => setKbPad(Math.max(0, Math.round(y + h - e.endCoordinates.screenY))));
+    });
+    const b = Keyboard.addListener('keyboardDidHide', () => setKbPad(0));
     return () => { a.remove(); b.remove(); };
   }, []);
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -49,6 +56,10 @@ function Main() {
   const [busy, setBusy] = useState(false);
   const [showSrc, setShowSrc] = useState(false);
   const [showSet, setShowSet] = useState(false);
+  const [showMenu, setShowMenu] = useState(false);
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [chatId, setChatId] = useState(0);
+  const chatRef = useRef(0);
   const [listening, setListening] = useState(false);
   const [awake, setAwake] = useState(true);
   const [, force] = useState(0);
@@ -58,19 +69,60 @@ function Main() {
   const rowY = useRef<Record<number, number>>({});
   const cardH = useRef(0);
   const contentH = useRef(0);
-  const push = (who: Msg['who'], text: string) => setMsgs((m) => [...m, { id: idRef.current++, who, text }]);
-  const refresh = useCallback(async () => setSources(await listSources()), []);
+  const refresh = useCallback(async () => { try { setSources(await listSources()); } catch {} }, []);
+  const refreshChats = useCallback(async () => { try { setChats(await listChats()); } catch {} }, []);
+  // every message is saved to the current chat
+  const push = (who: Msg['who'], text: string) => {
+    setMsgs((m) => [...m, { id: idRef.current++, who, text }]);
+    if (chatRef.current) addMsg(chatRef.current, who, text).then(refreshChats).catch(() => {});
+  };
+  const showChat = async (id: number) => {
+    chatRef.current = id; setChatId(id); rowY.current = {};
+    const m = await loadMsgs(id);
+    idRef.current = (m.length ? Math.max(...m.map((x) => x.id)) : 0) + 1;
+    setMsgs(m);
+  };
+  const resetReader = async () => { R.reset(); await clearSession().catch(() => {}); };
+  const startNew = async () => {
+    setShowMenu(false);
+    await resetReader();
+    if (chatRef.current && msgs.length === 0) return;          // already on an empty chat
+    const id = await newChat();
+    await showChat(id); refreshChats();
+  };
+  const openChat = async (id: number) => {
+    setShowMenu(false);
+    if (id === chatRef.current) return;
+    await resetReader(); await showChat(id);
+  };
+  const removeChat = (c: Chat) => Alert.alert('Delete chat?', c.title, [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Delete', style: 'destructive', onPress: async () => {
+      await deleteChat(c.id);
+      if (c.id === chatRef.current) {
+        await resetReader();
+        const rest = await listChats();
+        await showChat(rest.length ? rest[0].id : await newChat());
+      }
+      refreshChats();
+    } },
+  ]);
 
   useEffect(() => {
     const un = R.subscribe(() => force((x) => x + 1));
-    refresh();
     (async () => {
+      await cleanupStuck().catch(() => {});
+      refresh();
+      let cs = await listChats();
+      const id = cs.length ? cs[0].id : await newChat();
+      await showChat(id);
+      refreshChats();
       const s = await loadSession();
       if (s) {
         const pts = await getNotes(s.topic_id);
         if (pts) R.restore(s.topic_id, await topicName(s.topic_id), pts, s.point_n, s.speed);
       }
-    })();
+    })().catch(() => {});
     return un;
   }, []);
   useEffect(() => { awake ? activateKeepAwakeAsync() : deactivateKeepAwake(); }, [awake]);
@@ -166,10 +218,10 @@ function Main() {
   }, [s.idx, s.status]);
 
   return (
-    <KeyboardAvoidingView style={[st.root, { paddingTop: ins.top + 4 }]} behavior="padding">
+    <View ref={rootRef} collapsable={false} style={[st.root, { paddingTop: ins.top + 4, paddingBottom: kbPad }]}>
       <StatusBar barStyle="dark-content" />
       <View style={st.header}>
-        <TouchableOpacity style={st.hBtn} onPress={() => setShowSrc(true)}><Icon n="menu" size={24} /></TouchableOpacity>
+        <TouchableOpacity style={st.hBtn} onPress={() => { refreshChats(); setShowMenu(true); }}><Icon n="menu" size={24} /></TouchableOpacity>
         <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
         <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
       </View>
@@ -212,7 +264,7 @@ function Main() {
           </View>) : null}
       />
 
-      <View style={[st.dock, { paddingBottom: kb ? 10 : ins.bottom + 12 }]}>
+      <View style={[st.dock, { paddingBottom: kbPad > 0 ? 10 : ins.bottom + 12 }]}>
         <View style={st.box}>
           <TextInput style={st.boxInput} value={input} onChangeText={setInput} multiline
             placeholder="Type or speak · e.g. topic anemia" placeholderTextColor="#8A8A8A" />
@@ -242,6 +294,36 @@ function Main() {
             <TouchableOpacity style={st.ctrlSq} onPress={() => { follow.current = true; R.next(); }}><Icon n="next" size={22} /></TouchableOpacity>
           </View>)}
       </View>
+
+      <Modal visible={showMenu} transparent statusBarTranslucent navigationBarTranslucent animationType="fade" onRequestClose={() => setShowMenu(false)}>
+        <View style={st.drawerBg}>
+          <View style={[st.drawer, { paddingTop: ins.top + 8, paddingBottom: ins.bottom + 12 }]}>
+            <View style={st.drawerH}>
+              <Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" />
+              <Text style={[st.title, { flex: 1, marginLeft: 8 }]}>Sheet.md</Text>
+              <TouchableOpacity style={st.closeBtn} onPress={() => setShowMenu(false)}><Icon n="close" size={18} /></TouchableOpacity>
+            </View>
+            <TouchableOpacity style={st.drawerBtn} onPress={startNew}>
+              <Icon n="plus" size={20} /><Text style={st.drawerBtnT}>New chat</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={st.drawerBtn} onPress={() => { setShowMenu(false); setShowSrc(true); }}>
+              <Icon n="file" size={20} /><Text style={st.drawerBtnT}>Workspace</Text><Text style={st.sub}>{ready} sources</Text>
+            </TouchableOpacity>
+            <Text style={[st.secT, { marginTop: 14 }]}>Chats</Text>
+            <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
+              {chats.length === 0 && <Text style={[st.sub, { padding: 12 }]}>No chats yet</Text>}
+              {chats.map((c) => (
+                <View key={c.id} style={[st.chatRow, c.id === chatId && st.chatRowOn]}>
+                  <TouchableOpacity style={{ flex: 1, paddingVertical: 12 }} onPress={() => openChat(c.id)}>
+                    <Text style={[st.txt, c.id === chatId && { fontWeight: '700' }]} numberOfLines={1}>{c.title}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={st.hBtn} onPress={() => removeChat(c)}><Icon n="trash" size={18} color={C.sec} /></TouchableOpacity>
+                </View>))}
+            </ScrollView>
+          </View>
+          <Pressable style={{ flex: 1 }} onPress={() => setShowMenu(false)} />
+        </View>
+      </Modal>
 
       <Sheet visible={showSrc} onClose={() => setShowSrc(false)} title="Sources" subtitle={`${ready} ready`} bottom={ins.bottom}>
         <TouchableOpacity style={st.addBtn} onPress={addFiles}>
@@ -305,7 +387,7 @@ function Main() {
           <Text style={[st.sub, { paddingHorizontal: 4 }]}>Bangla mode also understands: থামো, পরের, আগের, আবার, চালু</Text>
         </ScrollView>
       </Sheet>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
@@ -381,6 +463,13 @@ const st = StyleSheet.create({
   ctrlWide: { flex: 1, height: 54, borderWidth: 1.5, borderColor: C.bd, borderRadius: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
   ctrlT: { fontSize: 16, fontWeight: '600', color: C.tx },
 
+  drawerBg: { flex: 1, flexDirection: 'row', backgroundColor: 'rgba(0,0,0,0.35)' },
+  drawer: { width: '80%', maxWidth: 340, backgroundColor: C.bg, paddingHorizontal: 14, gap: 8, elevation: 16 },
+  drawerH: { flexDirection: 'row', alignItems: 'center', paddingBottom: 6 },
+  drawerBtn: { flexDirection: 'row', alignItems: 'center', gap: 12, height: 50, borderRadius: 16, backgroundColor: C.surf, paddingHorizontal: 14 },
+  drawerBtnT: { flex: 1, fontSize: 16, fontWeight: '600', color: C.tx },
+  chatRow: { flexDirection: 'row', alignItems: 'center', borderRadius: 12, paddingLeft: 12 },
+  chatRowOn: { backgroundColor: C.surf },
   sheetBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'flex-end' },
   sheet: { backgroundColor: C.bg, borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 18, paddingTop: 10, gap: 12, maxHeight: '88%', elevation: 16 },
   grab: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, backgroundColor: '#D4D4D4', marginBottom: 2 },
