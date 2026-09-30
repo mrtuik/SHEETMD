@@ -196,7 +196,7 @@ function supported(line: string, srcN: string, srcWords: Set<string>): boolean {
   return hit / ws.length >= 0.6;                                                 // most words must come from the source
 }
 
-function parseAnswer(text: string, src: string, hi: number): Point[] {
+function parseAnswer(text: string, src: string, hi: number, check = true): Point[] {
   const srcN = flat(src);
   const srcWords = new Set(srcN.match(/\p{L}{4,}/gu) || []);
   const pts: Omit<Point, 'n'>[] = [];
@@ -211,7 +211,7 @@ function parseAnswer(text: string, src: string, hi: number): Point[] {
     body = body.replace(/\*+/g, '').trim();
     if (!title) continue;
     const line = `${title} ${body}`;
-    if (!supported(line, srcN, srcWords)) continue;
+    if (check && !supported(line, srcN, srcWords)) continue;
     pts.push({ title, text: /[.!?।]$/.test(body || title) ? (body || title) : (body || title) + '.' });
     if (pts.length >= hi) break;
   }
@@ -249,4 +249,85 @@ export async function llmNotes(name: string, body: string, marks: number): Promi
     const pts = parseAnswer(text, src, hi);
     return { pts: pts.length >= 2 ? pts : null, notInSource: false };
   } catch { clearTimeout(timer); return { pts: null, notInSource: false }; }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// "explain <topic>": the model's OWN knowledge (an optional web reference helps). Not limited to the user's sources.
+const EXPLAIN_SYS = (lo: number, hi: number) => `You are a medical laboratory technology tutor. Explain the topic like a topper's exam copy, from your own correct textbook knowledge.
+A REFERENCE (from the web) may be given: use it when it helps, ignore it when it is off-topic.
+Never invent numbers, names or facts you are not sure about. Answer in the language of the topic.
+Format: numbered points, one per line, exactly like:
+1. **Keyword**: short line
+Rules: no introduction, no conclusion. Each line at most 18 words. Bold only the keyword.
+Order (skip what does not apply): Definition, Classification, Etiology, Pathogenesis, Clinical features, Lab diagnosis, Complications, Treatment.
+Write ${lo} to ${hi} points.`;
+
+export async function llmExplain(name: string, marks: number, ref = ''): Promise<Point[] | null> {
+  const c = await getCtx();
+  if (!c) return null;
+  const [lo, hi] = range(marks);
+  const refTxt = ref ? `\n\nREFERENCE:\n${ref.slice(0, llm.model === 'q05' ? 1800 : 2600)}` : '';
+  let timer: any;
+  try {
+    const run = c.completion({
+      messages: [
+        { role: 'system', content: EXPLAIN_SYS(lo, hi) },
+        { role: 'user', content: `Topic: ${name}\nMarks: ${marks}${refTxt}\n\nWrite the answer.` },
+      ],
+      n_predict: marks >= 10 ? 800 : 500, temperature: 0.2, top_p: 0.9, penalty_repeat: 1.1,
+      stop: ['<|im_end|>', '<|endoftext|>'],
+    });
+    const out: any = await Promise.race([
+      run,
+      new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
+    ]);
+    clearTimeout(timer); touch();
+    const pts = parseAnswer(String(out?.text || ''), '', hi, false);
+    return pts.length >= 2 ? pts : null;
+  } catch { clearTimeout(timer); return null; }
+}
+
+// A spoken / typed QUESTION: the model thinks, uses the user's source excerpts where they help, and adds its own
+// knowledge where the sources are silent. `basis` says how much of the answer really came from the sources.
+const ANSWER_SYS = `You are a medical laboratory technology tutor answering a student's question as a topper's exam answer.
+You get SOURCE excerpts from the student's own notes. Think about the question, then answer it.
+Use the SOURCE facts whenever they are relevant. If the SOURCE is missing or incomplete, complete the answer with correct standard textbook knowledge.
+Never invent numbers, names or facts you are not sure about. Answer in the language of the question.
+Format: numbered points, one per line, exactly like:
+1. **Keyword**: short line
+Rules: no introduction, no conclusion. Each line at most 20 words. Bold only the keyword. Write 4 to 8 points.`;
+
+export type Basis = 'source' | 'mixed' | 'own';
+export type AnswerResult = { pts: Point[] | null; basis: Basis };
+
+export async function llmAnswer(question: string, chunks: { name: string; body: string }[]): Promise<AnswerResult> {
+  const c = await getCtx();
+  if (!c) return { pts: null, basis: 'own' };
+  const per = llm.model === 'q05' ? 900 : 1500;
+  const src = chunks.map((x, i) => `[${i + 1}] ${x.name}\n${x.body.slice(0, per)}`).join('\n\n').slice(0, MAXSRC());
+  let timer: any;
+  try {
+    const run = c.completion({
+      messages: [
+        { role: 'system', content: ANSWER_SYS },
+        { role: 'user', content: `QUESTION: ${question}\n\nSOURCE:\n${src || '(nothing found in the sources)'}\n\nWrite the answer.` },
+      ],
+      n_predict: 600, temperature: 0.2, top_p: 0.9, penalty_repeat: 1.1,
+      stop: ['<|im_end|>', '<|endoftext|>'],
+    });
+    const out: any = await Promise.race([
+      run,
+      new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
+    ]);
+    clearTimeout(timer); touch();
+    const text = String(out?.text || '');
+    const pts = parseAnswer(text, '', 10, false);
+    if (pts.length < 2) return { pts: null, basis: 'own' };
+    // how much of the answer is really supported by the source excerpts (checked in code, not trusted from the model)
+    const srcN = flat(src);
+    const srcWords = new Set(srcN.match(/\p{L}{4,}/gu) || []);
+    const hit = src ? pts.filter((p) => supported(`${p.title} ${p.text}`, srcN, srcWords)).length : 0;
+    const basis: Basis = hit === 0 ? 'own' : hit >= pts.length * 0.8 ? 'source' : 'mixed';
+    return { pts, basis };
+  } catch { clearTimeout(timer); return { pts: null, basis: 'own' }; }
 }
