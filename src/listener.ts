@@ -1,5 +1,9 @@
 // Always-on listening: one tap starts it, it auto-restarts until you tap again.
 // The recognizer's start/stop beep is muted while listening, and restarts back off so it doesn't churn.
+//
+// IMPORTANT (why voice commands stopped working): the recognizer must be restarted only AFTER it has delivered its
+// result. Restarting right at "speech end" destroys the recognizer before the final text arrives, so a command
+// such as "topic microscope" was lost. Now: result / error -> restart; speech end only starts a safety timer.
 import { muteBeep } from './service';
 
 let Voice: any = null;
@@ -9,49 +13,53 @@ let on = false;
 let starting = false;
 let errs = 0;
 let timer: any = null;
-let cb: (t: string) => void = () => {};
+let guard: any = null;
+let cb: (t: string[]) => void = () => {};
 let loc: () => string = () => 'en-US';
 let notify: (b: boolean) => void = () => {};
 let partial: (t: string) => boolean = () => false;   // true = the partial words were a complete command and already ran
 let handled = false;                                  // a partial result of this utterance already ran its command
 
-const schedule = (ms = 120) => { clearTimeout(timer); timer = setTimeout(begin, ms); };
+const schedule = (ms = 250) => { clearTimeout(timer); timer = setTimeout(begin, ms); };
 async function begin() {
   if (!on || !Voice || starting) return;
   starting = true;
-  try {
-    await Voice.start(loc(), {
-      EXTRA_PARTIAL_RESULTS: true,
-      EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 600,
-      EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 400,
-      EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS: 250,
-    });
-  }
+  try { await Voice.start(loc(), { EXTRA_PARTIAL_RESULTS: true, EXTRA_MAX_RESULTS: 5 }); }
   catch { errs++; schedule(Math.min(1000 + errs * 700, 6000)); }
   finally { starting = false; }
 }
 
-export async function startListening(onText: (t: string) => void, getLocale: () => string, onState: (b: boolean) => void, onPartial?: (t: string) => boolean) {
+export async function startListening(onTexts: (t: string[]) => void, getLocale: () => string, onState: (b: boolean) => void, onPartial?: (t: string) => boolean) {
   if (!Voice) return false;
-  cb = onText; loc = getLocale; notify = onState; on = true; errs = 0; partial = onPartial || (() => false); handled = false;
+  cb = onTexts; loc = getLocale; notify = onState; on = true; errs = 0; partial = onPartial || (() => false); handled = false;
   muteBeep(true);
-  Voice.onSpeechStart = () => { errs = 0; handled = false; };
+  Voice.onSpeechStart = () => { errs = 0; handled = false; clearTimeout(guard); };
   Voice.onSpeechPartialResults = (e: any) => { const t = e.value?.[0]; if (t && !handled && partial(t)) handled = true; };
-  Voice.onSpeechResults = (e: any) => { const t = e.value?.[0]; if (t && !handled) cb(t); handled = false; };
-  Voice.onSpeechEnd = () => schedule(120);
+  Voice.onSpeechResults = (e: any) => {
+    clearTimeout(guard);
+    const v: string[] = (e.value || []).filter(Boolean);
+    if (v.length && !handled) cb(v);
+    handled = false;
+    schedule(250);                                   // restart only now: the result has been delivered
+  };
+  Voice.onSpeechEnd = () => {                        // the result normally follows within a moment; if it never comes, restart anyway
+    clearTimeout(guard);
+    guard = setTimeout(() => schedule(0), 2500);
+  };
   Voice.onSpeechError = async (e: any) => {
+    clearTimeout(guard);
     const code = Number(e?.error?.code ?? e?.error?.message?.match?.(/\d+/)?.[0]);
     const quiet = code === 6 || code === 7;          // timeout / nothing heard: normal while silent
     if (!quiet) errs++;
     try { await Voice.cancel(); } catch {}
-    schedule(quiet ? 120 : Math.min(900 + errs * 600, 6000));
+    schedule(quiet ? 250 : Math.min(900 + errs * 600, 6000));
   };
   notify(true);
   begin();
   return true;
 }
 export async function stopListening() {
-  on = false; clearTimeout(timer);
+  on = false; clearTimeout(timer); clearTimeout(guard);
   try { await Voice?.cancel(); } catch {}
   muteBeep(false);
   notify(false);
