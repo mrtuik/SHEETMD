@@ -1,7 +1,8 @@
 import * as SQLite from 'expo-sqlite';
 import type { Point } from './notes';
 import { norm, focus, GENERIC } from './mdsplit';
-import { words, textScore, gramQuery } from './fuzzy';
+import { gramQuery } from './fuzzy';
+import { queryTokens, expandAbbr, variants, rankTopics, decide, isQuestionName, isQuestionBody, stripQuestions, covers, isJunkHeading } from './match';
 
 type DB = SQLite.SQLiteDatabase;
 let _p: Promise<DB> | null = null;
@@ -25,6 +26,9 @@ function openDb(): Promise<DB> {
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
         CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(name, body, topic_id UNINDEXED);
       `);
+      // each chat owns its sources (old databases get the column added; old sources are adopted by adoptOldSources)
+      try { await d.execAsync('ALTER TABLE sources ADD COLUMN chat_id INTEGER'); } catch {}
+      await d.execAsync('CREATE INDEX IF NOT EXISTS src_chat ON sources(chat_id)');
       // Typo-tolerant index (FTS5 trigram tokenizer, built into SQLite on the phone - nothing to download).
       // Filled from the existing `fts` table once, so sources added earlier do NOT need to be added again.
       try {
@@ -64,8 +68,8 @@ export const cleanupStuck = () => run((d) => d.runAsync("UPDATE sources SET stat
 
 export type Source = { id: number; name: string; type: string; status: string; info: string };
 
-export const addSource = (name: string, type: string, status = 'ready', info = '') => run(async (d) => {
-  const r = await d.runAsync('INSERT INTO sources(name,type,status,info) VALUES(?,?,?,?)', [name, type, status, info]);
+export const addSource = (name: string, type: string, status = 'ready', info = '', chatId = 0) => run(async (d) => {
+  const r = await d.runAsync('INSERT INTO sources(name,type,status,info,chat_id) VALUES(?,?,?,?,?)', [name, type, status, info, chatId || null]);
   return r.lastInsertRowId;
 });
 export const updateSource = (id: number, status: string, info: string) =>
@@ -80,87 +84,125 @@ export const addTopics = (sourceId: number, topics: { name: string; body: string
     }
   });
 });
-export const listSources = () => run((d) => d.getAllAsync<Source>('SELECT * FROM sources ORDER BY id DESC'));
-export const removeSource = (id: number) => run(async (d) => {
-  await d.withTransactionAsync(async () => {
-    const ids = 'SELECT id FROM topics WHERE source_id=?';
-    await d.runAsync(`DELETE FROM fts WHERE topic_id IN (${ids})`, [id]);
-    if (triOk) await d.runAsync(`DELETE FROM fts_tri WHERE topic_id IN (${ids})`, [id]);
-    await d.runAsync(`DELETE FROM notes WHERE topic_id IN (${ids})`, [id]);
-    await d.runAsync('DELETE FROM topics WHERE source_id=?', [id]);
-    await d.runAsync('DELETE FROM sources WHERE id=?', [id]);
-  });
+// only the sources of ONE chat
+export const listSources = (chatId: number) => run((d) => d.getAllAsync<Source>('SELECT * FROM sources WHERE chat_id=? ORDER BY id DESC', [chatId]));
+// sources that belong to no chat yet (added before chats owned sources) go to the OLDEST chat
+export const adoptOldSources = () => run(async (d) => {
+  const c = await d.getFirstAsync<{ id: number }>('SELECT id FROM chats ORDER BY created_at ASC, id ASC LIMIT 1');
+  if (c) await d.runAsync('UPDATE sources SET chat_id=? WHERE chat_id IS NULL', [c.id]);
 });
 
-// FR-2/FR-4: search across all sources, then read ONLY what was asked for.
-//  1. word search (exact + prefix) and typo-tolerant trigram search give candidate topics
-//  2. a topic whose NAME matches the query wins -> that topic (with its sub-sections) is read
-//  3. otherwise the best body match is narrowed down to the matching section / paragraph (focus) - never the whole file
-export const findTopic = (q: string) => run((d) => findTopicIn(d, q));
-type Row = { topic_id: number; name: string };
-async function findTopicIn(d: DB, q: string) {
-  const toks = words(norm(q));
-  if (!toks.length) return null;
+// removes topics + notes + both search indexes (+ a saved session) of the given sources
+const SRC_OF_CHAT = 'SELECT id FROM sources WHERE chat_id=?';
+async function wipe(d: DB, srcSql: string, args: (number | string)[]) {
+  const tids = `SELECT id FROM topics WHERE source_id IN (${srcSql})`;
+  await d.runAsync(`DELETE FROM fts WHERE topic_id IN (${tids})`, args);
+  if (triOk) await d.runAsync(`DELETE FROM fts_tri WHERE topic_id IN (${tids})`, args);
+  await d.runAsync(`DELETE FROM notes WHERE topic_id IN (${tids})`, args);
+  await d.runAsync(`DELETE FROM session WHERE topic_id IN (${tids})`, args);
+  await d.runAsync(`DELETE FROM topics WHERE source_id IN (${srcSql})`, args);
+}
+const shrink = async (d: DB) => { try { await d.execAsync('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;'); } catch {} };   // give the storage back
 
-  const wordMatch = toks.map((t) => `"${t}"*`).join(' OR ');
+export const removeSource = (id: number) => run(async (d) => {
+  await d.withTransactionAsync(async () => {
+    await wipe(d, 'SELECT ?', [id]);
+    await d.runAsync('DELETE FROM sources WHERE id=?', [id]);
+  });
+  await shrink(d);
+});
+
+// Search order (per chat): 1) topic NAME (typo / abbreviation / synonym / sound-alike tolerant)  2) topic BODY.
+//  - sure about the name -> that topic; unsure -> the top 3 names (kind 'pick'); nothing close -> body search
+//  - MCQ / question chunks are never returned (hard filter), and the chunk must really contain the query words
+export type Found = { kind: 'ok' | 'pick' | 'none'; found: boolean; id: number; name: string; body: string; alts: string[]; options?: string[] };
+const none = (alts: string[] = []): Found => ({ kind: 'none', found: false, id: 0, name: '', body: '', alts });
+
+export const findTopic = (q: string, chatId: number, exact = false) => run((d) => findTopicIn(d, q, chatId, exact));
+type Row = { topic_id: number; name: string };
+
+async function nameBody(d: DB, id: number, name: string): Promise<string> {
+  // same-name parts of the SAME file are joined
+  const same = await d.getAllAsync<{ body: string }>(
+    'SELECT body FROM topics WHERE lower(name)=lower(?) AND source_id=(SELECT source_id FROM topics WHERE id=?) ORDER BY id', [name, id]);
+  return same.map((x) => x.body).join('\n');
+}
+
+async function findTopicIn(d: DB, q: string, chatId: number, exact: boolean): Promise<Found> {
+  const scope = 'JOIN sources s ON s.id = t.source_id WHERE s.chat_id = ? AND s.status = \'ready\'';
+  if (exact) {                                               // the user tapped / said one of the 3 options
+    const r = await d.getFirstAsync<{ id: number; name: string }>(`SELECT t.id AS id, t.name AS name FROM topics t ${scope} AND lower(t.name)=lower(?) ORDER BY t.id LIMIT 1`, [chatId, q]);
+    if (!r) return none();
+    const body = stripQuestions(await nameBody(d, r.id, r.name));
+    return body.length > 20 && !isQuestionBody(body) ? { kind: 'ok', found: true, id: r.id, name: r.name, body, alts: [] } : none();
+  }
+
+  const toks = queryTokens(q);
+  if (!toks.length) return none();
+
+  // 1) name match
+  const names = await d.getAllAsync<{ id: number; name: string }>(`SELECT t.id AS id, t.name AS name FROM topics t ${scope}`, [chatId]);
+  const ranked = rankTopics(toks, names);
+  const dec = decide(ranked);
+  if (dec.kind === 'options') return { kind: 'pick', found: false, id: 0, name: '', body: '', alts: dec.options, options: dec.options };
+  if (dec.kind === 'auto' && dec.top) {
+    const body = stripQuestions(await nameBody(d, dec.top.id, dec.top.name));
+    if (body.length > 20 && !isQuestionBody(body) && covers(toks, dec.top.name + '\n' + body)) {
+      return { kind: 'ok', found: true, id: dec.top.id, name: dec.top.name, body, alts: ranked.slice(1, 4).map((x) => x.name) };
+    }
+  }
+
+  // 2) body match (words + typo-tolerant trigrams), question chunks filtered out
+  const ex = expandAbbr(toks);
+  const ftsToks = [...new Set([...toks, ...ex].filter((t) => t.length >= 2))];
+  const wordMatch = ftsToks.map((t) => `"${t}"*`).join(' OR ');
   let rows: Row[] = [];
   try {
     rows = await d.getAllAsync<Row>(
-      'SELECT fts.topic_id AS topic_id, t.name AS name FROM fts JOIN topics t ON t.id = fts.topic_id WHERE fts MATCH ? ORDER BY bm25(fts,10.0,1.0) LIMIT 30', [wordMatch]);
+      `SELECT fts.topic_id AS topic_id, t.name AS name FROM fts JOIN topics t ON t.id = fts.topic_id JOIN sources s ON s.id = t.source_id
+       WHERE fts MATCH ? AND s.chat_id = ? AND s.status = 'ready' ORDER BY bm25(fts,10.0,1.0) LIMIT 30`, [wordMatch, chatId]);
   } catch {}
   let fuzzy: Row[] = [];
-  const gq = gramQuery(toks);
+  const gq = gramQuery(ftsToks);
   if (triOk && gq) {
     try {
       fuzzy = await d.getAllAsync<Row>(
-        'SELECT fts_tri.topic_id AS topic_id, t.name AS name FROM fts_tri JOIN topics t ON t.id = fts_tri.topic_id WHERE fts_tri MATCH ? ORDER BY bm25(fts_tri,20.0,1.0) LIMIT 40', [gq]);
+        `SELECT fts_tri.topic_id AS topic_id, t.name AS name FROM fts_tri JOIN topics t ON t.id = fts_tri.topic_id JOIN sources s ON s.id = t.source_id
+         WHERE fts_tri MATCH ? AND s.chat_id = ? AND s.status = 'ready' ORDER BY bm25(fts_tri,20.0,1.0) LIMIT 40`, [gq, chatId]);
     } catch {}
   }
-
   const seen = new Set<number>();
-  const cands = [...rows, ...fuzzy].filter((r) => (seen.has(r.topic_id) ? false : (seen.add(r.topic_id), true)));
-  if (!cands.length) {
-    const alts = await d.getAllAsync<{ name: string }>('SELECT DISTINCT name FROM topics WHERE name LIKE ? LIMIT 3', [`%${toks[0].slice(0, 3)}%`]);
-    return { id: 0, name: '', body: '', alts: alts.map((a) => a.name), found: false };
+  const cands = [...rows, ...fuzzy].filter((r) => !isQuestionName(r.name) && (seen.has(r.topic_id) ? false : (seen.add(r.topic_id), true))).slice(0, 10);
+
+  for (const c of cands) {
+    const one = await d.getFirstAsync<{ name: string; body: string }>('SELECT name, body FROM topics WHERE id=?', [c.topic_id]);
+    if (!one || isQuestionBody(one.body)) continue;
+    const part = focus(one.body, ex);
+    const body = stripQuestions(part.body);
+    if (body.length < 20 || isQuestionBody(body)) continue;
+    if (!covers(toks, part.name + '\n' + body)) continue;      // the asked words are not really in this chunk
+    const nm = isJunkHeading(part.name) ? one.name : GENERIC.has(part.name.toLowerCase()) ? `${one.name} - ${part.name}` : part.name === ex.join(' ') ? one.name : part.name;
+    return { kind: 'ok', found: true, id: 0, name: nm, body, alts: ranked.slice(0, 3).map((x) => x.name) };   // id 0 = do not cache
   }
-
-  // name score: how well does the topic NAME cover the query words (typos allowed)?
-  const scored = cands.map((r) => ({ r, s: textScore(toks, norm(r.name)) }));
-  scored.sort((a, b) => (b.s - a.s) || (a.r.name.length - b.r.name.length));
-  const top = scored[0];
-  const alts = (list: { r: Row }[], not: string) =>
-    [...new Set(list.map((x) => x.r.name).filter((n) => n.toLowerCase() !== not.toLowerCase()))].slice(0, 3);
-
-  if (top.s >= 0.72) {
-    // name matches: read that topic (same-name parts of the SAME file are joined)
-    const best = top.r;
-    const same = await d.getAllAsync<{ body: string }>(
-      'SELECT body FROM topics WHERE lower(name)=lower(?) AND source_id=(SELECT source_id FROM topics WHERE id=?) ORDER BY id', [best.name, best.topic_id]);
-    const body = same.map((x) => x.body).join('\n');
-    return { id: best.topic_id, name: best.name, body, alts: alts(scored, best.name), found: true };
-  }
-
-  // body match: the first word-search hit, else the best typo-tolerant hit - narrowed to the asked part only
-  const pick = rows[0] ?? scored.find((x) => x.s >= 0.5)?.r ?? fuzzy[0];
-  if (!pick) return { id: 0, name: '', body: '', alts: alts(scored, ''), found: false };
-  const one = await d.getFirstAsync<{ name: string; body: string }>('SELECT name, body FROM topics WHERE id=?', [pick.topic_id]);
-  if (!one) return { id: 0, name: '', body: '', alts: alts(scored, ''), found: false };
-  const ex = focus(one.body, toks);
-  // a hit inside "Principle" / "Procedure" is shown under its topic's name
-  const nm = GENERIC.has(ex.name.toLowerCase()) ? `${one.name} - ${ex.name}` : ex.name === toks.join(' ') ? one.name : ex.name;
-  return { id: 0, name: nm, body: ex.body, alts: alts(scored, nm), found: true };   // id 0 = do not cache
+  return none([...new Set([...dec.options, ...ranked.slice(0, 3).map((x) => x.name)])].slice(0, 3));
 }
 
-const NOTES_V = 2;   // bump when the notes format changes: old cached notes are rebuilt
-export const getNotes = (topicId: number): Promise<Point[] | null> => run(async (d) => {
+const NOTES_V = 3;   // bump when the notes format changes: old cached notes are rebuilt
+// mode 'llm' wants smart notes for the same marks; mode 'rule' accepts whatever is cached
+export const getNotes = (topicId: number, mode: 'rule' | 'llm' = 'rule', marks = 5): Promise<Point[] | null> => run(async (d) => {
   if (!topicId) return null;
   const r = await d.getFirstAsync<{ points_json: string }>('SELECT points_json FROM notes WHERE topic_id=?', [topicId]);
   if (!r) return null;
-  try { const j = JSON.parse(r.points_json); return j && j.v === NOTES_V ? j.pts : null; } catch { return null; }
+  try {
+    const j = JSON.parse(r.points_json);
+    if (!j || j.v !== NOTES_V) return null;
+    if (mode === 'llm' && !(j.mode === 'llm' && j.marks === marks)) return null;
+    return j.pts;
+  } catch { return null; }
 });
-export const saveNotes = (topicId: number, pts: Point[]) => run(async (d) => {
+export const saveNotes = (topicId: number, pts: Point[], mode: 'rule' | 'llm' = 'rule', marks = 0) => run(async (d) => {
   if (!topicId) return;
-  await d.runAsync('INSERT OR REPLACE INTO notes VALUES(?,?,?)', [topicId, JSON.stringify({ v: NOTES_V, pts }), Date.now()]);
+  await d.runAsync('INSERT OR REPLACE INTO notes VALUES(?,?,?)', [topicId, JSON.stringify({ v: NOTES_V, mode, marks, pts }), Date.now()]);
 });
 export const topicName = (id: number) => run(async (d) => {
   const r = await d.getFirstAsync<{ name: string }>('SELECT name FROM topics WHERE id=?', [id]);
@@ -182,12 +224,18 @@ export const newChat = () => run(async (d) => {
   const r = await d.runAsync('INSERT INTO chats(title,created_at,updated_at) VALUES(?,?,?)', ['New chat', t, t]);
   return r.lastInsertRowId;
 });
+// deleting a chat deletes EVERYTHING it owns: messages, sources, topics, notes, search index
 export const deleteChat = (id: number) => run(async (d) => {
   await d.withTransactionAsync(async () => {
+    await wipe(d, SRC_OF_CHAT, [id]);
+    await d.runAsync('DELETE FROM sources WHERE chat_id=?', [id]);
     await d.runAsync('DELETE FROM msgs WHERE chat_id=?', [id]);
     await d.runAsync('DELETE FROM chats WHERE id=?', [id]);
   });
+  await shrink(d);
 });
+export const renameChat = (id: number, title: string) =>
+  run((d) => d.runAsync('UPDATE chats SET title=? WHERE id=?', [title.trim().slice(0, 60) || 'New chat', id]));
 export const loadMsgs = (chatId: number) =>
   run((d) => d.getAllAsync<{ id: number; who: 'you' | 'app'; text: string }>('SELECT id,who,text FROM msgs WHERE chat_id=? ORDER BY id', [chatId]));
 export const addMsg = (chatId: number, who: 'you' | 'app', text: string) => run(async (d) => {
