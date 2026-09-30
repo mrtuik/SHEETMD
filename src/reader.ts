@@ -81,9 +81,9 @@ async function run(from: number, intro?: string, chunk = 0) {
 }
 
 // Always says the topic name first, then reads point by point until you interrupt.
-export function startTopic(id: number, name: string, points: Point[]) {
+export function startTopic(id: number, name: string, points: Point[], intro?: string) {
   state.topicId = id; state.topic = name; state.points = points; after = null; resumeAt = 0;
-  run(0, `Topic ${name}. ${points.length} points.`);
+  run(0, intro ?? `Topic ${name}. ${points.length} points.`);
 }
 export function restore(id: number, name: string, points: Point[], n: number, rate: number) {
   Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), chunk: 0, rate, status: 'paused' });
