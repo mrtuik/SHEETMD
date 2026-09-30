@@ -3,21 +3,10 @@ import * as DocumentPicker from 'expo-document-picker';
 import JSZip from 'jszip';
 import { addSource, addTopics, updateSource } from './db';
 import * as Pdf from './pdfnative';
+import { splitTopics } from './mdsplit';
 
 const TEXT = /\.(md|txt)$/i, PDF = /\.pdf$/i, IMG = /\.(jpe?g|png)$/i;
-type T = { name: string; body: string };
-
-export function splitTopics(fileName: string, text: string): T[] {
-  const isH = (l: string) => /^#{1,3}\s+\S/.test(l) || /^(chapter|unit|lesson)\s+\d+/i.test(l.trim());
-  const res: { name: string; body: string[] }[] = [];
-  let cur: { name: string; body: string[] } | null = null;
-  for (const l of text.replace(/\r/g, '').split('\n')) {
-    if (isH(l)) { if (cur) res.push(cur); cur = { name: l.replace(/^#+\s*/, '').trim(), body: [] }; }
-    else { if (!cur) cur = { name: fileName.replace(/\.[^.]+$/, ''), body: [] }; cur.body.push(l); }
-  }
-  if (cur) res.push(cur);
-  return res.map((r) => ({ name: r.name, body: r.body.join('\n').trim() })).filter((r) => r.body.length > 20);
-}
+type T = { name: string; body: string; own?: string };
 
 // ---- PDF heading detection + streaming splitter (works page by page, so any size) ----
 function isHeading(l: string) {
