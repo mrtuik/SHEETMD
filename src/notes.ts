@@ -10,6 +10,12 @@ const HEAD = /^\s{0,3}#{1,6}\s+(\S.*?)\s*#*\s*$/;
 const BOLD = /^\s*\*\*([^*\n]{2,80}?)\*\*:?\s*$/;
 const BULLET = /^\s*([-*+•▪◦●○■□]|\d+[.)])\s+(.*)$/;
 const DEF = /\b(is|are|refers to|means|defined as|mane|holo)\b/i;
+const DEF_STRONG = /\b(is an?|is the|are the|are an?|is defined|is called|is known|refers to|means|defined as|mane|holo)\b/i;
+const isDef = (s: string, nm: string) => {                                  // "Meningitis is inflammation of..." also counts
+  if (DEF_STRONG.test(s)) return true;
+  const w = nm.toLowerCase().match(/[a-z\u0980-\u09FF]{3,}/)?.[0];
+  return !!w && new RegExp('^\\W*' + w.slice(0, Math.max(4, w.length - 2)) + '\\w*\\s+(is|are|means|refers)\\s+(?!\\w+(ed|ing)\\b)', 'i').test(s);
+};
 const EX = /(for example|e\.g\.|such as|formula|example)|=/i;
 
 const title = (s: string) => stripMarkdown(s).replace(/^\d+[.)]\s+/, '').replace(/[:：]+$/, '').trim();
@@ -112,18 +118,18 @@ export function makeNotes(name: string, body: string): Point[] {
 
   if (!secs.length) {
     if (!pre.length) return [{ n: 1, title: 'Empty', text: 'No content found for this topic.' }];
-    const di = Math.max(0, pre.findIndex((s) => DEF.test(s)));
-    def = unlabel(pre[di]);
+    const di = pre.slice(0, 3).findIndex((s) => isDef(s, nm));        // only a real defining sentence becomes "Definition"
+    if (di >= 0) def = unlabel(pre[di]);
     const rest = pre.filter((_, i) => i !== di);
     const examples = rest.filter((s) => EX.test(s));
-    pts.push({ title: 'Definition', text: endP(def) });
+    if (di >= 0) pts.push({ title: 'Definition', text: endP(def) });
     rest.filter((s) => !EX.test(s)).slice(0, 25).forEach((k) => pts.push({ title: label(k), text: endP(k) }));
     if (examples.length) pts.push({ title: 'Examples', text: examples.slice(0, 4).map(endP).join(' ') });
   } else {
     const hasDef = secs.some((s) => /^definition/i.test(s.title));
     let rest = pre;
     if (!hasDef) {
-      const di = pre.findIndex((s) => DEF.test(s));
+      const di = pre.slice(0, 3).findIndex((s) => isDef(s, nm));
       if (di >= 0) { def = unlabel(pre[di]); rest = pre.filter((_, i) => i !== di); pts.push({ title: 'Definition', text: endP(def) }); }
     }
     groups(rest).forEach((g, k) => pts.push({ title: k ? `Overview, part ${k + 1}` : 'Overview', text: g.map(endP).join(' ') }));
