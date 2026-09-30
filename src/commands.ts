@@ -22,8 +22,26 @@ export const OK_END = /(?:^|\s)(?:okay|ok|okey|o\.k\.?|ওকে|ঠিক আ�
 // words that cancel a question that is being dictated
 export const CANCEL_Q = /^(?:cancel|stop|never ?mind|বাতিল|স্টপ)$/i;
 
+// What the phone's speech recogniser often writes for a playback command (accent / noise) -> the real command.
+const ALIAS: Record<string, Cmd['t']> = {
+  stop: 'stop', stock: 'stop', stoop: 'stop', stopp: 'stop', 'stop it': 'stop', 'stop reading': 'stop', 'stop now': 'stop', 'stop stop': 'stop', 'স্টপ': 'stop', 'বন্ধ': 'stop', 'বন্ধ করো': 'stop',
+  pause: 'pause', paws: 'pause', pose: 'pause', paus: 'pause', hold: 'pause', wait: 'pause', 'hold on': 'pause', 'pause it': 'pause', 'থামো': 'pause', 'পজ': 'pause', 'থামাও': 'pause',
+  continue: 'continue', resume: 'continue', play: 'continue', 'go on': 'continue', 'carry on': 'continue', 'keep going': 'continue', 'continue reading': 'continue', 'play again': 'continue', start: 'continue', 'চালু': 'continue', 'চালাও': 'continue', 'কন্টিনিউ': 'continue',
+  next: 'next', nex: 'next', 'next point': 'next', 'next one': 'next', skip: 'next', 'skip it': 'next', 'নেক্সট': 'next', 'পরের': 'next', 'পরেরটা': 'next',
+  previous: 'prev', 'previous point': 'prev', 'previous one': 'prev', back: 'prev', 'go back': 'prev', last: 'prev', 'last point': 'prev', 'আগের': 'prev', 'আগেরটা': 'prev', 'ব্যাক': 'prev',
+  slower: 'slower', 'slow down': 'slower', slow: 'slower', 'go slower': 'slower', 'আস্তে': 'slower',
+  faster: 'faster', 'speed up': 'faster', fast: 'faster', 'go faster': 'faster', 'জোরে': 'faster', 'দ্রুত': 'faster',
+};
+const LEAD = /^(?:(?:ok|okay|hey|hi|please|now|just|you can)\s+)+/;
+const TAIL = /(?:\s+(?:please|now|sir|ok|okay|thanks?|thank you))+$/;
+const GREET = /^(?:hi+|hii+|hello+|hey+|hola|namaste|thanks?|thank you|ok|okay|good (?:morning|evening|night)|হ্যালো|হাই)$/;
+export const isGreeting = (s: string) => GREET.test(s.trim().toLowerCase().replace(/[.!?।,\s]+$/, ''));
+
 export function parse(s: string): Cmd {
-  const x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
+  let x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
+  const y = x.replace(LEAD, '').replace(TAIL, '').trim();
+  if (y && ALIAS[y]) return { t: ALIAS[y] } as Cmd;             // "okay stop please" == "stop"
+  if (y && y !== x && /^(?:topics?|টপিক|explain|question|questions)\b/.test(y)) x = y;
   const pk = x.match(/^(?:option|number|no|choose|select|pick|নম্বর)?\s*(\S+)$/);
   if (pk && has(PICK, pk[1])) return { t: 'pick', n: PICK[pk[1]] };
   let m = x.match(/^(?:topics?|টপিক)\s*:?\s+(.+)$/);
@@ -36,12 +54,5 @@ export function parse(s: string): Cmd {
   if (m) return { t: 'question', q: m[1] };
   m = x.match(/^(?:repeat|again|আবার)(?:\s+(?:point\s+)?(.+))?$/);
   if (m) return { t: 'repeat', arg: m[1] ? (NUM[m[1]] ?? m[1]) : undefined };
-  if (/^(continue|resume|play|go on|চালু|চালাও|কন্টিনিউ)$/.test(x)) return { t: 'continue' };
-  if (/^(pause|wait|hold on|থামো|পজ)$/.test(x)) return { t: 'pause' };
-  if (/^(stop|cancel|স্টপ|বন্ধ)$/.test(x)) return { t: 'stop' };
-  if (/^(next|next point|skip|নেক্সট|পরের|পরেরটা)$/.test(x)) return { t: 'next' };
-  if (/^(previous|previous point|back|go back|আগের|আগেরটা|ব্যাক)$/.test(x)) return { t: 'prev' };
-  if (/^(slower|slow down|slow|আস্তে)$/.test(x)) return { t: 'slower' };
-  if (/^(faster|speed up|fast|জোরে|দ্রুত)$/.test(x)) return { t: 'faster' };
   return { t: 'unknown' };
 }
