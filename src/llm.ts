@@ -176,12 +176,32 @@ export function splitMarks(q: string): { q: string; marks: number } {
 const range = (marks: number): [number, number] =>
   marks <= 2 ? [3, 4] : marks <= 4 ? [4, 6] : marks <= 7 ? [6, 8] : marks <= 9 ? [8, 11] : [10, 14];
 
-const SYSTEM = (lo: number, hi: number) => `You write university exam answers exactly like a topper's exam copy (medical lab technology).
+// ---------------------------------------------------------------------------------------------------------------------
+// The sections of a note depend on WHAT the topic is. A test has Principle/Procedure, a disease has Etiology/Pathogenesis,
+// a germ has Morphology/Culture. "Classification" is written ONLY when the source itself lists types - never forced.
+type Kind = 'test' | 'organism' | 'disease' | 'other';
+const TEST_RX = /\b(estimation|determination|measurement|test|tests|count|counting|stain|staining|method|technique|assay|procedure|medium|media|microscope|microscopy|centrifuge|analy[sz]er|smear|culture|sterili[sz]ation|collection|preparation|reaction)\b/i;
+const ORG_RX = /(coccus|cocci|bacillus|bacilli|bacter|virus|viridae|vibrio|salmonella|shigella|klebsiella|pseudomonas|proteus|escherichia|e\. ?coli|clostridi|mycobacter|treponema|plasmodium|leishmania|entamoeba|giardia|candida|aspergillus|helminth|worm|fungus|fungi|rickettsia|chlamydia|mycoplasma|staphylo|strepto|neisseria|haemophilus|hemophilus|brucella|borrelia|trypanosoma|filaria|taenia|ascaris|ancylostoma)/i;
+const DIS_RX = /(itis\b|emia\b|aemia\b|osis\b|oma\b|pathy\b|penia\b|philia\b|syndrome|infection|fever|anemia|anaemia|leuk|lymphoma|myeloma|cancer|carcinoma|failure|deficiency|disease|disorder|diabetes|hepatitis|tuberculosis|malaria|typhoid|cholera)/i;
+const kindOf = (name: string): Kind => TEST_RX.test(name) ? 'test' : ORG_RX.test(name) ? 'organism' : DIS_RX.test(name) ? 'disease' : 'other';
+const ORDER: Record<Kind, string> = {
+  test: 'Principle, Requirements (reagents / apparatus), Procedure, Calculation / Normal values, Interpretation, Sources of error, Clinical significance',
+  organism: 'Morphology, Culture, Antigens / Virulence factors, Pathogenesis, Clinical features, Lab diagnosis, Treatment, Prevention',
+  disease: 'Definition, Etiology, Pathogenesis, Clinical features, Lab diagnosis, Complications, Treatment',
+  other: 'Definition first (only if the text really defines it), then the topic\'s own parts in the order of the text',
+};
+const RULES = `Use ONLY the sections that really apply to THIS topic, and only as far as the text covers them. Do not fill a template.
+Write a "Classification" / "Types" point ONLY when the text itself lists types, classes or groups - otherwise do not write it at all.
+Never write an empty or generic point. Point titles must be the real names used in the text.`;
+
+const SYSTEM = (lo: number, hi: number, kind: Kind) => `You write university exam answers exactly like a topper's exam copy (medical lab technology).
 Use ONLY the SOURCE text. Never add a fact, number or name that is not in the SOURCE. Write in the language of the SOURCE.
+Cover EVERY part of the SOURCE - do not skip a section, a list, a table row or a value.
 Format: numbered points, one per line, exactly like:
 1. **Keyword**: short line
 Rules: no introduction, no conclusion, no filler words. Each line at most 18 words. Bold only the keyword. Keep numbers, units and names exactly as in the SOURCE.
-Order (SKIP every section the SOURCE does not cover): Definition, Classification, Etiology, Pathogenesis, Clinical features, Lab diagnosis, Complications, Treatment.
+Suggested order for this kind of topic: ${ORDER[kind]}.
+${RULES}
 Write ${lo} to ${hi} points (fewer if the SOURCE has less).
 If the SOURCE has nothing about the topic, reply exactly: NOT_IN_SOURCE`;
 
@@ -206,7 +226,7 @@ function parseAnswer(text: string, src: string, hi: number, check = true): Point
     let title = '', body = m[1].trim();
     const b = body.match(/^\*\*(.+?)\*\*\s*[:\-–—]?\s*(.*)$/);
     if (b) { title = b[1]; body = b[2]; }
-    else { const c = body.match(/^([^:]{2,40}):\s+(.+)$/); if (c) { title = c[1]; body = c[2]; } else { title = body.split(/\s+/).slice(0, 4).join(' '); } }
+    else { const c = body.match(/^([^:]{2,40}):\s+(.+)$/); if (c) { title = c[1]; body = c[2]; } else { title = body.split(/\s+/).slice(0, 5).join(' ').replace(/(\s+(the|of|to|and|a|an|in|is|are|on|for|with|by|that|which))+$/i, ''); } }
     title = title.replace(/\*+/g, '').replace(/[:.]+$/, '').trim();
     body = body.replace(/\*+/g, '').trim();
     if (!title) continue;
@@ -218,63 +238,18 @@ function parseAnswer(text: string, src: string, hi: number, check = true): Point
   return pts.map((p, i) => ({ n: i + 1, ...p }));
 }
 
-export type LlmResult = { pts: Point[] | null; notInSource: boolean };
+export type LlmResult = { pts: Point[] | null; notInSource: boolean; cancelled?: boolean };
 const MAXSRC = () => (llm.model === 'q05' ? 3200 : 5200);
 
-// null pts = the model was not usable / gave nothing good -> caller uses the rule-based notes
-export async function llmNotes(name: string, body: string, marks: number): Promise<LlmResult> {
-  const c = await getCtx();
-  if (!c) return { pts: null, notInSource: false };
-  const [lo, hi] = range(marks);
-  const src = body.replace(/\n{3,}/g, '\n\n').slice(0, MAXSRC());
+// "stop" / a newer request cancels the running job (the phone stops computing at once)
+let jobId = 0;
+export function cancelGen() { jobId++; try { ctx?.stopCompletion?.(); } catch {} }
+
+async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number): Promise<{ text: string; cancelled: boolean }> {
   let timer: any;
   try {
     const run = c.completion({
-      messages: [
-        { role: 'system', content: SYSTEM(lo, hi) },
-        { role: 'user', content: `Topic: ${name}\nMarks: ${marks}\n\nSOURCE:\n${src}\n\nWrite the answer.` },
-      ],
-      n_predict: marks >= 10 ? 800 : 500, temperature: 0.1, top_p: 0.9, penalty_repeat: 1.1,
-      stop: ['<|im_end|>', '<|endoftext|>'],
-    });
-    const out: any = await Promise.race([
-      run,
-      new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
-    ]);
-    clearTimeout(timer);
-    touch();
-    const text = String(out?.text || '').trim();
-    if (!text) return { pts: null, notInSource: false };
-    if (/NOT_IN_SOURCE/.test(text)) return { pts: null, notInSource: true };
-    const pts = parseAnswer(text, src, hi);
-    return { pts: pts.length >= 2 ? pts : null, notInSource: false };
-  } catch { clearTimeout(timer); return { pts: null, notInSource: false }; }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// "explain <topic>": the model's OWN knowledge (an optional web reference helps). Not limited to the user's sources.
-const EXPLAIN_SYS = (lo: number, hi: number) => `You are a medical laboratory technology tutor. Explain the topic like a topper's exam copy, from your own correct textbook knowledge.
-A REFERENCE (from the web) may be given: use it when it helps, ignore it when it is off-topic.
-Never invent numbers, names or facts you are not sure about. Answer in the language of the topic.
-Format: numbered points, one per line, exactly like:
-1. **Keyword**: short line
-Rules: no introduction, no conclusion. Each line at most 18 words. Bold only the keyword.
-Order (skip what does not apply): Definition, Classification, Etiology, Pathogenesis, Clinical features, Lab diagnosis, Complications, Treatment.
-Write ${lo} to ${hi} points.`;
-
-export async function llmExplain(name: string, marks: number, ref = ''): Promise<Point[] | null> {
-  const c = await getCtx();
-  if (!c) return null;
-  const [lo, hi] = range(marks);
-  const refTxt = ref ? `\n\nREFERENCE:\n${ref.slice(0, llm.model === 'q05' ? 1800 : 2600)}` : '';
-  let timer: any;
-  try {
-    const run = c.completion({
-      messages: [
-        { role: 'system', content: EXPLAIN_SYS(lo, hi) },
-        { role: 'user', content: `Topic: ${name}\nMarks: ${marks}${refTxt}\n\nWrite the answer.` },
-      ],
-      n_predict: marks >= 10 ? 800 : 500, temperature: 0.2, top_p: 0.9, penalty_repeat: 1.1,
+      messages, n_predict: nPredict, temperature, top_p: 0.9, penalty_repeat: 1.1,
       stop: ['<|im_end|>', '<|endoftext|>'],
     });
     const out: any = await Promise.race([
@@ -282,9 +257,79 @@ export async function llmExplain(name: string, marks: number, ref = ''): Promise
       new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
     ]);
     clearTimeout(timer); touch();
-    const pts = parseAnswer(String(out?.text || ''), '', hi, false);
-    return pts.length >= 2 ? pts : null;
-  } catch { clearTimeout(timer); return null; }
+    return { text: job === jobId ? String(out?.text || '').trim() : '', cancelled: job !== jobId };
+  } catch { clearTimeout(timer); return { text: '', cancelled: job !== jobId }; }
+}
+const tokens = (hi: number) => Math.min(800, hi * 45 + 80);     // no more tokens than the points need (faster on the phone)
+
+// Cuts a long source into pieces (at blank lines) so NO portion is left out; each piece is written separately.
+function pieces(body: string, max: number): string[] {
+  const text = body.replace(/\n{3,}/g, '\n\n').trim();
+  if (text.length <= max) return [text];
+  const out: string[] = [];
+  let cur = '';
+  for (const para of text.split(/\n\n+/)) {
+    if (cur && cur.length + para.length + 2 > max) { out.push(cur); cur = ''; }
+    if (para.length > max) { for (let i = 0; i < para.length; i += max) out.push(para.slice(i, i + max)); continue; }
+    cur += (cur ? '\n\n' : '') + para;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+// null pts = the model was not usable / gave nothing good -> caller uses the rule-based notes
+export async function llmNotes(name: string, body: string, marks: number, onProgress?: (i: number, n: number) => void): Promise<LlmResult> {
+  const c = await getCtx();
+  if (!c) return { pts: null, notInSource: false };
+  const job = ++jobId;
+  const parts = pieces(body, MAXSRC());
+  const [lo0, hi0] = parts.length > 1 ? [4, 8] : range(marks);        // long topic: every piece gets its own points
+  const kind = kindOf(name);
+  const all: Omit<Point, 'n'>[] = [];
+  let missing = 0;
+  for (let i = 0; i < parts.length; i++) {
+    onProgress?.(i + 1, parts.length);
+    const src = parts[i];
+    const r = await complete(c, job, [
+      { role: 'system', content: SYSTEM(lo0, hi0, kind) },
+      { role: 'user', content: `Topic: ${name}\nMarks: ${marks}${parts.length > 1 ? `\nPart ${i + 1} of ${parts.length} of the source` : ''}\n\nSOURCE:\n${src}\n\nWrite the answer.` },
+    ], tokens(hi0), 0.1);
+    if (r.cancelled) return { pts: null, notInSource: false, cancelled: true };
+    if (!r.text) { missing++; continue; }
+    if (/NOT_IN_SOURCE/.test(r.text)) { if (parts.length === 1) return { pts: null, notInSource: true }; continue; }
+    for (const p of parseAnswer(r.text, src, hi0)) all.push({ title: p.title, text: p.text });
+  }
+  if (missing) return { pts: null, notInSource: false };             // a piece failed: better the complete rule-based notes than notes with a hole
+  const seen = new Set<string>();
+  const pts = all.filter((p) => { const k = (p.title + p.text).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+  return { pts: pts.length >= 2 ? pts.slice(0, 40).map((p, i) => ({ n: i + 1, ...p })) : null, notInSource: false };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// "explain <topic>": the model's OWN knowledge (an optional web reference helps). Not limited to the user's sources.
+const EXPLAIN_SYS = (lo: number, hi: number, kind: Kind) => `You are a medical laboratory technology tutor. Explain the topic like a topper's exam copy, from your own correct textbook knowledge.
+A REFERENCE (from the web) may be given: use it when it helps, ignore it when it is off-topic.
+Never invent numbers, names or facts you are not sure about. Answer in the language of the topic.
+Format: numbered points, one per line, exactly like:
+1. **Keyword**: short line
+Rules: no introduction, no conclusion. Each line at most 18 words. Bold only the keyword.
+Suggested order for this kind of topic: ${ORDER[kind]}.
+${RULES}
+Write ${lo} to ${hi} points.`;
+
+export async function llmExplain(name: string, marks: number, ref = ''): Promise<LlmResult> {
+  const c = await getCtx();
+  if (!c) return { pts: null, notInSource: false };
+  const job = ++jobId;
+  const [lo, hi] = range(marks);
+  const refTxt = ref ? `\n\nREFERENCE:\n${ref.slice(0, llm.model === 'q05' ? 1800 : 2600)}` : '';
+  const r = await complete(c, job, [
+    { role: 'system', content: EXPLAIN_SYS(lo, hi, kindOf(name)) },
+    { role: 'user', content: `Topic: ${name}\nMarks: ${marks}${refTxt}\n\nWrite the answer.` },
+  ], tokens(hi), 0.2);
+  if (r.cancelled) return { pts: null, notInSource: false, cancelled: true };
+  const pts = parseAnswer(r.text, '', hi, false);
+  return { pts: pts.length >= 2 ? pts : null, notInSource: false };
 }
 
 // A spoken / typed QUESTION: the model thinks, uses the user's source excerpts where they help, and adds its own
@@ -295,39 +340,29 @@ Use the SOURCE facts whenever they are relevant. If the SOURCE is missing or inc
 Never invent numbers, names or facts you are not sure about. Answer in the language of the question.
 Format: numbered points, one per line, exactly like:
 1. **Keyword**: short line
-Rules: no introduction, no conclusion. Each line at most 20 words. Bold only the keyword. Write 4 to 8 points.`;
+Rules: no introduction, no conclusion. Each line at most 20 words. Bold only the keyword. Write 4 to 8 points.
+Only the points the question needs - no fixed template, no "Classification" unless the question is about types.`;
 
 export type Basis = 'source' | 'mixed' | 'own';
-export type AnswerResult = { pts: Point[] | null; basis: Basis };
+export type AnswerResult = { pts: Point[] | null; basis: Basis; cancelled?: boolean };
 
 export async function llmAnswer(question: string, chunks: { name: string; body: string }[]): Promise<AnswerResult> {
   const c = await getCtx();
   if (!c) return { pts: null, basis: 'own' };
+  const job = ++jobId;
   const per = llm.model === 'q05' ? 900 : 1500;
   const src = chunks.map((x, i) => `[${i + 1}] ${x.name}\n${x.body.slice(0, per)}`).join('\n\n').slice(0, MAXSRC());
-  let timer: any;
-  try {
-    const run = c.completion({
-      messages: [
-        { role: 'system', content: ANSWER_SYS },
-        { role: 'user', content: `QUESTION: ${question}\n\nSOURCE:\n${src || '(nothing found in the sources)'}\n\nWrite the answer.` },
-      ],
-      n_predict: 600, temperature: 0.2, top_p: 0.9, penalty_repeat: 1.1,
-      stop: ['<|im_end|>', '<|endoftext|>'],
-    });
-    const out: any = await Promise.race([
-      run,
-      new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
-    ]);
-    clearTimeout(timer); touch();
-    const text = String(out?.text || '');
-    const pts = parseAnswer(text, '', 10, false);
-    if (pts.length < 2) return { pts: null, basis: 'own' };
-    // how much of the answer is really supported by the source excerpts (checked in code, not trusted from the model)
-    const srcN = flat(src);
-    const srcWords = new Set(srcN.match(/\p{L}{4,}/gu) || []);
-    const hit = src ? pts.filter((p) => supported(`${p.title} ${p.text}`, srcN, srcWords)).length : 0;
-    const basis: Basis = hit === 0 ? 'own' : hit >= pts.length * 0.8 ? 'source' : 'mixed';
-    return { pts, basis };
-  } catch { clearTimeout(timer); return { pts: null, basis: 'own' }; }
+  const r = await complete(c, job, [
+    { role: 'system', content: ANSWER_SYS },
+    { role: 'user', content: `QUESTION: ${question}\n\nSOURCE:\n${src || '(nothing found in the sources)'}\n\nWrite the answer.` },
+  ], 420, 0.2);
+  if (r.cancelled) return { pts: null, basis: 'own', cancelled: true };
+  const pts = parseAnswer(r.text, '', 10, false);
+  if (pts.length < 2) return { pts: null, basis: 'own' };
+  // how much of the answer is really supported by the source excerpts (checked in code, not trusted from the model)
+  const srcN = flat(src);
+  const srcWords = new Set(srcN.match(/\p{L}{4,}/gu) || []);
+  const hit = src ? pts.filter((p) => supported(`${p.title} ${p.text}`, srcN, srcWords)).length : 0;
+  const basis: Basis = hit === 0 ? 'own' : hit >= pts.length * 0.8 ? 'source' : 'mixed';
+  return { pts, basis };
 }
