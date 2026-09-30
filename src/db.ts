@@ -1,6 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 import type { Point } from './notes';
-import { norm, focus, GENERIC } from './mdsplit';
+import { norm, focus, excerpt, GENERIC } from './mdsplit';
 import { gramQuery } from './fuzzy';
 import { queryTokens, expandAbbr, variants, rankTopics, decide, isQuestionName, isQuestionBody, stripQuestions, covers, isJunkHeading } from './match';
 
@@ -174,13 +174,18 @@ async function findTopicIn(d: DB, q: string, chatId: number, exact: boolean): Pr
   const seen = new Set<number>();
   const cands = [...rows, ...fuzzy].filter((r) => !isQuestionName(r.name) && (seen.has(r.topic_id) ? false : (seen.add(r.topic_id), true))).slice(0, 10);
 
+  // A body hit is only accepted when the query is the HEADING of a section inside that text.
+  // (A chunk that merely mentions the word - e.g. "Lymphocyte" mentioning meningitis - is not the topic.)
   for (const c of cands) {
+    await new Promise((r) => setTimeout(r, 0));                 // let the screen / mic breathe between heavy steps
     const one = await d.getFirstAsync<{ name: string; body: string }>('SELECT name, body FROM topics WHERE id=?', [c.topic_id]);
     if (!one || isQuestionBody(one.body)) continue;
-    const part = focus(one.body, ex);
+    const part = excerpt(one.body, ex);
+    if (!part) continue;
     const body = stripQuestions(part.body);
     if (body.length < 20 || isQuestionBody(body)) continue;
-    if (!covers(toks, part.name + '\n' + body)) continue;      // the asked words are not really in this chunk
+    if (!covers(toks, part.name + '\n' + body)) continue;
+    if (!covers(toks, part.name) && !covers(ex, part.name)) continue;   // the heading itself must be about the query
     const nm = isJunkHeading(part.name) ? one.name : GENERIC.has(part.name.toLowerCase()) ? `${one.name} - ${part.name}` : part.name === ex.join(' ') ? one.name : part.name;
     return { kind: 'ok', found: true, id: 0, name: nm, body, alts: ranked.slice(0, 3).map((x) => x.name) };   // id 0 = do not cache
   }
