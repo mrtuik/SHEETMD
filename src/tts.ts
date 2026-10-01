@@ -163,7 +163,7 @@ export const VOICES: VoiceItem[] = [
 export const DEFAULT_VOICE_ID = 'en_US-lessac-medium';
 
 // Maps expo-speech rate (0.3..1.2) to Piper speed (clamp 0.5..1.3)
-export const rateToSpeed = (rate: number): number => Math.min(1.3, Math.max(0.5, +(rate || 0.7).toFixed(2)));
+export const rateToSpeed = (rate: number): number => Math.min(1.5, Math.max(0.3, +(rate || 0.7).toFixed(2)));
 
 export type VoicePhase = 'none' | 'checking' | 'downloading' | 'paused' | 'extracting' | 'ready' | 'error';
 
@@ -583,6 +583,8 @@ type SpeakJob = {
   text: string;
   opts: SpeakOptions;
   finCalled: boolean;
+  started?: boolean;   // Piper really began playing
+  fell?: boolean;      // handed over to the phone voice: ignore any late Piper events for this job
 };
 
 let jobIdCounter = 1;
@@ -595,7 +597,14 @@ let safetyTimer: any = null;
 // Listen to native events from SheetTtsModule
 if (NativeTts?.addListener) {
   NativeTts.addListener('onStart', ({ id }: { id: number }) => {
-    if (activeJob && activeJob.id === id) {
+    if (activeJob && activeJob.id === id && !activeJob.fell) {
+      activeJob.started = true;
+      // pre-generate the NEXT chunk only after this one is already playing (generating both at once froze weak phones)
+      const nx = speakQueue[0];
+      if (nx && NativeTts?.prepare && !/[\u0980-\u09FF]/.test(nx.text) && nx.opts.engine !== 'phone') {
+        try { NativeTts.prepare(nx.text, rateToSpeed(nx.opts.rate ?? 0.7)); } catch {}
+      }
+      clearTimeout(safetyTimer);               // Piper is speaking: never hand over to the phone voice now
       activeSpeakerType = 'piper';
       ttsState.activeSpeaker = 'piper';
       emit();
@@ -604,7 +613,7 @@ if (NativeTts?.addListener) {
   });
 
   NativeTts.addListener('onDone', ({ id }: { id: number }) => {
-    if (activeJob && activeJob.id === id) {
+    if (activeJob && activeJob.id === id && !activeJob.fell) {
       clearTimeout(safetyTimer);
       finishJob(activeJob, 'done');
       activeJob = null;
@@ -613,7 +622,7 @@ if (NativeTts?.addListener) {
   });
 
   NativeTts.addListener('onStopped', ({ id }: { id: number }) => {
-    if (activeJob && activeJob.id === id) {
+    if (activeJob && activeJob.id === id && !activeJob.fell) {
       clearTimeout(safetyTimer);
       finishJob(activeJob, 'stopped');
       activeJob = null;
@@ -622,7 +631,7 @@ if (NativeTts?.addListener) {
   });
 
   NativeTts.addListener('onError', ({ id, message }: { id: number; message: string }) => {
-    if (activeJob && activeJob.id === id && !fallbackInFlight) {
+    if (activeJob && activeJob.id === id && !fallbackInFlight && !activeJob.fell) {
       clearTimeout(safetyTimer);
       // Fallback to phone expo-speech for this chunk (no silence, no loop)
       fallbackToPhone(activeJob);
@@ -641,6 +650,8 @@ function finishJob(job: SpeakJob, type: 'done' | 'stopped' | 'error', err?: any)
 }
 
 function fallbackToPhone(job: SpeakJob) {
+  job.fell = true;
+  try { NativeTts?.stop?.(); } catch {}      // Piper must be silent before the phone voice starts (two voices at once was the bug)
   fallbackInFlight = true;
   activeSpeakerType = 'phone';
   ttsState.activeSpeaker = 'phone';
@@ -709,22 +720,13 @@ function processNextJob() {
     ttsState.activeSpeaker = 'piper';
     emit();
 
-    // Pipeline generation: pre-generate NEXT chunk while this one is played
-    if (speakQueue.length > 0) {
-      const nextJob = speakQueue[0];
-      const nextBn = nextJob.opts.lang === 'bn' || /[\u0980-\u09FF]/.test(nextJob.text);
-      if (!nextBn && NativeTts?.prepare) {
-        NativeTts.prepare(nextJob.text, rateToSpeed(nextJob.opts.rate ?? 0.7));
-      }
-    }
-
     // Safety watchdog: if native engine stalls or fails silently
     clearTimeout(safetyTimer);
     safetyTimer = setTimeout(() => {
-      if (activeJob && activeJob.id === job.id && !fallbackInFlight) {
+      if (activeJob && activeJob.id === job.id && !fallbackInFlight && !job.started) {
         fallbackToPhone(job);
       }
-    }, Math.min(15000, 3000 + job.text.length * 100));
+    }, Math.min(40000, 12000 + job.text.length * 150));      // slow phone: first audio can take a while; cleared as soon as onStart arrives
 
     try {
       NativeTts.speak(job.id, job.text, rateToSpeed(job.opts.rate ?? 0.7));
