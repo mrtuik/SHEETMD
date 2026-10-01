@@ -7,7 +7,7 @@ import * as Speech from 'expo-speech';
 import { requireNativeModule } from 'expo';
 import { getMeta, setMeta } from './db';
 
-export type VoiceAccent = 'US' | 'GB';
+export type VoiceAccent = 'US' | 'GB' | 'KO';   // KO = Kokoro (one shared download, many speakers)
 export type VoiceGender = 'female' | 'male';
 
 export type VoiceItem = {
@@ -20,6 +20,10 @@ export type VoiceItem = {
   bytes: number;
   license: string;
   note?: string;
+  engine?: 'kokoro';   // omitted = Piper (VITS)
+  sid?: number;        // Kokoro speaker id
+  pack?: string;       // voices that share ONE download point to the first voice's id
+  lex?: 'us' | 'gb';   // Kokoro English lexicon
 };
 
 // Official Piper VITS medium-quality single-speaker English models from sherpa-onnx
@@ -158,6 +162,30 @@ export const VOICES: VoiceItem[] = [
     license: 'CC-BY-SA 4.0',
     note: 'Distinctive northern accent',
   },
+  // Kokoro-82M int8 (sherpa-onnx multi-lang v1.0): ONE ~132 MB download, many speakers. Heavier than Piper: needs a stronger phone.
+  ...([
+    ['af_heart', 'Heart - US female', 'female', 3, 'us', 'Warm, very natural'],
+    ['af_bella', 'Bella - US female', 'female', 2, 'us', 'Clear and expressive'],
+    ['af_nicole', 'Nicole - US female', 'female', 6, 'us', 'Soft, calm'],
+    ['am_michael', 'Michael - US male', 'male', 16, 'us', 'Steady narration'],
+    ['am_adam', 'Adam - US male', 'male', 11, 'us', 'Deep, clear'],
+    ['bf_emma', 'Emma - UK female', 'female', 21, 'gb', 'British, clear'],
+    ['bm_george', 'George - UK male', 'male', 26, 'gb', 'British, formal'],
+  ] as [string, string, VoiceGender, number, 'us' | 'gb', string][]).map(([k, label, gender, sid, lex, note]): VoiceItem => ({
+    id: `kokoro-${k}`,
+    label,
+    accent: 'KO',
+    gender,
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2',
+    bytes: 131_770_328,
+    license: 'Apache-2.0 (Kokoro-82M)',
+    note,
+    engine: 'kokoro',
+    sid,
+    pack: 'kokoro-af_heart',
+    lex,
+  })),
 ];
 
 export const DEFAULT_VOICE_ID = 'en_US-lessac-medium';
@@ -199,12 +227,22 @@ VOICES.forEach((v) => {
   ttsState.voices[v.id] = { phase: 'none', got: 0, total: v.bytes, msg: '' };
 });
 
+// Voices that share one download (Kokoro) use the pack's first voice as the download / state holder.
+export const repOf = (id: string): string => VOICES.find((v) => v.id === id)?.pack ?? id;
+const voiceOf = (id: string) => VOICES.find((v) => v.id === id);
+let curSid = 0;                 // Kokoro speaker id of the loaded voice (0 for Piper)
+let loadedKey = '';             // which model file is in memory ("<pack>|<lexicon>"): switching speaker inside it needs no reload
+const wantAfter: Record<string, string> = {};   // pack -> the voice the user actually tapped Download on
+
 const subs = new Set<() => void>();
 export const subscribeTts = (f: () => void) => {
   subs.add(f);
   return () => { subs.delete(f); };
 };
-const emit = () => subs.forEach((f) => f());
+const emit = () => {
+  VOICES.forEach((v) => { if (v.pack && v.pack !== v.id && ttsState.voices[v.pack]) ttsState.voices[v.id] = { ...ttsState.voices[v.pack] }; });
+  subs.forEach((f) => f());
+};
 
 const NativeTts: any = (() => {
   try { return requireNativeModule('SheetTts'); }
@@ -226,6 +264,18 @@ const sizeOf = async (uri: string) => {
     return 0;
   }
 };
+
+async function loadNative(id: string): Promise<boolean> {
+  const v = voiceOf(id);
+  if (!v || !NativeTts) return false;
+  const rid = repOf(id);
+  const key = `${rid}|${v.lex || ''}`;
+  if (loadedKey === key && ttsState.isPiperReady) { curSid = v.sid ?? 0; return true; }      // same model file, only another speaker
+  loadedKey = '';
+  const ok = await NativeTts.init(np(voiceDir(rid)), v.engine === 'kokoro' ? 'kokoro' : 'vits', v.lex || 'us').catch(() => false);
+  if (ok) { loadedKey = key; curSid = v.sid ?? 0; }
+  return !!ok;
+}
 
 const checkVoiceReadyOnDisk = async (id: string): Promise<boolean> => {
   try {
@@ -260,12 +310,14 @@ export async function initTts() {
   ttsState.ramReason = ramCheck.reason;
 
   // Check state of each voice on disk
+  const diskReady: Record<string, boolean> = {};
   for (const v of VOICES) {
-    const ready = await checkVoiceReadyOnDisk(v.id);
-    if (ready) {
+    const rid = repOf(v.id);
+    if (diskReady[rid] === undefined) diskReady[rid] = await checkVoiceReadyOnDisk(rid);
+    if (diskReady[rid]) {
       ttsState.voices[v.id] = { phase: 'ready', got: v.bytes, total: v.bytes, msg: '' };
     } else {
-      const part = await sizeOf(partPath(v.id));
+      const part = await sizeOf(partPath(rid));
       ttsState.voices[v.id] = { phase: part > 0 ? 'paused' : 'none', got: part, total: v.bytes, msg: '' };
     }
   }
@@ -285,7 +337,7 @@ export async function initTts() {
 
   // If selected voice is ready, try loading it
   if (ttsState.voices[targetVoice]?.phase === 'ready' && NativeTts) {
-    const loaded = await NativeTts.init(np(voiceDir(targetVoice))).catch(() => false);
+    const loaded = await loadNative(targetVoice);
     if (loaded) {
       ttsState.isPiperReady = true;
       ttsState.engine = savedEngine === 'phone' ? 'phone' : 'piper';
@@ -297,7 +349,7 @@ export async function initTts() {
     // Check if any other voice is ready
     const anyReady = VOICES.find((v) => ttsState.voices[v.id]?.phase === 'ready');
     if (anyReady && NativeTts) {
-      const loaded = await NativeTts.init(np(voiceDir(anyReady.id))).catch(() => false);
+      const loaded = await loadNative(anyReady.id);
       if (loaded) {
         ttsState.selectedVoice = anyReady.id;
         await setMeta('tts_voice', anyReady.id).catch(() => {});
@@ -343,7 +395,9 @@ let dlPoll: any = null;
 let userAction: 'pause' | 'cancel' | '' = '';
 const downloadQueue: string[] = [];
 
-export async function startVoiceDownload(id: string, allowMobile = false): Promise<TtsPreflight> {
+export async function startVoiceDownload(wanted: string, allowMobile = false): Promise<TtsPreflight> {
+  const id = repOf(wanted);
+  wantAfter[id] = wanted;
   const v = VOICES.find((x) => x.id === id);
   if (!v) return { ok: false, reason: 'offline' };
   if (ttsState.voices[id]?.phase === 'ready') return { ok: true };
@@ -465,16 +519,19 @@ async function runVoiceDownload(id: string) {
   }
 
   ttsState.voices[id] = { phase: 'ready', got: v.bytes, total: v.bytes, msg: '' };
+  emit();                                          // copy the pack state to every voice of the pack before one is selected
 
   // If no model is currently ready, or this is the selected voice, load it now
-  if (!ttsState.isPiperReady || ttsState.selectedVoice === id) {
-    await selectVoice(id);
+  const sel = wantAfter[id] || id;
+  if (!ttsState.isPiperReady || ttsState.selectedVoice === sel) {
+    await selectVoice(sel);
   }
 
   emit();
 }
 
-export function pauseVoiceDownload(id: string) {
+export function pauseVoiceDownload(wanted: string) {
+  const id = repOf(wanted);
   if (activeDownloadId === id) {
     userAction = 'pause';
     try { (currentResumable as any)?.pauseAsync?.(); } catch {}
@@ -486,7 +543,8 @@ export function pauseVoiceDownload(id: string) {
   }
 }
 
-export function cancelVoiceDownload(id: string) {
+export function cancelVoiceDownload(wanted: string) {
+  const id = repOf(wanted);
   if (activeDownloadId === id) {
     userAction = 'cancel';
     try { (currentResumable as any)?.cancelAsync?.(); } catch {}
@@ -499,23 +557,26 @@ export function cancelVoiceDownload(id: string) {
   }
 }
 
-export async function deleteVoice(id: string) {
+export async function deleteVoice(wanted: string) {
+  const id = repOf(wanted);                       // Kokoro: deleting one voice removes the shared download (all Kokoro voices)
   if (activeDownloadId === id) cancelVoiceDownload(id);
 
-  if (ttsState.selectedVoice === id) {
+  const selWasThis = repOf(ttsState.selectedVoice) === id;
+  if (selWasThis) {
     try { NativeTts?.release?.(); } catch {}
     ttsState.isPiperReady = false;
+    loadedKey = '';
   }
 
   await FS.deleteAsync(voiceDir(id), { idempotent: true }).catch(() => {});
   await FS.deleteAsync(partPath(id), { idempotent: true }).catch(() => {});
 
-  const v = VOICES.find((x) => x.id === id);
-  ttsState.voices[id] = { phase: 'none', got: 0, total: v?.bytes || 0, msg: '' };
+  VOICES.filter((x) => repOf(x.id) === id).forEach((x) => {
+    ttsState.voices[x.id] = { phase: 'none', got: 0, total: x.bytes, msg: '' };
+  });
 
-  if (ttsState.selectedVoice === id) {
-    // Find another ready voice
-    const nextReady = VOICES.find((x) => x.id !== id && ttsState.voices[x.id]?.phase === 'ready');
+  if (selWasThis) {
+    const nextReady = VOICES.find((x) => repOf(x.id) !== id && ttsState.voices[x.id]?.phase === 'ready');
     if (nextReady) {
       await selectVoice(nextReady.id);
     } else {
@@ -536,7 +597,7 @@ export async function selectVoice(id: string) {
   await setMeta('tts_voice', id).catch(() => {});
 
   if (ttsState.voices[id]?.phase === 'ready' && !ttsState.ramReason && NativeTts) {
-    const loaded = await NativeTts.init(np(voiceDir(id))).catch(() => false);
+    const loaded = await loadNative(id);
     if (loaded) {
       ttsState.isPiperReady = true;
       ttsState.engine = 'piper';
@@ -557,7 +618,7 @@ export async function setTtsEngine(engine: TtsEngine) {
   if (engine === 'piper' && !ttsState.isPiperReady && NativeTts) {
     const v = ttsState.selectedVoice;
     if (ttsState.voices[v]?.phase === 'ready') {
-      const loaded = await NativeTts.init(np(voiceDir(v))).catch(() => false);
+      const loaded = await loadNative(v);
       ttsState.isPiperReady = loaded;
     }
   }
@@ -602,7 +663,7 @@ if (NativeTts?.addListener) {
       // pre-generate the NEXT chunk only after this one is already playing (generating both at once froze weak phones)
       const nx = speakQueue[0];
       if (nx && NativeTts?.prepare && !/[\u0980-\u09FF]/.test(nx.text) && nx.opts.engine !== 'phone') {
-        try { NativeTts.prepare(nx.text, rateToSpeed(nx.opts.rate ?? 0.7)); } catch {}
+        try { NativeTts.prepare(nx.text, rateToSpeed(nx.opts.rate ?? 0.7), curSid); } catch {}
       }
       clearTimeout(safetyTimer);               // Piper is speaking: never hand over to the phone voice now
       activeSpeakerType = 'piper';
@@ -726,10 +787,10 @@ function processNextJob() {
       if (activeJob && activeJob.id === job.id && !fallbackInFlight && !job.started) {
         fallbackToPhone(job);
       }
-    }, Math.min(40000, 12000 + job.text.length * 150));      // slow phone: first audio can take a while; cleared as soon as onStart arrives
+    }, voiceOf(ttsState.selectedVoice)?.engine === 'kokoro' ? Math.min(120000, 25000 + job.text.length * 500) : Math.min(40000, 12000 + job.text.length * 150));      // slow phone: first audio can take a while; cleared as soon as onStart arrives
 
     try {
-      NativeTts.speak(job.id, job.text, rateToSpeed(job.opts.rate ?? 0.7));
+      NativeTts.speak(job.id, job.text, rateToSpeed(job.opts.rate ?? 0.7), curSid);
     } catch {
       clearTimeout(safetyTimer);
       fallbackToPhone(job);
