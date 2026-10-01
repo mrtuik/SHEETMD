@@ -34,6 +34,18 @@ export function pointChunks(p: Point): string[] {
   return [dup ? `Point ${p.n}.` : cleanForSpeech(`Point ${p.n}. ${p.title}`), ...body];
 }
 
+// which bullet (line) of a point a spoken chunk belongs to - the screen highlights that line
+export function lineOf(p: Point, chunk: number): number {
+  if (!p.bullets?.length || chunk < 0) return -1;
+  let n = 0;
+  for (let j = 0; j < p.bullets.length; j++) {
+    const t = cleanForSpeech(p.bullets[j]);
+    n += !t ? 0 : t.length <= 240 ? 1 : speechChunks(p.bullets[j]).length;
+    if (chunk < n) return j;
+  }
+  return -1;
+}
+
 function halt() {
   Speech.stop();
   const r = release; release = null;
