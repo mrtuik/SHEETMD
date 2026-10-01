@@ -11,13 +11,28 @@ const NUM: Record<string, string> = {
 // English + a few Bangla words (for Bangla voice mode)
 // "one / two / three" answers the 3-options question (only acted on while options are waiting)
 const PICK: Record<string, number> = {
-  one: 1, won: 1, first: 1, '1': 1, ek: 1, 'এক': 1, 'প্রথম': 1, '১': 1,
-  two: 2, to: 2, too: 2, second: 2, '2': 2, dui: 2, 'দুই': 2, 'দ্বিতীয়': 2, '২': 2,
-  three: 3, tree: 3, free: 3, third: 3, '3': 3, tin: 3, 'তিন': 3, 'তৃতীয়': 3, '৩': 3,
+  one: 1, won: 1, wan: 1, first: 1, '1st': 1, '1': 1, ek: 1, 'এক': 1, 'প্রথম': 1, 'ওয়ান': 1, 'ফার্স্ট': 1, '১': 1,
+  two: 2, to: 2, too: 2, tu: 2, second: 2, '2nd': 2, '2': 2, dui: 2, 'দুই': 2, 'দ্বিতীয়': 2, 'টু': 2, 'সেকেন্ড': 2, '২': 2,
+  three: 3, tree: 3, free: 3, thri: 3, third: 3, '3rd': 3, '3': 3, tin: 3, 'তিন': 3, 'তৃতীয়': 3, 'থ্রি': 3, 'থার্ড': 3, '৩': 3,
 };
+// filler words around a spoken choice: "number two", "option 3 please", "the first one", "say two"
+const PICK_FILL = new Set(['option', 'number', 'no', 'choose', 'select', 'pick', 'say', 'the', 'please', 'ok', 'okay', 'it', 'is', 'that', 'this', 'i', 'want', 'নম্বর', 'অপশন']);
 const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 
 // spoken "okay" that ends a question ("what is anemia okay")
+// 0 = not a choice. Accepts "two", "2", "number two", "the first one", "option 3 please", Bangla / Banglish forms.
+export function parsePick(s: string): number {
+  const toks = s.toLowerCase().replace(/[.!?।,:;"'()\-]/g, ' ').split(/\s+/).filter(Boolean).filter((t) => !PICK_FILL.has(t));
+  if (!toks.length || toks.length > 3) return 0;
+  const ns = toks.map((t) => (has(PICK, t) ? PICK[t] : 0));
+  return ns[0] && ns.every((n) => n === ns[0]) ? ns[0] : 0;
+}
+// the phone's mic can hear the app reading "Did you mean ... Say one, two or three." and then the answer: keep only the answer
+export function stripChoiceEcho(s: string): string {
+  const m = s.toLowerCase().match(/(?:did you mean|say one)[\s\S]*?(?:two|to|too|2)\s*(?:or|and)\s*(?:three|tree|free|3)\s*[.!?।]*\s*(.*)$/);
+  return m ? m[1].trim() : s;
+}
+
 export const OK_END = /(?:^|\s)(?:okay|ok|okey|o\.k\.?|ওকে|ঠিক আছে)\s*[.!?।]*$/i;
 // words that cancel a question that is being dictated
 export const CANCEL_Q = /^(?:cancel|stop|never ?mind|বাতিল|স্টপ)$/i;
@@ -42,8 +57,8 @@ export function parse(s: string): Cmd {
   const y = x.replace(LEAD, '').replace(TAIL, '').trim();
   if (y && ALIAS[y]) return { t: ALIAS[y] } as Cmd;             // "okay stop please" == "stop"
   if (y && y !== x && /^(?:topics?|টপিক|exact|exactly|explain|question|questions)\b/.test(y)) x = y;
-  const pk = (y || x).match(/^(?:(?:option|number|no|choose|select|pick|say|নম্বর)\s+)?(\S+)$/);
-  if (pk && has(PICK, pk[1])) return { t: 'pick', n: PICK[pk[1]] };
+  const pn = parsePick(y || x);
+  if (pn) return { t: 'pick', n: pn };
   let m = x.match(/^(?:topics?|টপিক)\s*:?\s+(.+)$/);
   if (m) return { t: 'topic', q: m[1] };
   // exact <topic name>: that topic read word for word from the file, heading to next heading (no model)
