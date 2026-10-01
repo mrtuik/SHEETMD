@@ -20,6 +20,32 @@ jobs:
             if [ "$code" != "200" ] && [ "$code" != "206" ]; then echo "::error::model link is broken: $u"; exit 1; fi
             if [ "$magic" != "GGUF" ]; then echo "::error::not a GGUF file: $u"; exit 1; fi
           done
+      - name: Verify Piper voice model links (official sherpa-onnx release repos)
+        run: |
+          voices=(
+            "en_US-lessac-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium.tar.bz2"
+            "en_US-amy-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-medium.tar.bz2"
+            "en_US-ryan-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-ryan-medium.tar.bz2"
+            "en_US-joe-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-joe-medium.tar.bz2"
+            "en_US-kusal-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-kusal-medium.tar.bz2"
+            "en_US-hfc_female-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-hfc_female-medium.tar.bz2"
+            "en_US-hfc_male-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-hfc_male-medium.tar.bz2"
+            "en_US-norman-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-norman-medium.tar.bz2"
+            "en_GB-alan-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-alan-medium.tar.bz2"
+            "en_GB-jenny_dioco-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-jenny_dioco-medium.tar.bz2"
+            "en_GB-alba-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-alba-medium.tar.bz2"
+            "en_GB-northern_english_male-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-northern_english_male-medium.tar.bz2"
+          )
+          for entry in "${voices[@]}"; do
+            id=$(echo "$entry" | cut -d' ' -f1)
+            u=$(echo "$entry" | cut -d' ' -f2)
+            code=$(curl -sL -r 0-2 -o /tmp/head_bz2.bin -w "%{http_code}" "$u")
+            magic=$(head -c 3 /tmp/head_bz2.bin)
+            size=$(curl -sI -L "$u" | grep -i '^content-length:' | tail -n 1 | tr -d '\r' | awk '{print $2}')
+            echo "$id: HTTP $code | Magic $magic | Real size: $size bytes | URL: $u"
+            if [ "$code" != "200" ] && [ "$code" != "206" ]; then echo "::error::voice model link is broken: $u"; exit 1; fi
+            if [ "$magic" != "BZh" ]; then echo "::error::not a tar.bz2 file: $u"; exit 1; fi
+          done
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - uses: actions/setup-java@v4
@@ -27,6 +53,31 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: npm install --legacy-peer-deps
       - run: npx expo install --fix -- --legacy-peer-deps
+      - name: Download pinned sherpa-onnx Android arm64-v8a native libraries
+        env:
+          SHERPA_ONNX_VERSION: "v1.13.8"
+        run: |
+          mkdir -p modules/sheet-tts/android/src/main/jniLibs/arm64-v8a
+          URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/${SHERPA_ONNX_VERSION}/sherpa-onnx-${SHERPA_ONNX_VERSION}-android.tar.bz2"
+          echo "Downloading sherpa-onnx ${SHERPA_ONNX_VERSION} from $URL"
+          curl -sSL "$URL" -o /tmp/sherpa-android.tar.bz2
+          if [ ! -s /tmp/sherpa-android.tar.bz2 ]; then
+            echo "::error::Failed to download sherpa-onnx native libraries from $URL"
+            exit 1
+          fi
+          mkdir -p /tmp/sherpa_extracted
+          tar -xjf /tmp/sherpa-android.tar.bz2 -C /tmp/sherpa_extracted
+          cp /tmp/sherpa_extracted/jniLibs/arm64-v8a/libsherpa-onnx-jni.so modules/sheet-tts/android/src/main/jniLibs/arm64-v8a/
+          cp /tmp/sherpa_extracted/jniLibs/arm64-v8a/libonnxruntime.so modules/sheet-tts/android/src/main/jniLibs/arm64-v8a/
+          for f in libsherpa-onnx-jni.so libonnxruntime.so; do
+            p="modules/sheet-tts/android/src/main/jniLibs/arm64-v8a/$f"
+            if [ ! -s "$p" ]; then
+              echo "::error::Missing or empty native library: $p"
+              exit 1
+            fi
+            echo "Verified $f size: $(wc -c < "$p") bytes"
+          done
+          rm -rf /tmp/sherpa_extracted /tmp/sherpa-android.tar.bz2
       - run: npx expo prebuild --platform android --clean
       - name: Copy notification icons into Android resources
         run: |
