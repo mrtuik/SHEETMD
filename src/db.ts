@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 import type { Point } from './notes';
 import { norm, focus, excerpt, GENERIC } from './mdsplit';
-import { gramQuery } from './fuzzy';
+import { gramQuery, words } from './fuzzy';
 import { queryTokens, expandAbbr, variants, rankTopics, decide, isQuestionName, isQuestionBody, stripQuestions, covers, isJunkHeading } from './match';
 
 type DB = SQLite.SQLiteDatabase;
@@ -172,21 +172,51 @@ async function findTopicIn(d: DB, q: string, chatId: number, exact: boolean): Pr
     } catch {}
   }
   const seen = new Set<number>();
-  const cands = [...rows, ...fuzzy].filter((r) => !isQuestionName(r.name) && (seen.has(r.topic_id) ? false : (seen.add(r.topic_id), true))).slice(0, 10);
+  const cands = [...rows, ...fuzzy].filter((r) => !isQuestionName(r.name) && (seen.has(r.topic_id) ? false : (seen.add(r.topic_id), true))).slice(0, 16);
 
-  // A body hit is only accepted when the query is the HEADING of a section inside that text.
-  // (A chunk that merely mentions the word - e.g. "Lymphocyte" mentioning meningitis - is not the topic.)
+  // 2b) GATHER from the sources: everything the books say about the topic, from every chunk that really talks about it.
+  //  - a section whose HEADING is the topic            -> strong (whole section)
+  //  - a paragraph that names the topic 2+ times       -> medium (that paragraph + the next one)
+  //  - one passing mention (e.g. "lymphocytes ... in meningitis") is NOT the topic and is ignored
+  const hard = ex.filter((t) => t.length >= 3);
+  const stem = (t: string) => (t.length >= 7 ? t.slice(0, t.length - 3) : t);
+  const stems = (hard.length ? hard : ex).map(stem);
+  const hits = (para: string): number => {
+    const w = words(norm(para));
+    let n = 0;
+    for (const x of w) if (stems.some((st) => x.startsWith(st))) n++;
+    return n;
+  };
+  const allHave = (para: string) => { const w = words(norm(para)); return stems.every((st) => w.some((x) => x.startsWith(st))); };
+  type Piece = { name: string; text: string; score: number };
+  const pieces: Piece[] = [];
   for (const c of cands) {
     await new Promise((r) => setTimeout(r, 0));                 // let the screen / mic breathe between heavy steps
     const one = await d.getFirstAsync<{ name: string; body: string }>('SELECT name, body FROM topics WHERE id=?', [c.topic_id]);
     if (!one || isQuestionBody(one.body)) continue;
     const part = excerpt(one.body, ex);
-    if (!part) continue;
-    const body = stripQuestions(part.body);
-    if (body.length < 20 || isQuestionBody(body)) continue;
-    if (!covers(toks, part.name + '\n' + body)) continue;
-    if (!covers(toks, part.name) && !covers(ex, part.name)) continue;   // the heading itself must be about the query
-    const nm = isJunkHeading(part.name) ? one.name : GENERIC.has(part.name.toLowerCase()) ? `${one.name} - ${part.name}` : part.name === ex.join(' ') ? one.name : part.name;
+    if (part && (covers(toks, part.name) || covers(ex, part.name))) {
+      const body = stripQuestions(part.body);
+      if (body.length >= 20 && !isQuestionBody(body)) {
+        const nm = isJunkHeading(part.name) ? one.name : GENERIC.has(part.name.toLowerCase()) ? `${one.name} - ${part.name}` : part.name;
+        pieces.push({ name: nm, text: body, score: 100 + Math.min(body.length, 3000) / 100 });
+        continue;
+      }
+    }
+    const paras = stripQuestions(one.body).split(/\n\s*\n|\n(?=#{1,6}\s)/).map((x) => x.trim()).filter(Boolean);
+    const take = new Set<number>();
+    let total = 0;
+    paras.forEach((p, i) => { if (allHave(p)) { const n = hits(p); total += n; if (n >= 2) { take.add(i); if (i + 1 < paras.length) take.add(i + 1); } } });
+    if (take.size) pieces.push({ name: isJunkHeading(one.name) ? 'Source' : one.name, text: [...take].sort((x, y) => x - y).map((i) => paras[i]).join('\n\n'), score: total });
+  }
+  if (pieces.length) {
+    pieces.sort((x, y) => y.score - x.score);
+    const picked: Piece[] = [];
+    let size = 0;
+    for (const p of pieces) { if (size >= 7000) break; picked.push(p); size += p.text.length; }
+    const body = picked.map((p) => p.text).join('\n\n').slice(0, 9000);
+    const strong = picked.find((p) => p.score >= 100);
+    const nm = strong ? strong.name : ex.map((t) => t.charAt(0).toUpperCase() + t.slice(1)).join(' ');
     return { kind: 'ok', found: true, id: 0, name: nm, body, alts: ranked.slice(0, 3).map((x) => x.name) };   // id 0 = do not cache
   }
   return none([...new Set([...dec.options, ...ranked.slice(0, 3).map((x) => x.name)])].slice(0, 3));
