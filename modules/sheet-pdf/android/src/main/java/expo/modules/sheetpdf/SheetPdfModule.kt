@@ -14,6 +14,7 @@ import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.File
@@ -48,6 +49,30 @@ class SheetPdfModule : Module() {
         s.startPage = i
         s.endPage = i
         out.add(try { s.getText(d) } catch (e: Exception) { "" })
+      }
+      out
+    }
+
+    // Every WORD of pages start..end with its position, font size and bold flag (for headings / bullets / tables).
+    // One string per page: first line "P<TAB>width<TAB>height", then "x<TAB>x2<TAB>y<TAB>size<TAB>bold<TAB>text" per word.
+    AsyncFunction("readWords") { start: Int, end: Int ->
+      val d = doc ?: throw Exception("PDF not open")
+      val out = ArrayList<String>()
+      val last = minOf(end, d.numberOfPages)
+      for (i in start..last) {
+        val g = WordGrab()
+        g.sortByPosition = true
+        g.startPage = i
+        g.endPage = i
+        try { g.getText(d) } catch (e: Exception) { }
+        var w = 595f
+        var h = 842f
+        try {
+          val box = d.getPage(i - 1).getMediaBox()
+          w = box.getWidth()
+          h = box.getHeight()
+        } catch (e: Exception) { }
+        out.add("P\t" + w + "\t" + h + "\n" + g.sb.toString())
       }
       out
     }
@@ -87,5 +112,39 @@ class SheetPdfModule : Module() {
       bmp.recycle()
       res.text
     }
+  }
+}
+
+// Collects one line per WORD: position, font size, bold. (PDFBox calls writeString once per word.)
+private class WordGrab : PDFTextStripper() {
+  val sb = StringBuilder()
+
+  override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
+    val tp = textPositions ?: return
+    if (tp.isEmpty()) return
+    val t = (text ?: "").replace("\t", " ").replace("\n", " ").replace("\r", " ").trim()
+    if (t.isEmpty()) return
+    val first = tp[0]
+    val last = tp[tp.size - 1]
+    val x = first.getXDirAdj()
+    val x2 = last.getXDirAdj() + last.getWidthDirAdj()
+    val y = first.getYDirAdj()
+    var size = 0f
+    var boldChars = 0
+    for (p in tp) {
+      val fs = p.getFontSizeInPt()
+      if (fs > size) size = fs
+      var b = false
+      try {
+        val f = p.getFont()
+        val n = (f?.getName() ?: "").lowercase()
+        if (n.contains("bold") || n.contains("black") || n.contains("heavy") || n.contains("semibold") || n.contains("demi")) b = true
+        val fd = f?.getFontDescriptor()
+        if (fd != null && (fd.getFontWeight() >= 600f || fd.isForceBold())) b = true
+      } catch (e: Exception) { }
+      if (b) boldChars++
+    }
+    val bold = if (boldChars * 10 >= tp.size * 6) 1 else 0
+    sb.append(x).append('\t').append(x2).append('\t').append(y).append('\t').append(size).append('\t').append(bold).append('\t').append(t).append('\n')
   }
 }
