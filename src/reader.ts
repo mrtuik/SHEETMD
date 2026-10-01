@@ -1,4 +1,4 @@
-import * as Speech from 'expo-speech';
+import { speak, stopSpeak } from './tts';
 import { cleanForSpeech, speechChunks } from './cleaner';
 import { saveSession } from './db';
 import type { Point } from './notes';
@@ -47,7 +47,7 @@ export function lineOf(p: Point, chunk: number): number {
 }
 
 function halt() {
-  Speech.stop();
+  stopSpeak();
   const r = release; release = null;
   r?.();                                   // never leave a reader loop waiting on a stopped utterance
 }
@@ -66,8 +66,8 @@ function say(parts: string[], from = 0, track = false): Promise<void> {
       const fin = () => { if (done) return; done = true; if (--left <= 0) { release = null; res(); } };
       const bn = state.lang === 'bn' || (state.lang === 'auto' && /[\u0980-\u09FF]/.test(text));
       const voice = (bn ? state.voiceBn : state.voiceEn) || undefined;
-      Speech.speak(text, {
-        language: bn ? 'bn-BD' : 'en-US', voice, pitch: 1.0, rate,
+      speak(text, {
+        lang: bn ? 'bn' : 'en', voice, rate,
         onStart: () => { spoken = track ? parts.join(' ') : text; if (track) { state.chunk = from + k; emit(); } },
         onDone: fin, onStopped: fin, onError: fin,
       });
