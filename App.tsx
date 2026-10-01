@@ -6,7 +6,7 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
-import { parse, isGreeting, OK_END, CANCEL_Q } from './src/commands';
+import { parse, isGreeting, stripChoiceEcho, OK_END, CANCEL_Q } from './src/commands';
 import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
 import { exactPoints } from './src/exact';
@@ -20,7 +20,7 @@ import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownloa
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
-import { startListening, stopListening } from './src/listener';
+import { startListening, stopListening, restartListening } from './src/listener';
 import { updateService, stopService, onServiceAction } from './src/service';
 import { ICONS, IconName } from './src/icons';
 
@@ -190,7 +190,7 @@ function Main() {
     const line = 'Did you mean: ' + names.map((n, i) => `${['one', 'two', 'three'][i]}, ${n}`).join('. ') + '. Say one, two or three.';
     try { R.stop(); } catch {}
     choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
-    const done = () => setTimeout(() => { choiceSpeaking.current = false; }, 500);
+    const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(150); }, 350);   // then a fresh mic: it must not carry the app's own voice into your answer
     setTimeout(() => { choiceSpeaking.current = false; }, 25000);      // safety: if no callback ever comes, the mic is not left deaf
     Speech.speak(line, { language: /[\u0980-\u09FF]/.test(line) ? 'bn-BD' : 'en-US', rate: 0.95, onDone: done, onStopped: done, onError: done });
   };
@@ -416,6 +416,8 @@ function Main() {
     setHeard(alts[0].slice(0, 60));
     if (choiceSpeaking.current) return;
     if (qRef.current) { feedQuestion(alts[0]); return; }          // dictating a question: everything is part of it until "okay"
+    if (choicesRef.current) alts = alts.map(stripChoiceEcho).filter(Boolean);     // options waiting: drop the app's own "did you mean..." voice, keep the answer
+    if (!alts.length) return;
     let t = alts[0];
     let c = parse(t);
     if (c.t === 'unknown') {
@@ -432,8 +434,10 @@ function Main() {
   };
   const onPartial = (t: string) => {
     if (qRef.current) return false;                                // never while a question is being dictated
-    if (!FAST.has(parse(t).t) || choiceSpeaking.current || heardSelf(t)) return false;
-    execRef.current(t);
+    if (choiceSpeaking.current || heardSelf(t)) return false;
+    const k = parse(stripChoiceEcho(t));
+    if (!FAST.has(k.t) && !(k.t === 'pick' && !!choicesRef.current)) return false;      // "one / two / three" runs the moment it is heard, like stop / pause
+    execRef.current(stripChoiceEcho(t));
     return true;
   };
   const mic = async () => {
