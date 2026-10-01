@@ -795,7 +795,7 @@ function Main() {
                 <Text style={st.txt}>Active speech engine</Text>
                 <Text style={st.val}>
                   {ttsState.engine === 'piper' && ttsState.isPiperReady
-                    ? `Piper: ${VOICES.find((v) => v.id === ttsState.selectedVoice)?.label || ttsState.selectedVoice}`
+                    ? `${VOICES.find((v) => v.id === ttsState.selectedVoice)?.engine === 'kokoro' ? 'Kokoro' : 'Piper'}: ${VOICES.find((v) => v.id === ttsState.selectedVoice)?.label || ttsState.selectedVoice}`
                     : 'Phone voice'}
                 </Text>
               </View>
@@ -881,12 +881,12 @@ function Main() {
           </View>
 
           {/* English voices (Piper Catalog grouped by US / GB) */}
-          <Text style={st.secT}>English offline voices (Piper)</Text>
-          {(['US', 'GB'] as const).map((accent) => {
+          <Text style={st.secT}>English offline voices</Text>
+          {(['US', 'GB', 'KO'] as const).map((accent) => {
             const list = VOICES.filter((v) => v.accent === accent);
             return (
               <View key={accent} style={st.group}>
-                <Text style={[st.sub, { paddingTop: 10, fontWeight: '700' }]}>{accent === 'US' ? 'United States' : 'British (UK)'}</Text>
+                <Text style={[st.sub, { paddingTop: 10, fontWeight: '700' }]}>{accent === 'US' ? 'United States (Piper)' : accent === 'GB' ? 'British (UK) (Piper)' : 'Kokoro - higher quality (one 132 MB download, heavier: needs a strong phone)'}</Text>
                 {list.map((v, idx) => {
                   const vst = ttsState.voices[v.id] || { phase: 'none', got: 0, total: v.bytes, msg: '' };
                   const isSelected = ttsState.selectedVoice === v.id && ttsState.engine === 'piper';
@@ -919,9 +919,10 @@ function Main() {
                     }
                   };
 
-                  const onPreview = () => {
+                  const onPreview = async () => {
                     stopSpeak();
                     setPreviewingVoice(v.id);
+                    if (isReady && ttsState.selectedVoice !== v.id) await selectVoice(v.id);     // the preview must use THIS voice
                     speak(`Hello, this is ${v.label}.`, {
                       engine: 'piper',
                       rate: s.rate,
@@ -933,7 +934,7 @@ function Main() {
                   };
 
                   const onDelete = () => {
-                    Alert.alert('Delete voice?', `${v.label} will be removed from private storage.`, [
+                    Alert.alert('Delete voice?', v.engine === 'kokoro' ? 'All Kokoro voices share one download. It will be removed from private storage.' : `${v.label} will be removed from private storage.`, [
                       { text: 'Cancel', style: 'cancel' },
                       {
                         text: 'Delete',
