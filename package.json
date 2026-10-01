@@ -1,0 +1,29 @@
+{
+  "name": "sheet-md",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "android": "expo run:android"
+  },
+  "dependencies": {
+    "@react-native-voice/voice": "^3.2.4",
+    "expo": "~54.0.0",
+    "expo-device": "~8.0.0",
+    "expo-document-picker": "~14.0.0",
+    "expo-file-system": "~19.0.0",
+    "expo-keep-awake": "~15.0.0",
+    "expo-network": "~8.0.0",
+    "expo-speech": "~14.0.0",
+    "expo-sqlite": "~16.0.0",
+    "jszip": "^3.10.1",
+    "llama.rn": "^0.9.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-safe-area-context": "~5.6.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.0",
+    "typescript": "~5.9.2"
+  }
+}
