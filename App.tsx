@@ -6,7 +6,7 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
-import { parse, isGreeting, stripChoiceEcho, OK_END, CANCEL_Q } from './src/commands';
+import { parse, parsePick, isGreeting, stripChoiceEcho, OK_END, CANCEL_Q } from './src/commands';
 import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
 import { exactPoints } from './src/exact';
@@ -20,7 +20,7 @@ import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownloa
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
-import { startListening, stopListening, restartListening } from './src/listener';
+import { startListening, stopListening, restartListening, markHandled } from './src/listener';
 import { updateService, stopService, onServiceAction } from './src/service';
 import { ICONS, IconName } from './src/icons';
 
@@ -190,8 +190,8 @@ function Main() {
     const line = 'Did you mean: ' + names.map((n, i) => `${['one', 'two', 'three'][i]}, ${n}`).join('. ') + '. Say one, two or three.';
     try { R.stop(); } catch {}
     choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
-    const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(150); }, 350);   // then a fresh mic: it must not carry the app's own voice into your answer
-    setTimeout(() => { choiceSpeaking.current = false; }, 25000);      // safety: if no callback ever comes, the mic is not left deaf
+    const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(100); }, 200);   // then a fresh mic: it must not carry the app's own voice into your answer
+    setTimeout(() => { choiceSpeaking.current = false; }, Math.min(12000, 2500 + line.length * 80));      // safety: if no callback ever comes, the mic is not left deaf for long
     Speech.speak(line, { language: /[\u0980-\u09FF]/.test(line) ? 'bn-BD' : 'en-US', rate: 0.95, onDone: done, onStopped: done, onError: done });
   };
 
@@ -411,11 +411,34 @@ function Main() {
   const heardSelf = (t: string) => t.trim().split(/\s+/).length >= 3 && R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim());
   // one-word playback commands run the moment they are heard (no waiting for the recognizer to finish)
   const FAST = new Set(['pause', 'stop', 'next', 'prev', 'continue', 'slower', 'faster']);
+  // options waiting: any of the recogniser's guesses that sounds like one / two / three (also the usual mishearings)
+  const WORDS = ['one', 'two', 'three'];
+  // While the app is reading, the mic hears the app's own voice, so "stop" arrives glued to the end of the app's words
+  // ("...and the cell membrane stop"). A clear command word at the END that the app is not itself saying right now is a real command.
+  const TAIL_WORDS = new Set(['stop', 'pause', 'next', 'previous', 'continue', 'resume', 'slower', 'faster']);
+  const tailCmd = (t: string): string | null => {
+    if (R.state.status !== 'reading') return null;
+    const w = t.trim().toLowerCase().replace(/[.!?।,]+/g, '').split(/\s+/).filter(Boolean);
+    if (w.length < 2) return null;                                   // a lone word takes the normal path
+    const last = w[w.length - 1];
+    if (!TAIL_WORDS.has(last) || R.getSpoken().toLowerCase().includes(last)) return null;
+    return last;
+  };
+  const stableT = useRef<any>(null);                                 // topic / exact / explain: runs when the words stop changing, not after the long end-of-speech silence
+  const clearStable = () => { clearTimeout(stableT.current); stableT.current = null; };
+  const loosePick = (alts: string[]) => { for (const a of alts) { const n = parsePick(stripChoiceEcho(a), true); if (n && n <= (choicesRef.current?.length || 3)) return n; } return 0; };
   const onVoice = (alts: string[]) => {
     if (!alts.length) return;
     setHeard(alts[0].slice(0, 60));
+    clearStable();
     if (choiceSpeaking.current) return;
-    if (qRef.current) { feedQuestion(alts[0]); return; }          // dictating a question: everything is part of it until "okay"
+    if (qRef.current) { feedQuestion(alts[0]); return; }
+    for (const a of alts) { const tc = tailCmd(a); if (tc) { execRef.current(tc); restartListening(150); return; } }
+    if (choicesRef.current) {
+      const n = loosePick(alts);
+      if (n) { execRef.current(WORDS[n - 1]); return; }
+      setHeard(alts[0].slice(0, 40) + '  (not one/two/three)');         // so you can see what the phone heard instead
+    }          // dictating a question: everything is part of it until "okay"
     if (choicesRef.current) alts = alts.map(stripChoiceEcho).filter(Boolean);     // options waiting: drop the app's own "did you mean..." voice, keep the answer
     if (!alts.length) return;
     let t = alts[0];
@@ -433,9 +456,18 @@ function Main() {
     execRef.current(t);
   };
   const onPartial = (t: string) => {
-    if (qRef.current) return false;                                // never while a question is being dictated
+    if (qRef.current) { clearStable(); return false; }              // never while a question is being dictated
     if (choiceSpeaking.current || heardSelf(t)) return false;
+    const tc = tailCmd(t);
+    if (tc) { clearStable(); execRef.current(tc); restartListening(150); return true; }
+    if (choicesRef.current) { const n = loosePick([t]); if (n) { execRef.current(WORDS[n - 1]); return true; } }
     const k = parse(stripChoiceEcho(t));
+    clearStable();
+    if ((k.t === 'topic' || k.t === 'exact' || k.t === 'explain') && (k as any).q?.trim() && !choicesRef.current) {
+      const snap = t;                                                // same words for 0.7 s = finished: go now instead of waiting for the end-of-speech silence
+      stableT.current = setTimeout(() => { stableT.current = null; if (qRef.current || choiceSpeaking.current) return; markHandled(); execRef.current(snap); }, 700);
+      return false;
+    }
     if (!FAST.has(k.t) && !(k.t === 'pick' && !!choicesRef.current)) return false;      // "one / two / three" runs the moment it is heard, like stop / pause
     execRef.current(stripChoiceEcho(t));
     return true;
