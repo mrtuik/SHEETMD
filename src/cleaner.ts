@@ -90,13 +90,18 @@ export function cleanForSpeech(input: string): string {
   return t;
 }
 
-// Sentence splitter: a full stop inside a number (12.5) is not a sentence end.
+// Sentence splitter: a full stop inside a number (12.5) or after e.g. / i.e. / vs. / Fig. / Dr. is not a sentence end.
+const ABBR_END = /(?:^|[\s(])(?:e\.g|i\.e|vs|viz|fig|figs|dr|mr|mrs|ms|prof|approx|cf|spp|inc|ltd)\.$/i;
+const LABEL_END = /^\W*\(?[A-Za-z]\.$/;                      // "A." "B." at the start of a sentence = a list label
 export function splitSentences(t: string): string[] {
   const out: string[] = [];
   let cur = '';
   for (let i = 0; i < t.length; i++) {
     cur += t[i];
-    if (/[.!?।]/.test(t[i]) && (i === t.length - 1 || /\s/.test(t[i + 1]))) { out.push(cur.trim()); cur = ''; }
+    if (/[.!?।]/.test(t[i]) && (i === t.length - 1 || /\s/.test(t[i + 1]))) {
+      if (t[i] === '.' && i < t.length - 1 && (ABBR_END.test(cur) || LABEL_END.test(cur))) continue;
+      out.push(cur.trim()); cur = '';
+    }
   }
   if (cur.trim()) out.push(cur.trim());
   return out.filter(Boolean);
