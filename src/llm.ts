@@ -196,7 +196,9 @@ Never write an empty or generic point. Point titles must be the real names used 
 
 const SYSTEM = (lo: number, hi: number, kind: Kind) => `You write university exam answers exactly like a topper's exam copy (medical lab technology).
 Use ONLY the SOURCE text. Never add a fact, number or name that is not in the SOURCE. Write in the language of the SOURCE.
-Cover EVERY part of the SOURCE - do not skip a section, a list, a table row or a value.
+Cover EVERY part of the SOURCE that is about the topic - do not skip a section, a list, a table row or a value.
+The SOURCE may be several passages taken from different places of the books: merge them into ONE clean answer, remove repeats, and ignore any passage that is not about the topic.
+The topic name was typed by voice and may be slightly misspelled: write about the topic the SOURCE is really about.
 Format: numbered points, one per line, exactly like:
 1. **Keyword**: short line
 Rules: no introduction, no conclusion, no filler words. Each line at most 18 words. Bold only the keyword. Keep numbers, units and names exactly as in the SOURCE.
