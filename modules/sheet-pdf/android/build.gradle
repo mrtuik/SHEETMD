@@ -1,0 +1,15 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+group = 'expo.modules.sheetpdf'
+version = '1.0.0'
+android {
+  namespace "expo.modules.sheetpdf"
+  defaultConfig { versionCode 1; versionName "1.0.0" }
+  lint { abortOnError false }
+}
+dependencies {
+  implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
+  implementation 'com.google.mlkit:text-recognition:16.0.1'
+}
