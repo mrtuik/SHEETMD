@@ -30,7 +30,12 @@ class SheetTtsModule : Module() {
   private var currentModelDir: String = ""
 
   private val playExecutor = Executors.newSingleThreadExecutor()
-  private val prepareExecutor = Executors.newSingleThreadExecutor()
+  private val prepareExecutor = Executors.newSingleThreadExecutor { r ->
+    Thread(r).apply { priority = Thread.MIN_PRIORITY }      // background: never steals CPU from the voice that is playing
+  }
+  // sherpa's OfflineTts must not generate from two threads at once (prepare + speak did): one at a time
+  private val genLock = Any()
+  @Volatile private var epoch: Int = 0        // bumped on every stop / new speak: a background generation from an older epoch aborts at once
 
   @Volatile private var activeId: Int = -1
   @Volatile private var cancelled: Boolean = false
@@ -196,12 +201,24 @@ class SheetTtsModule : Module() {
       val key = "$curDir:$speed:$text"
       if (preCache.containsKey(key)) return@Function
 
+      val myEpoch = epoch
       prepareExecutor.submit {
         try {
-          if (tts === currentTts && !cancelled) {
-            val audio = currentTts.generate(text, sid = 0, speed = speed)
-            if (tts === currentTts && !cancelled) {
-              preCache[key] = audio
+          if (tts === currentTts && epoch == myEpoch) {
+            val parts = ArrayList<FloatArray>()
+            var total = 0
+            synchronized(genLock) {
+              currentTts.generateWithCallback(text, sid = 0, speed = speed) { samples ->
+                if (epoch != myEpoch || tts !== currentTts) return@generateWithCallback 0   // a command arrived: give the engine back immediately
+                parts.add(samples); total += samples.size
+                1
+              }
+            }
+            if (tts === currentTts && epoch == myEpoch && total > 0) {
+              val all = FloatArray(total)
+              var o = 0
+              for (a in parts) { System.arraycopy(a, 0, all, o, a.size); o += a.size }
+              preCache[key] = GeneratedAudio(all, currentTts.sampleRate())
             }
           }
         } catch (e: Exception) { }
@@ -215,6 +232,7 @@ class SheetTtsModule : Module() {
         return@Function
       }
 
+      epoch++                                       // any background prepare for older text gives up now
       // If already playing another chunk, stop previous playback
       if (activeId != -1) {
         val prevId = activeId
@@ -301,20 +319,22 @@ class SheetTtsModule : Module() {
               }
             }
           } else {
-            currentTts.generateWithCallback(text, sid = 0, speed = speed) { samples ->
-              if (cancelled || activeId != id) {
-                return@generateWithCallback 0
-              }
-              if (samples.isNotEmpty()) {
-                if (!started) {
-                  started = true
-                  sendEvent("onStart", mapOf("id" to id))
-                  audioTrack.play()
+            synchronized(genLock) {
+              currentTts.generateWithCallback(text, sid = 0, speed = speed) { samples ->
+                if (cancelled || activeId != id) {
+                  return@generateWithCallback 0
                 }
-                audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-                totalWrittenFrames += samples.size
+                if (samples.isNotEmpty()) {
+                  if (!started) {
+                    started = true
+                    sendEvent("onStart", mapOf("id" to id))
+                    audioTrack.play()
+                  }
+                  audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+                  totalWrittenFrames += samples.size
+                }
+                1
               }
-              1
             }
           }
 
@@ -419,6 +439,7 @@ class SheetTtsModule : Module() {
   }
 
   private fun stopPlayback() {
+    epoch++
     val prevId = activeId
     activeId = -1
     cancelled = true
