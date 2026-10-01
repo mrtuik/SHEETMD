@@ -147,6 +147,11 @@ const touch = () => { clearTimeout(idle); idle = setTimeout(() => { try { ctx?.r
 
 async function getCtx(): Promise<any | null> {
   if (llm.phase !== 'ready') return null;
+  if (active) {                                    // an old (cancelled) job is still running inside the model: stop it, or reload the model
+    try { ctx?.stopCompletion?.(); } catch {}
+    await Promise.race([active, new Promise((r) => setTimeout(r, 2500))]);
+    if (active) { try { await ctx?.release?.(); } catch {} ctx = null; active = null; }
+  }
   if (ctx) { touch(); return ctx; }
   try {
     const { initLlama } = require('llama.rn');
@@ -245,22 +250,30 @@ const MAXSRC = () => (llm.model === 'q05' ? 3200 : 5200);
 
 // "stop" / a newer request cancels the running job (the phone stops computing at once)
 let jobId = 0;
-export function cancelGen() { jobId++; try { ctx?.stopCompletion?.(); } catch {} }
+let active: Promise<any> | null = null;          // the native completion that is running right now
+const cancelHooks = new Set<() => void>();
+export function cancelGen() { jobId++; try { ctx?.stopCompletion?.(); } catch {} cancelHooks.forEach((f) => f()); }   // waiting jobs return at once
 
 async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number): Promise<{ text: string; cancelled: boolean }> {
+  if (job !== jobId) return { text: '', cancelled: true };
   let timer: any;
+  let hook: (() => void) | null = null;
   try {
     const run = c.completion({
       messages, n_predict: nPredict, temperature, top_p: 0.9, penalty_repeat: 1.1,
       stop: ['<|im_end|>', '<|endoftext|>'],
     });
+    const tracked: Promise<any> = Promise.resolve(run).catch(() => {}).then(() => { if (active === tracked) active = null; });
+    active = tracked;
     const out: any = await Promise.race([
       run,
       new Promise((res) => { timer = setTimeout(() => { try { c.stopCompletion?.(); } catch {} res(null); }, 150000); }),
+      new Promise((res) => { hook = () => res(null); cancelHooks.add(hook); }),
     ]);
-    clearTimeout(timer); touch();
+    touch();
     return { text: job === jobId ? String(out?.text || '').trim() : '', cancelled: job !== jobId };
-  } catch { clearTimeout(timer); return { text: '', cancelled: job !== jobId }; }
+  } catch { return { text: '', cancelled: job !== jobId }; }
+  finally { clearTimeout(timer); if (hook) cancelHooks.delete(hook); }
 }
 const tokens = (hi: number) => Math.min(800, hi * 45 + 80);     // no more tokens than the points need (faster on the phone)
 
