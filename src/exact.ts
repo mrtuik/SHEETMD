@@ -1,6 +1,9 @@
-// "exact <topic name>": word-for-word reading of one topic from the .md file. NO model, NO rewriting.
-// The topic is read from its heading to the next topic's heading (sub-headings, bullets, numbered steps and table rows
-// all included, in the file's own order). Only layout noise is removed: HTML tags/styles, page markers, "Back to Index".
+// "exact <topic name>": word-for-word reading of one topic from the file. NO model, NO rewriting.
+// The whole topic is read, from its heading to the next topic's heading: sub-headings, bullets, numbered lists,
+// paragraphs and TABLES, in the file's own order. Every sub-heading becomes its own point ("Point 3. Autoclave")
+// and EVERYTHING under it is read (nothing is left as a bare title).
+// A table is read as:  "Table. Left column: A. Right column: B."  then  "Row 1. Left side: ... Right side: ..."
+// Only layout noise is removed: HTML tags/styles, page markers, "Back to Index".
 import { stripMarkdown } from './cleaner';
 import type { Point } from './notes';
 
@@ -29,10 +32,44 @@ export function stripHtml(s: string): string {
 
 const isSep = (l: string) => /^[\s|:\-]+$/.test(l) && /-/.test(l);
 const isRow = (l: string) => /^\s*\|/.test(l) || (l.match(/\|/g) || []).length >= 2;
-const rowText = (l: string) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => stripMarkdown(c)).filter((c) => c && c !== '-' && c !== '—').join(', ');
+const cellsOf = (l: string) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => stripMarkdown(c).replace(/^[-—–]$/, '').trim());
+const dot = (s: string) => (/[.!?।:;]$/.test(s) ? s : s + '.');
+
+// table -> spoken lines. Left side / right side for 2 columns, column names for more.
+export function tableLines(rows: string[][], hasHead: boolean): string[] {
+  const n = Math.max(...rows.map((r) => r.length), 0);
+  if (!n) return [];
+  let head: string[] | null = hasHead ? rows[0] : null;
+  let data = hasHead ? rows.slice(1) : rows;
+  const hk = head ? head.join('|').toLowerCase() : '';
+  data = data.filter((r) => r.some((c) => c) && !(hk && r.join('|').toLowerCase() === hk));     // header repeated at a page break
+  const out: string[] = [];
+  if (n === 1) { data.forEach((r) => r[0] && out.push(r[0])); return out; }
+  if (n === 2) {
+    out.push(head && (head[0] || head[1])
+      ? `Table. Left column: ${head[0] || 'blank'}. Right column: ${head[1] || 'blank'}.`
+      : 'Table. Two columns, left side and right side.');
+    data.forEach((r, i) => {
+      const parts = [`Row ${i + 1}.`];
+      if (r[0]) parts.push(`Left side: ${dot(r[0])}`);
+      if (r[1]) parts.push(`Right side: ${dot(r[1])}`);
+      out.push(parts.join(' '));
+    });
+    return out;
+  }
+  const names = Array.from({ length: n }, (_, j) => (head && head[j]) || `Column ${j + 1}`);
+  out.push(`Table with ${n} columns: ${names.join(', ')}.`);
+  data.forEach((r, i) => {
+    const parts = [`Row ${i + 1}.`];
+    names.forEach((nm, j) => { if (r[j]) parts.push(`${nm}: ${dot(r[j])}`); });
+    out.push(parts.join(' '));
+  });
+  return out;
+}
 
 export function exactPoints(name: string, body: string): Point[] {
-  const lines = stripHtml(body.replace(/\r/g, '')).split('\n');
+  const pre = body.replace(/\r/g, '').split('\n').map((l) => (isRow(l) ? l.replace(/<br\s*\/?>/gi, ' ') : l)).join('\n');
+  const lines = stripHtml(pre).split('\n');
   type Raw = { title: string; lines: string[] };
   const raws: Raw[] = [{ title: 'Introduction', lines: [] }];
   const cur = () => raws[raws.length - 1];
@@ -53,10 +90,14 @@ export function exactPoints(name: string, body: string): Point[] {
       continue;
     }
     if (!fence && isRow(t)) {
-      while (true) {
-        if (!isSep(t === lines[i].trim() ? t : lines[i].trim())) { const r = rowText(lines[i]); if (r) cur().lines.push(r); }
-        if (i + 1 < lines.length && isRow(lines[i + 1].trim())) i++; else break;
+      const rows: string[][] = [];
+      let hasHead = false;
+      for (let k = i; k < lines.length && isRow(lines[k].trim()); k++, i = k - 1) {
+        const l = lines[k].trim();
+        if (isSep(l)) { if (rows.length === 1) hasHead = true; continue; }
+        rows.push(cellsOf(l));
       }
+      cur().lines.push(...tableLines(rows, hasHead));
       continue;
     }
     const q = t.replace(/^>+\s?/, '');
@@ -81,4 +122,12 @@ export function exactPoints(name: string, body: string): Point[] {
   }
   if (!pts.length) return [{ n: 1, title: name, text: 'Nothing to read in this topic.' }];
   return pts.map((p, i) => ({ n: i + 1, ...p }));
+}
+
+// every word of the topic must be somewhere in the points (used by the self-test)
+export function missingWords(body: string, pts: Point[]): string[] {
+  const clean = (s: string) => stripMarkdown(stripHtml(s)).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length >= 3);
+  const said = new Set(clean(pts.map((p) => p.title + ' ' + (p.bullets || [p.text]).join(' ')).join(' ')));
+  const need = clean(body.split('\n').filter((l) => !isSep(l.trim())).join(' '));
+  return [...new Set(need.filter((w) => !said.has(w) && !/^(left|right|column|side|row|table)$/.test(w)))];
 }
