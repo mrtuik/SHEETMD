@@ -32,6 +32,8 @@ const BUL2 = /^([•▪◦●○■□‣∙·▫◾▸►▶])(\S.*)$/;
 const NUM1 = /^\d{1,2}[.)]$/;
 const key = (s: string) => s.toLowerCase().replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
 const isPageNo = (l: string) => /^(page\s*)?\d{1,4}(\s*(of|\/)\s*\d{1,4})?$/i.test(l.trim()) || /^[-–—\s]*\d{1,4}[-–—\s]*$/.test(l.trim());
+// a line that ends right after a hyphen / en dash that touches a letter or digit ("early-" + "morning", "10–" + "20 mL") continues the same word
+const GLUE = /[\p{L}\p{N}][-–]$/u;
 const r05 = (n: number) => Math.round(n * 2) / 2;
 
 function buildLines(pg: Pg, page: number): Ln[] {
@@ -59,7 +61,7 @@ function buildLines(pg: Pg, page: number): Ln[] {
     const segs: Seg[] = [];
     for (const w of rest) {
       const s = segs[segs.length - 1];
-      if (s && w.x - s.x2 <= lim) { s.text += ' ' + w.text; s.x2 = Math.max(s.x2, w.x2); }
+      if (s && w.x - s.x2 <= lim) { s.text += (w.x - s.x2 < 0.12 * w.size ? '' : ' ') + w.text; s.x2 = Math.max(s.x2, w.x2); }   // gap ~0 = same word split by a font change ("disinfectant" + ".")
       else segs.push({ x: w.x, x2: w.x2, text: w.text });
     }
     const text = (num ? num + ' ' : '') + segs.map((s) => s.text).join(' ');
@@ -80,40 +82,89 @@ type Block =
 
 const colOf = (cols: number[], x: number) => { let c = 0; cols.forEach((v, i) => { if (v <= x + 6) c = i; }); return c; };
 
-// a run of lines that forms a table: >= 2 lines that have 2+ segments starting at the same x positions
+// a run of lines that forms a table. The first line has 2+ segments (the header, or the first row); the following lines
+// start at those same x positions. Cells of one row are NOT on the same baseline (browsers centre the text of a cell
+// vertically), so a row may be made of single-segment lines at different y: columns are used, not lines.
 function tableRun(L: Ln[], i: number, body: number): { end: number; cols: number[] } | null {
-  const first = L[i];
-  if (first.segs.length < 2 || first.size > body * 1.15 || first.marker === 'bullet') return null;
-  const cols = first.segs.map((s) => s.x);
-  let multi = 1, end = i;
-  for (let k = i + 1; k < L.length; k++) {
+  let j = i;
+  const cols: number[] = [];
+  const addCol = (x: number) => { if (!cols.some((c) => Math.abs(c - x) <= 6)) { cols.push(x); cols.sort((p, q) => p - q); } };
+  if (L[i].segs.length < 2) {
+    // header cells can sit on different baselines (a 2-line header cell next to a 1-line one): single-segment lines
+    // less than one line pitch above the first multi-segment line belong to that header
+    let k = i;
+    while (k < L.length && k <= i + 2 && L[k].segs.length < 2 && L[k].marker === '' && L[k].size <= body * 1.15 && (k === i || L[k].y - L[k - 1].y <= 1.25 * L[k].size)) k++;
+    if (k >= L.length || k === i || L[k].segs.length < 2 || L[k].y - L[k - 1].y > 1.25 * L[k].size || Math.abs(L[k].size - L[i].size) > 1) return null;
+    j = k;
+  }
+  const first = L[j];
+  if (first.segs.length < 2 || first.size > body * 1.15 || first.marker === 'bullet' || first.marker === 'num') return null;
+  for (let k = i; k <= j; k++) L[k].segs.forEach((s) => addCol(s.x));
+  let multi = 1, end = j;
+  const used = new Set<number>();
+  for (let k = i; k <= j; k++) L[k].segs.forEach((s) => used.add(colOf(cols, s.x)));
+  for (let k = j + 1; k < L.length; k++) {
     const a = L[k - 1], b = L[k];
     const gap = b.y - a.y;
-    if (gap > 4.5 * Math.max(a.size, b.size) || b.size > body * 1.15 || b.marker === 'bullet') break;
+    if (gap > 4.5 * Math.max(a.size, b.size) || b.size > body * 1.15 || b.marker === 'bullet' || b.marker === 'num') break;
+    if (Math.abs(b.size - first.size) > 1.5) break;
+    const inHead = b.y - first.y <= 1.3 * b.size;                 // still on the header's rows: may open a new column
     if (b.segs.length >= 2) {
+      if (inHead) b.segs.forEach((s) => addCol(s.x));
       const al = b.segs.filter((s) => cols.some((c) => Math.abs(c - s.x) <= 6)).length;
-      if (al >= 2 || (al >= 1 && b.segs.length === cols.length)) { multi++; end = k; continue; }
+      if (al >= 2 || (al >= 1 && b.segs.length === cols.length)) { multi++; end = k; b.segs.forEach((s) => used.add(colOf(cols, s.x))); continue; }
       break;
     }
     const s = b.segs[0];
+    if (inHead && b.marker === '') addCol(s.x);
     const ci = cols.findIndex((c) => Math.abs(c - s.x) <= 6);
-    if (ci >= 0 && (ci === cols.length - 1 || s.x2 <= cols[ci + 1] - 2) && b.marker === '') { end = k; continue; }   // wrapped cell text
+    if (ci >= 0 && (ci === cols.length - 1 || s.x2 <= cols[ci + 1] - 2) && b.marker === '') { end = k; used.add(ci); continue; }   // single-cell line (wrapped or vertically centred cell text)
     break;
   }
-  return multi >= 2 ? { end, cols } : null;
+  // a table needs 2 rows with 2+ cells, or a header plus lines that fill at least 2 different columns
+  return multi >= 2 || (end >= j + 2 && used.size >= 2) ? { end, cols } : null;
 }
 
+// Rows are rebuilt column by column: in each column the lines are grouped into cells (a bigger vertical gap = next
+// cell), then the cells of all columns that overlap vertically form one row. Wrapped cell text stays in its cell.
 function tableBlock(L: Ln[], i: number, end: number, cols: number[]): Block {
   const run = L.slice(i, end + 1);
-  const gaps = run.slice(1).map((l, k) => l.y - run[k].y);
+  type It = { c: number; y: number; size: number; bold: boolean; text: string };
+  const items: It[] = [];
+  run.forEach((l) => {
+    const byCol = new Map<number, Seg[]>();
+    l.segs.forEach((s) => { const c = colOf(cols, s.x); byCol.set(c, [...(byCol.get(c) || []), s]); });
+    byCol.forEach((ss, c) => items.push({ c, y: l.y, size: l.size, bold: l.bold, text: ss.map((s) => s.text).join(' ') }));
+  });
+  // wrapped-line pitch = smallest gap between two lines of the same column
+  const gaps: number[] = [];
+  cols.forEach((_, c) => { const col = items.filter((t) => t.c === c); for (let k = 1; k < col.length; k++) { const g = col[k].y - col[k - 1].y; if (g > 0.5) gaps.push(g); } });
   const minG = gaps.length ? Math.min(...gaps) : 0, maxG = gaps.length ? Math.max(...gaps) : 0;
-  const flat = maxG < minG * 1.15;
+  const flat = !gaps.length || maxG < minG * 1.15;               // every cell is one line
+  const hdrBold = run[0].bold && run.length > 1 && !run[1].bold;
+  type Ch = { c: number; top: number; bot: number; parts: string[] };
+  const chunks: Ch[] = [];
+  cols.forEach((_, c) => {
+    let cur: Ch | null = null, prev: It | null = null;
+    items.filter((t) => t.c === c).forEach((t) => {
+      const brk = !cur || !prev || flat || (t.y - prev.y) > minG * 1.35 || (hdrBold && prev.y === run[0].y && t.y !== run[0].y);
+      if (brk) { cur = { c, top: t.y - t.size * 0.85, bot: t.y + t.size * 0.25, parts: [] }; chunks.push(cur); }
+      const ch = cur as Ch;
+      const last = ch.parts[ch.parts.length - 1];
+      if (last !== undefined && GLUE.test(last)) ch.parts[ch.parts.length - 1] = last + t.text;   // "kidney/coffee-" + "bean"
+      else ch.parts.push(t.text);
+      ch.bot = t.y + t.size * 0.25;
+      prev = t;
+    });
+  });
+  chunks.sort((a, b) => a.top - b.top || a.c - b.c);
   const rows: string[][] = [];
-  let cur: string[] = [];
-  run.forEach((l, k) => {
-    const newRow = k === 0 || flat || (l.y - run[k - 1].y) > minG * 1.35 || (k === 1 && run[0].bold && !l.bold);
-    if (newRow) { cur = cols.map(() => ''); rows.push(cur); }
-    l.segs.forEach((s) => { const c = colOf(cols, s.x); cur[c] = cur[c] ? cur[c] + ' ' + s.text : s.text; });
+  let rowBot = -1e9, cur: string[] = [];
+  chunks.forEach((ch) => {
+    if (!rows.length || ch.top > rowBot - 1) { cur = cols.map(() => ''); rows.push(cur); rowBot = ch.bot; }
+    else rowBot = Math.max(rowBot, ch.bot);
+    const t = ch.parts.join(' ');
+    cur[ch.c] = cur[ch.c] ? cur[ch.c] + ' ' + t : t;
   });
   return { t: 'tbl', rows, cols, page: run[0].page };
 }
@@ -138,17 +189,30 @@ export function layoutPages(raw: Pg[]): { md: string; headings: number } {
   let body = 10, best = -1;
   bySize.forEach((n, s) => { if (n > best) { best = n; body = s; } });
 
-  // normal line pitch (to tell "wrapped line" from "new paragraph")
-  const pit: number[] = [];
-  keep.forEach((L) => L.forEach((l, k) => { if (k && Math.abs(l.size - L[k - 1].size) < 1 && l.size <= body * 1.1) { const g = l.y - L[k - 1].y; if (g > 0 && g < 2.6 * l.size) pit.push(g); } }));
-  pit.sort((a, b) => a - b);
-  const g0 = pit.length ? pit[Math.floor(pit.length * 0.3)] : body * 1.3;
+  // normal line pitch: the smallest vertical gap that is common between two body lines = a wrapped line.
+  // (browsers and Word add a little more space between list items and a lot more between paragraphs)
+  const hist = new Map<number, number>();
+  let pn = 0;
+  keep.forEach((L) => L.forEach((l, k) => {
+    if (k && r05(l.size) === body && r05(L[k - 1].size) === body) { const g = l.y - L[k - 1].y; if (g > 0 && g < 2.6 * l.size) { const b = r05(g); hist.set(b, (hist.get(b) || 0) + 1); pn++; } }
+  }));
+  let g0 = body * 1.4;
+  const hb = [...hist.keys()].sort((a, b) => a - b).find((b) => (hist.get(b) || 0) >= Math.max(3, pn * 0.05));
+  if (hb !== undefined) g0 = hb + 0.25;
+  const newPar = g0 * 1.1;           // a gap bigger than this starts a new item / paragraph
 
-  const isHead = (l: Ln) => {
+  // left margin of the text (smallest x that many lines share); lines indented from it are list items
+  const xs = keep.flat().map((l) => l.x);
+  let left = xs.length ? Math.min(...xs) : 0;
+  [...new Set(xs.map((x) => Math.round(x)))].sort((a, b) => a - b).some((x) => { if (xs.filter((v) => Math.abs(v - x) <= 1.5).length >= 3) { left = x; return true; } return false; });
+
+  const isHead = (l: Ln, prev: Ln | null) => {
     if (l.marker === 'bullet' || l.text.length < 2 || l.text.length > 140) return false;
     if (l.size >= body * 1.12) return true;
     const wc = l.text.split(/\s+/).length;
-    return l.bold && l.segs.length === 1 && l.marker === '' && wc <= 14 && !/[.,;]$/.test(l.text);
+    // a bold-only line is a heading only at the left margin and with room above it - an all-bold wrapped line of a list item is not
+    const room = !prev || l.y - prev.y > g0 * 1.25;
+    return l.bold && l.segs.length === 1 && l.marker === '' && wc <= 14 && !/[.,;]$/.test(l.text) && l.x <= left + 6 && room;
   };
 
   const blocks: Block[] = [];
@@ -168,7 +232,7 @@ export function layoutPages(raw: Pg[]): { md: string; headings: number } {
         i = run.end; cur = null; prev = null;
         continue;
       }
-      if (isHead(l)) {
+      if (isHead(l, i ? L[i - 1] : null)) {
         const last = blocks[blocks.length - 1];
         if (last && last.t === 'h' && last.page === p && Math.abs(last.size - l.size) < 0.6 && last.bold === l.bold && l.y - last.y <= 1.7 * l.size && !/[:.]$/.test(last.text)) {
           last.text += ' ' + l.text; last.y = l.y;                         // heading that wrapped onto a second line
@@ -182,10 +246,14 @@ export function layoutPages(raw: Pg[]): { md: string; headings: number } {
       }
       const gap = prev ? l.y - prev.y : 1e9;
       const crossPage = !prev && blocks.length && (() => { const b = blocks[blocks.length - 1]; return (b.t === 'p' || b.t === 'li') && /^[a-z(]/.test(l.text) && !/[.!?:]$/.test(b.text); })();
-      if ((cur && prev && gap <= g0 * 1.35 && Math.abs(l.size - prev.size) < 1) || crossPage) {
+      if ((cur && prev && gap <= newPar && Math.abs(l.size - prev.size) < 1) || crossPage) {
         const t = (cur || blocks[blocks.length - 1]) as Extract<Block, { t: 'p' | 'li' }>;
-        t.text = /[A-Za-z]-$/.test(t.text) && /^[a-z]/.test(l.text) ? t.text.slice(0, -1) + l.text : t.text + ' ' + l.text;
+        // a line that ends in "-" is cut at a real hyphen of the text (early-morning): keep it, drop only the space
+        t.text = GLUE.test(t.text) ? t.text + l.text : t.text + ' ' + l.text;
         if (!cur) cur = t;
+      } else if (l.x - left >= 8 && l.size <= body * 1.1) {
+        cur = { t: 'li', text: l.text, page: p, mx: l.x, num: false };          // list item whose bullet is a drawn shape, not a character
+        blocks.push(cur);
       } else { cur = { t: 'p', text: l.text, page: p }; blocks.push(cur); }
       prev = l;
     }
@@ -203,14 +271,14 @@ export function layoutPages(raw: Pg[]): { md: string; headings: number } {
   // markdown
   const bx = [...new Set(blocks.filter((b): b is Extract<Block, { t: 'li' }> => b.t === 'li' && !b.num).map((b) => Math.round(b.mx)))].sort((a, b) => a - b);
   const bxc: number[] = [];
-  bx.forEach((x) => { if (!bxc.length || x - bxc[bxc.length - 1] > 5) bxc.push(x); });
+  bx.forEach((x) => { if (!bxc.length || x - bxc[bxc.length - 1] > 7) bxc.push(x); });
   const out: string[] = [];
   const esc = (s: string) => s.replace(/\|/g, '/').replace(/\s+/g, ' ').trim();
   for (const b of blocks) {
     if (b.t === 'h') out.push('', '#'.repeat(b.level) + ' ' + b.text.replace(/[:：]+$/, '').trim(), '');
     else if (b.t === 'p') out.push(b.text, '');
     else if (b.t === 'li') {
-      const lv = b.num ? 0 : Math.max(0, bxc.findIndex((c) => Math.abs(c - b.mx) <= 5));
+      const lv = b.num ? 0 : Math.max(0, bxc.findIndex((c, k) => b.mx >= c - 3 && (k === bxc.length - 1 || b.mx < bxc[k + 1] - 3)));
       out.push('  '.repeat(Math.min(lv, 3)) + (b.num ? '' : '- ') + b.text);
     } else {
       out.push('');
