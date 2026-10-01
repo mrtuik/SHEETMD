@@ -24,10 +24,10 @@ export const CANCEL_Q = /^(?:cancel|stop|never ?mind|বাতিল|স্ট�
 
 // What the phone's speech recogniser often writes for a playback command (accent / noise) -> the real command.
 const ALIAS: Record<string, Cmd['t']> = {
-  stop: 'stop', stock: 'stop', stoop: 'stop', stopp: 'stop', 'stop it': 'stop', 'stop reading': 'stop', 'stop now': 'stop', 'stop stop': 'stop', 'স্টপ': 'stop', 'বন্ধ': 'stop', 'বন্ধ করো': 'stop',
-  pause: 'pause', paws: 'pause', pose: 'pause', paus: 'pause', hold: 'pause', wait: 'pause', 'hold on': 'pause', 'pause it': 'pause', 'থামো': 'pause', 'পজ': 'pause', 'থামাও': 'pause',
-  continue: 'continue', resume: 'continue', play: 'continue', 'go on': 'continue', 'carry on': 'continue', 'keep going': 'continue', 'continue reading': 'continue', 'play again': 'continue', start: 'continue', 'চালু': 'continue', 'চালাও': 'continue', 'কন্টিনিউ': 'continue',
-  next: 'next', nex: 'next', 'next point': 'next', 'next one': 'next', skip: 'next', 'skip it': 'next', 'নেক্সট': 'next', 'পরের': 'next', 'পরেরটা': 'next',
+  stop: 'stop', stock: 'stop', stoop: 'stop', stopp: 'stop', stob: 'stop', stops: 'stop', stopped: 'stop', 'stop the reading': 'stop', 'stop read': 'stop', 'band koro': 'stop', 'bondho': 'stop', 'bondho koro': 'stop', 'stop it': 'stop', 'stop reading': 'stop', 'stop now': 'stop', 'stop stop': 'stop', 'স্টপ': 'stop', 'বন্ধ': 'stop', 'বন্ধ করো': 'stop',
+  pause: 'pause', 'pause reading': 'pause', 'thamo': 'pause', 'thaamo': 'pause', paws: 'pause', 'pause please': 'pause', pose: 'pause', paus: 'pause', hold: 'pause', wait: 'pause', 'hold on': 'pause', 'pause it': 'pause', 'থামো': 'pause', 'পজ': 'pause', 'থামাও': 'pause',
+  continue: 'continue', 'continue it': 'continue', 'chalu': 'continue', 'chalao': 'continue', resume: 'continue', play: 'continue', 'go on': 'continue', 'carry on': 'continue', 'keep going': 'continue', 'continue reading': 'continue', 'play again': 'continue', start: 'continue', 'চালু': 'continue', 'চালাও': 'continue', 'কন্টিনিউ': 'continue',
+  next: 'next', 'next topic': 'next', 'porer': 'next', nex: 'next', 'next point': 'next', 'next one': 'next', skip: 'next', 'skip it': 'next', 'নেক্সট': 'next', 'পরের': 'next', 'পরেরটা': 'next',
   previous: 'prev', 'previous point': 'prev', 'previous one': 'prev', back: 'prev', 'go back': 'prev', last: 'prev', 'last point': 'prev', 'আগের': 'prev', 'আগেরটা': 'prev', 'ব্যাক': 'prev',
   slower: 'slower', 'slow down': 'slower', slow: 'slower', 'go slower': 'slower', 'আস্তে': 'slower',
   faster: 'faster', 'speed up': 'faster', fast: 'faster', 'go faster': 'faster', 'জোরে': 'faster', 'দ্রুত': 'faster',
@@ -42,7 +42,7 @@ export function parse(s: string): Cmd {
   const y = x.replace(LEAD, '').replace(TAIL, '').trim();
   if (y && ALIAS[y]) return { t: ALIAS[y] } as Cmd;             // "okay stop please" == "stop"
   if (y && y !== x && /^(?:topics?|টপিক|exact|exactly|explain|question|questions)\b/.test(y)) x = y;
-  const pk = x.match(/^(?:option|number|no|choose|select|pick|নম্বর)?\s*(\S+)$/);
+  const pk = (y || x).match(/^(?:(?:option|number|no|choose|select|pick|say|নম্বর)\s+)?(\S+)$/);
   if (pk && has(PICK, pk[1])) return { t: 'pick', n: PICK[pk[1]] };
   let m = x.match(/^(?:topics?|টপিক)\s*:?\s+(.+)$/);
   if (m) return { t: 'topic', q: m[1] };
