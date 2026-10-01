@@ -28,6 +28,7 @@ function openDb(): Promise<DB> {
       `);
       // each chat owns its sources (old databases get the column added; old sources are adopted by adoptOldSources)
       try { await d.execAsync('ALTER TABLE sources ADD COLUMN chat_id INTEGER'); } catch {}
+      try { await d.execAsync('ALTER TABLE topics ADD COLUMN pri INTEGER DEFAULT 1'); } catch {}      // 0 = numbered main topic ("1. Define ...")
       await d.execAsync('CREATE INDEX IF NOT EXISTS src_chat ON sources(chat_id)');
       // Typo-tolerant index (FTS5 trigram tokenizer, built into SQLite on the phone - nothing to download).
       // Filled from the existing `fts` table once, so sources added earlier do NOT need to be added again.
@@ -74,10 +75,10 @@ export const addSource = (name: string, type: string, status = 'ready', info = '
 });
 export const updateSource = (id: number, status: string, info: string) =>
   run((d) => d.runAsync('UPDATE sources SET status=?, info=? WHERE id=?', [status, info, id]));
-export const addTopics = (sourceId: number, topics: { name: string; body: string; own?: string }[]) => run(async (d) => {
+export const addTopics = (sourceId: number, topics: { name: string; body: string; own?: string; pri?: number }[]) => run(async (d) => {
   await d.withTransactionAsync(async () => {
     for (const t of topics) {
-      const r = await d.runAsync('INSERT INTO topics(source_id,name,body) VALUES(?,?,?)', [sourceId, t.name, t.body]);
+      const r = await d.runAsync('INSERT INTO topics(source_id,name,body,pri) VALUES(?,?,?,?)', [sourceId, t.name, t.body, t.pri ?? 1]);
       const nm = norm(t.name), bd = norm(t.own ?? t.body);
       await d.runAsync('INSERT INTO fts(name,body,topic_id) VALUES(?,?,?)', [nm, bd, r.lastInsertRowId]);
       if (triOk) await d.runAsync('INSERT INTO fts_tri(name,body,topic_id) VALUES(?,?,?)', [nm, bd, r.lastInsertRowId]);
@@ -127,7 +128,7 @@ const nz = (s: string) => norm(s).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 const canon = (s: string) => nz(s.replace(/\([^)]*\)/g, ' ').replace(/^\s*(?:topic|chapter|unit|lesson|part)?\s*\d+\s*[:.)\-\u2013]\s*/i, ' '));
 export const findExact = (q: string, chatId: number, strict = false) => run(async (d): Promise<Found> => {
   const scope = "JOIN sources s ON s.id = t.source_id WHERE s.chat_id = ? AND s.status = 'ready'";
-  const rows = await d.getAllAsync<{ id: number; name: string }>(`SELECT t.id AS id, t.name AS name FROM topics t ${scope} ORDER BY t.id`, [chatId]);
+  const rows = await d.getAllAsync<{ id: number; name: string; pri: number | null }>(`SELECT t.id AS id, t.name AS name, t.pri AS pri FROM topics t ${scope} ORDER BY t.id`, [chatId]);
   const ok = async (r: { id: number; name: string }): Promise<Found> => {
     const body = (await nameBody(d, r.id, r.name)).trim();
     return body.length ? { kind: 'ok', found: true, id: r.id, name: r.name, body, alts: [] } : none();
@@ -149,6 +150,11 @@ export const findExact = (q: string, chatId: number, strict = false) => run(asyn
     const hit = uniq(rows.filter((r) => { const nw = words(nz(r.name)); return qw.every((w) => nw.some((x) => x === w || (w.length >= 4 && x.startsWith(w)))); }))
       .sort((x, y) => x.name.length - y.name.length);
     if (hit.length === 1) return ok(hit[0]);
+    // several headings contain the words: a numbered main topic ("1. Define Sterilization") wins over its sub-parts,
+    // so "exact sterilization" reads the whole numbered topic at once instead of asking
+    const mains = hit.filter((r) => (rows.find((x) => x.id === r.id)?.pri ?? 1) === 0);
+    if (mains.length === 1) return ok(mains[0]);
+    if (mains.length > 1) return { kind: 'pick', found: false, id: 0, name: '', body: '', alts: mains.slice(0, 3).map((x) => x.name), options: mains.slice(0, 3).map((x) => x.name) };
     if (hit.length > 1) return { kind: 'pick', found: false, id: 0, name: '', body: '', alts: hit.slice(0, 3).map((x) => x.name), options: hit.slice(0, 3).map((x) => x.name) };
   }
   const toks = queryTokens(want);
