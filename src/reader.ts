@@ -138,7 +138,15 @@ export function repeat(arg?: string) {
   run(i);
   after = back;
 }
-export function setRate(d: number) { state.rate = Math.min(1.2, Math.max(0.3, +(state.rate + d).toFixed(1))); emit(); }
-export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(1, state.pauseSec + d)); emit(); }
+let rateT: any = null;
+export function setRate(d: number) {
+  state.rate = Math.min(1.5, Math.max(0.3, +(state.rate + d).toFixed(1))); emit();
+  // apply NOW: re-start the sentence being read with the new speed (taps are batched, so +,+,+ restarts once)
+  if (state.status === 'reading') {
+    clearTimeout(rateT);
+    rateT = setTimeout(() => { if (state.status === 'reading') { const c = state.chunk; resumeAt = 0; run(state.idx, undefined, c); } }, 500);
+  }
+}
+export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); }
 export function setLang(l: RState['lang']) { state.lang = l; emit(); }
 export function setVoice(lang: 'en' | 'bn', id: string) { if (lang === 'bn') state.voiceBn = id; else state.voiceEn = id; emit(); }
