@@ -1,5 +1,5 @@
 export type Cmd =
-  | { t: 'topic'; q: string } | { t: 'explain'; q: string } | { t: 'question'; q?: string }
+  | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'question'; q?: string }
   | { t: 'repeat'; arg?: string } | { t: 'pick'; n: number }
   | { t: 'continue' | 'pause' | 'stop' | 'next' | 'prev' | 'slower' | 'faster' | 'unknown' };
 
@@ -41,11 +41,14 @@ export function parse(s: string): Cmd {
   let x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
   const y = x.replace(LEAD, '').replace(TAIL, '').trim();
   if (y && ALIAS[y]) return { t: ALIAS[y] } as Cmd;             // "okay stop please" == "stop"
-  if (y && y !== x && /^(?:topics?|টপিক|explain|question|questions)\b/.test(y)) x = y;
+  if (y && y !== x && /^(?:topics?|টপিক|exact|exactly|explain|question|questions)\b/.test(y)) x = y;
   const pk = x.match(/^(?:option|number|no|choose|select|pick|নম্বর)?\s*(\S+)$/);
   if (pk && has(PICK, pk[1])) return { t: 'pick', n: PICK[pk[1]] };
   let m = x.match(/^(?:topics?|টপিক)\s*:?\s+(.+)$/);
   if (m) return { t: 'topic', q: m[1] };
+  // exact <topic name>: that topic read word for word from the file, heading to next heading (no model)
+  m = x.match(/^(?:exactly|exact|egzact|এক্সাক্ট)\s*:?\s*(.+)$/);
+  if (m) return { t: 'exact', q: m[1] };
   // explain <topic>: answered from the model's own knowledge (+ a web lookup), NOT from your sources
   m = x.match(/^(?:explain|এক্সপ্লেন|ব্যাখ্যা)\s*:?\s+(?:about\s+)?(.+)$/);
   if (m) return { t: 'explain', q: m[1] };
