@@ -76,3 +76,11 @@ export async function stopListening() {
   muteBeep(false);
   notify(false);
 }
+
+// fresh recogniser (e.g. right after the app finished speaking), so it does not carry the app's own voice into the next result
+export async function restartListening(ms = 250) {
+  if (!on || !Voice) return;
+  clearTimeout(guard); handled = false;
+  try { await Voice.cancel(); } catch {}
+  schedule(ms);
+}
