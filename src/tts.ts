@@ -215,6 +215,8 @@ const DIR = () => `${FS.documentDirectory}tts/`;
 const voiceDir = (id: string) => `${DIR()}${id}/`;
 const partPath = (id: string) => `${DIR()}${id}.tar.bz2.part`;
 const archivePath = (id: string) => `${DIR()}${id}.tar.bz2`;
+// Kotlin java.io.File needs a plain path, not a file:// URI
+const np = (uri: string) => uri.replace(/^file:\/\//, '');
 
 const sizeOf = async (uri: string) => {
   try {
@@ -283,7 +285,7 @@ export async function initTts() {
 
   // If selected voice is ready, try loading it
   if (ttsState.voices[targetVoice]?.phase === 'ready' && NativeTts) {
-    const loaded = await NativeTts.init(voiceDir(targetVoice)).catch(() => false);
+    const loaded = await NativeTts.init(np(voiceDir(targetVoice))).catch(() => false);
     if (loaded) {
       ttsState.isPiperReady = true;
       ttsState.engine = savedEngine === 'phone' ? 'phone' : 'piper';
@@ -295,7 +297,7 @@ export async function initTts() {
     // Check if any other voice is ready
     const anyReady = VOICES.find((v) => ttsState.voices[v.id]?.phase === 'ready');
     if (anyReady && NativeTts) {
-      const loaded = await NativeTts.init(voiceDir(anyReady.id)).catch(() => false);
+      const loaded = await NativeTts.init(np(voiceDir(anyReady.id))).catch(() => false);
       if (loaded) {
         ttsState.selectedVoice = anyReady.id;
         await setMeta('tts_voice', anyReady.id).catch(() => {});
@@ -447,7 +449,7 @@ async function runVoiceDownload(id: string) {
   let extracted = false;
   try {
     if (NativeTts?.extractTarBz2) {
-      extracted = await NativeTts.extractTarBz2(partPath(id), voiceDir(id));
+      extracted = await NativeTts.extractTarBz2(np(partPath(id)), np(voiceDir(id)));
     }
   } catch {
     extracted = false;
@@ -534,7 +536,7 @@ export async function selectVoice(id: string) {
   await setMeta('tts_voice', id).catch(() => {});
 
   if (ttsState.voices[id]?.phase === 'ready' && !ttsState.ramReason && NativeTts) {
-    const loaded = await NativeTts.init(voiceDir(id)).catch(() => false);
+    const loaded = await NativeTts.init(np(voiceDir(id))).catch(() => false);
     if (loaded) {
       ttsState.isPiperReady = true;
       ttsState.engine = 'piper';
@@ -555,7 +557,7 @@ export async function setTtsEngine(engine: TtsEngine) {
   if (engine === 'piper' && !ttsState.isPiperReady && NativeTts) {
     const v = ttsState.selectedVoice;
     if (ttsState.voices[v]?.phase === 'ready') {
-      const loaded = await NativeTts.init(voiceDir(v)).catch(() => false);
+      const loaded = await NativeTts.init(np(voiceDir(v))).catch(() => false);
       ttsState.isPiperReady = loaded;
     }
   }
