@@ -9,9 +9,10 @@ import * as Speech from 'expo-speech';
 import { parse, isGreeting, OK_END, CANCEL_Q } from './src/commands';
 import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
+import { exactPoints } from './src/exact';
 import * as R from './src/reader';
 import {
-  findTopic, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
+  findTopic, findExact, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
   listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
 } from './src/db';
 import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis } from './src/llm';
@@ -30,6 +31,7 @@ const C = { bg: '#FFFFFF', surf: '#F6F6F5', bd: '#E4E4E2', tx: '#0A0A0A', sec: '
 const LANG_LABEL = { auto: 'Auto', en: 'English', bn: 'Bangla' } as const;
 const COMMANDS: [string, string][] = [
   ['topic <name>', 'Read that topic from your sources, point by point'],
+  ['exact <name>', 'Read that topic word for word from its heading to the next heading (fast, no AI)'],
   ['explain <name>', 'Explain it from my own knowledge + web (not your sources)'],
   ['question ... okay', 'Say "question", then your full question, then "okay": I think, use your sources, add my own knowledge'],
   ['pause  /  continue', 'Hold, or carry on from the same sentence'],
@@ -80,6 +82,7 @@ function Main() {
   const qRef = useRef<{ parts: string[]; timer: any } | null>(null);   // a spoken question being dictated (ends with "okay")
   const choicesRef = useRef<string[] | null>(null);        // the 3 options waiting for a tap / "one, two, three"
   const choiceMarks = useRef(5);
+  const choiceExact = useRef(false);            // the 3 options belong to an "exact" request
   const choiceSpeaking = useRef(false);
   const askedDl = useRef(false);
   const [awake, setAwake] = useState(true);
@@ -179,8 +182,8 @@ function Main() {
   }, []);
 
   // "did you mean": show the 3 names, read them out, then wait for a tap or "one / two / three"
-  const showChoices = (names: string[], marks: number) => {
-    choicesRef.current = names; choiceMarks.current = marks; rowY.current = {};
+  const showChoices = (names: string[], marks: number, exactMode = false) => {
+    choicesRef.current = names; choiceMarks.current = marks; choiceExact.current = exactMode; rowY.current = {};
     push('app', CHOICE + JSON.stringify(names));
     const line = 'Did you mean: ' + names.map((n, i) => `${['one', 'two', 'three'][i]}, ${n}`).join('. ') + '. Say one, two or three.';
     try { R.stop(); } catch {}
@@ -336,7 +339,24 @@ function Main() {
     if (rest) feedQuestion(rest);
   };
 
-  const pickName = async (nm: string) => { choicesRef.current = null; await openTopic(nm, true, choiceMarks.current); };
+  // exact <name>: word for word, heading to next heading, no model
+  const exactTopic = async (qRaw: string, strict = false) => {
+    if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
+    const f = await findExact(qRaw, chatRef.current, strict);
+    if (f.kind === 'pick' && f.options?.length) { showChoices(f.options, 0, true); return; }
+    if (!f.found) { notFound(f.alts); return; }
+    choicesRef.current = null;
+    const pts = exactPoints(f.name, f.body);
+    rowY.current = {}; cardY.current = null;
+    push('app', 'Exact: read word for word from your notes');
+    push('app', TOPIC + f.name);
+    R.startTopic(0, f.name, pts);
+  };
+  const pickName = async (nm: string) => {
+    choicesRef.current = null;
+    if (choiceExact.current) { choiceExact.current = false; await exactTopic(nm, true); return; }
+    await openTopic(nm, true, choiceMarks.current);
+  };
 
   const exec = async (text: string, via: 'voice' | 'text' = 'voice') => {
     if (!text.trim()) return;
@@ -356,6 +376,7 @@ function Main() {
     if (c.t === 'question' && via === 'voice') { startQuestion(c.q); return; }
     push('you', text);
     if (c.t === 'topic') await openTopic(c.q);
+    else if (c.t === 'exact') await exactTopic(c.q);
     else if (c.t === 'explain') await explainTopic(c.q);
     else if (c.t === 'question') { if (c.q) await answerQuestion(c.q); else push('app', 'Type your question and send it.'); }
     else if (c.t === 'pick') {
@@ -366,10 +387,10 @@ function Main() {
       // typed text is a normal chat: answered from your sources + the model's own knowledge.
       // (Spoken words that are not a command are ignored, so talking nearby never triggers anything.)
       if (via === 'text') {
-        if (isGreeting(text) || !queryTokens(text).length) push('app', 'Hi! Say or type: topic <name>, explain <name>, or ask a question.');
+        if (isGreeting(text) || !queryTokens(text).length) push('app', 'Hi! Say or type: topic <name>, exact <name>, explain <name>, or ask a question.');
         else await answerQuestion(text);
       }
-      else push('app', 'Try: topic <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
+      else push('app', 'Try: topic <name>, exact <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
     }
   };
   const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t, 'text'); };
@@ -390,7 +411,7 @@ function Main() {
     let t = alts[0];
     let c = parse(t);
     if (c.t === 'unknown') {                                      // the recognizer's 2nd-5th guesses: only for "say a name" commands
-      const a = alts.slice(1).find((x) => ['topic', 'explain', 'question'].includes(parse(x).t));
+      const a = alts.slice(1).find((x) => ['topic', 'exact', 'explain', 'question'].includes(parse(x).t));
       if (!a) return;
       t = a; c = parse(a);
     }
@@ -542,7 +563,7 @@ function Main() {
       <View style={[st.dock, { paddingBottom: kbPad > 0 ? 10 : ins.bottom + 12 }]}>
         <View style={st.box}>
           <TextInput style={st.boxInput} value={input} onChangeText={setInput} multiline
-            placeholder="Ask anything · or: topic anemia, explain anemia" placeholderTextColor="#8A8A8A" />
+            placeholder="Ask anything · or: topic anemia, exact anemia, explain anemia" placeholderTextColor="#8A8A8A" />
           <View style={st.boxRow}>
             <TouchableOpacity style={st.boxPlus} onPress={() => setShowSrc(true)}><Icon n="plus" size={24} /></TouchableOpacity>
             <View style={{ flex: 1 }} />
