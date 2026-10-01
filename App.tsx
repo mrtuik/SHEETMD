@@ -217,8 +217,9 @@ function Main() {
   const freeUp = async (): Promise<boolean> => {
     if (!makingRef.current) return true;
     cancelGen();
-    for (let i = 0; i < 25 && makingRef.current; i++) await new Promise((r) => setTimeout(r, 120));
-    return !makingRef.current;
+    for (let i = 0; i < 40 && makingRef.current; i++) await new Promise((r) => setTimeout(r, 120));
+    if (makingRef.current) { makingRef.current = false; setWorking(''); }      // a stuck job must never block the app: the old one is cancelled, go on
+    return true;
   };
   const openTopic = async (qRaw: string, exact = false, marksIn = 5) => {
     if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
