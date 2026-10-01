@@ -17,14 +17,20 @@ const PICK: Record<string, number> = {
 };
 // filler words around a spoken choice: "number two", "option 3 please", "the first one", "say two"
 const PICK_FILL = new Set(['option', 'number', 'no', 'choose', 'select', 'pick', 'say', 'the', 'please', 'ok', 'okay', 'it', 'is', 'that', 'this', 'i', 'want', 'নম্বর', 'অপশন']);
+// what the recogniser writes for a lone "one / two / three" when it mishears: only used while the 3 options are waiting
+const PICK_LOOSE: Record<string, number> = {
+  on: 1, own: 1, when: 1, want: 1, juan: 1, oun: 1, wun: 1, run: 1, 'ওয়ানা': 1, 'এক্': 1,
+  do: 2, dew: 2, tue: 2, tuu: 2, 'তু': 2, 'দু': 2, 'দুটো': 2,
+  thee: 3, thre: 3, thrie: 3, fee: 3, sri: 3, shree: 3, three: 3, 'ত্রি': 3, 'তিনটা': 3,
+};
 const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 
 // spoken "okay" that ends a question ("what is anemia okay")
 // 0 = not a choice. Accepts "two", "2", "number two", "the first one", "option 3 please", Bangla / Banglish forms.
-export function parsePick(s: string): number {
+export function parsePick(s: string, loose = false): number {
   const toks = s.toLowerCase().replace(/[.!?।,:;"'()\-]/g, ' ').split(/\s+/).filter(Boolean).filter((t) => !PICK_FILL.has(t));
   if (!toks.length || toks.length > 3) return 0;
-  const ns = toks.map((t) => (has(PICK, t) ? PICK[t] : 0));
+  const ns = toks.map((t) => (has(PICK, t) ? PICK[t] : loose && has(PICK_LOOSE, t) ? PICK_LOOSE[t] : 0));
   return ns[0] && ns.every((n) => n === ns[0]) ? ns[0] : 0;
 }
 // the phone's mic can hear the app reading "Did you mean ... Say one, two or three." and then the answer: keep only the answer
