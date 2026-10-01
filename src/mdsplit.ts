@@ -3,13 +3,15 @@
 import { stripMarkdown } from './cleaner';
 import { textScore, words } from './fuzzy';
 
-export type T = { name: string; body: string; own?: string };
+export type T = { name: string; body: string; own?: string; pri?: number };   // pri 0 = a numbered main topic ("1. Define ..."), 1 = anything else
 
 export const norm = (s: string) => s.toLowerCase().replace(/ae/g, 'e');   // haemoglobin == hemoglobin
 
 const HEAD = /^\s{0,3}(#{1,6})\s+(\S.*?)\s*#*\s*$/;
 const CHAP = /^(chapter|unit|lesson)\s+\d+/i;
 const BOLD = /^\s*\*\*([^*\n]{2,80}?)\*\*:?\s*$/;
+const NUMH = /^\d+[.)]\s+\S/;          // "1. Define Sterilization" = a main topic
+const LETH = /^[A-Za-z][.)]\s+\S/;       // "A. Physical methods" = a part of a topic
 
 export const GENERIC = new Set(`definition,introduction,intro,principle,principles,parts,part,procedure,procedures,method,methods,steps,requirements,reagents,specimen,
 normal values,normal range,reference range,interpretation,uses,applications,advantages,disadvantages,merits,demerits,limitations,precautions,sources of error,errors,
@@ -20,9 +22,27 @@ important points,key points,short note,diagram,flow chart,table`.split(',').map(
 export const headName = (s: string) =>
   stripMarkdown(s).replace(/^\d+[.)]\s+/, '').replace(/[:：]+$/, '').trim();
 
+// In notes with numbered topics ("1. Define ...", "2. Autoclave") the un-numbered headings between two numbers
+// ("Classification of ...", "What is a Disinfectant?") belong INSIDE the number above them, even when they have the
+// same heading size. Without this a topic stopped at the first such heading and the rest was never read.
+function fixLevels(hs: { level: number; raw: string }[]) {
+  const nums = hs.filter((h) => NUMH.test(h.raw)).map((h) => h.level);
+  if (nums.length < 2) return;
+  const nl = Math.min(...nums);
+  let inNum = false;
+  for (const h of hs) {
+    const numbered = NUMH.test(h.raw);
+    if (numbered && h.level === nl) { inNum = true; continue; }
+    if (h.level < nl) { inNum = false; continue; }
+    if (!inNum) continue;
+    if (LETH.test(h.raw)) h.level = Math.min(7, Math.max(h.level, nl + 2));
+    else if (!numbered && h.level <= nl) h.level = Math.min(7, nl + 1);
+  }
+}
+
 export function splitTopics(fileName: string, text: string): T[] {
   const lines = text.replace(/\r/g, '').split('\n');
-  type H = { i: number; level: number; name: string };
+  type H = { i: number; level: number; name: string; raw: string };
   const hs: H[] = [];
   let fence = false;
   const hasHash = lines.some((l) => HEAD.test(l));
@@ -30,12 +50,15 @@ export function splitTopics(fileName: string, text: string): T[] {
     if (/^\s*(```|~~~)/.test(l)) { fence = !fence; return; }
     if (fence) return;
     let m = l.match(HEAD);
-    if (m) { hs.push({ i, level: m[1].length, name: headName(m[2]) }); return; }
-    if (CHAP.test(l.trim())) { hs.push({ i, level: 1, name: l.trim() }); return; }
-    if (!hasHash && (m = l.match(BOLD))) hs.push({ i, level: 7, name: headName(m[1]) });
+    if (m) { hs.push({ i, level: m[1].length, name: headName(m[2]), raw: stripMarkdown(m[2]) }); return; }
+    if (CHAP.test(l.trim())) { hs.push({ i, level: 1, name: l.trim(), raw: l.trim() }); return; }
+    if (!hasHash && (m = l.match(BOLD))) hs.push({ i, level: 7, name: headName(m[1]), raw: stripMarkdown(m[1]) });
   });
+  fixLevels(hs);
 
   const res: T[] = [];
+  const nums = hs.filter((h) => NUMH.test(h.raw)).map((h) => h.level);
+  const nl = nums.length >= 2 ? Math.min(...nums) : 0;
   const base = fileName.replace(/\.[^.]+$/, '');
   const first = hs.length ? hs[0].i : lines.length;
   const pre = lines.slice(0, first).join('\n').trim();
@@ -58,7 +81,7 @@ export function splitTopics(fileName: string, text: string): T[] {
     const body = lines.slice(h.i + 1, end).join('\n').trim();
     const own = lines.slice(h.i + 1, nextAny).join('\n').trim();
     if (skip[k]) return;
-    if (body.length > 20 && h.name) res.push({ name: h.name, body, own });
+    if (body.length > 20 && h.name) res.push({ name: h.name, body, own, pri: nl && h.level === nl && NUMH.test(h.raw) ? 0 : 1 });
   });
   return res;
 }
