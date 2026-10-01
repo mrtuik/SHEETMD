@@ -198,11 +198,11 @@ function Main() {
   const showChoices = (names: string[], marks: number, exactMode = false) => {
     choicesRef.current = names; choiceMarks.current = marks; choiceExact.current = exactMode; rowY.current = {};
     push('app', CHOICE + JSON.stringify(names));
-    const line = 'Did you mean: ' + names.map((n, i) => `${['one', 'two', 'three'][i]}, ${n}`).join('. ') + '. Say one, two or three.';
+    const line = 'Did you mean: ' + names.map((n) => n.replace(/\s*\(.*?\)\s*/g, ' ').trim()).join(', or ') + '?';   // no number words spoken: the mic cannot mistake the app's own voice for your "one / two / three", so you may answer at any moment
     try { R.stop(); } catch {}
     choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
     const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(100); }, 200);   // then a fresh mic: it must not carry the app's own voice into your answer
-    setTimeout(() => { choiceSpeaking.current = false; }, Math.min(12000, 2500 + line.length * 80));      // safety: if no callback ever comes, the mic is not left deaf for long
+    setTimeout(() => { choiceSpeaking.current = false; }, Math.min(6000, 1500 + line.length * 60));      // safety: if no callback ever comes, the mic is not left deaf for long
     speak(line, { lang: /[\u0980-\u09FF]/.test(line) ? 'bn' : 'en', voice: R.state.voiceBn || undefined, rate: 0.95, onDone: done, onStopped: done, onError: done });
   };
 
@@ -388,6 +388,7 @@ function Main() {
       case 'slower': R.setRate(-0.1); break;
       case 'faster': R.setRate(0.1); break;
     }
+    if (c.t === 'topic' || c.t === 'exact' || c.t === 'explain') { try { R.pause(); } catch {} stopSpeak(); choicesRef.current = null; }   // new request: nothing old keeps talking
     if (c.t === 'question' && via === 'voice') { startQuestion(c.q); return; }
     push('you', text);
     if (c.t === 'topic') await openTopic(c.q);
@@ -438,11 +439,52 @@ function Main() {
   const stableT = useRef<any>(null);                                 // topic / exact / explain: runs when the words stop changing, not after the long end-of-speech silence
   const clearStable = () => { clearTimeout(stableT.current); stableT.current = null; };
   const loosePick = (alts: string[]) => { for (const a of alts) { const n = parsePick(stripChoiceEcho(a), true); if (n && n <= (choicesRef.current?.length || 3)) return n; } return 0; };
+  // ---- COMMANDS WORK AT ANY TIME, AND FIRST ------------------------------------------------------------------
+  // Runs before every other rule (options being read, question dictation, app reading, notes being written):
+  //  - stop / pause / next / previous / continue / slower / faster : the moment they are heard (any of the recogniser's guesses)
+  //  - topic / exact / explain : the app goes silent at once, then searches (nothing keeps talking over your command)
+  //  - one / two / three : whenever options are waiting, even while they are still being read out
+  // Returns true when a command was run, so nothing else handles the same words again.
+  const lastCmd = useRef({ t: '', at: 0 });
+  const dupCmd = (t: string) => { const n = Date.now(); const same = lastCmd.current.t === t && n - lastCmd.current.at < 1500; lastCmd.current = { t, at: n }; return same; };
+  const silence = () => { try { R.pause(); } catch {} stopSpeak(); choiceSpeaking.current = false; };
+  const hardCmd = (alts: string[], partial: boolean): boolean => {
+    const asking = !!qRef.current;
+    const opts = !!choicesRef.current;
+    for (const a0 of alts) {
+      const a = opts ? stripChoiceEcho(a0) : a0;
+      if (!a) continue;
+      const words = a.trim().split(/\s+/).length;
+      const k = parse(a);
+      if (asking) {                                                      // dictating a question: only "stop / cancel" is a command
+        if (CANCEL_Q.test(a.trim().replace(/[.!?।,]+$/, ''))) return false;   // feedQuestion cancels it
+        continue;
+      }
+      if (k.t === 'pick') {
+        if (opts) { const n = loosePick([a]); if (n) { if (dupCmd('pick' + n)) return true; silence(); execRef.current(WORDS[n - 1]); return true; } }
+        continue;
+      }
+      if (FAST.has(k.t) && words <= 3) {
+        if (dupCmd(k.t)) return true;
+        if (k.t === 'stop') { silence(); }
+        execRef.current(a); return true;
+      }
+      if (['topic', 'exact', 'explain'].includes(k.t) && (k as any).q?.trim() && !heardSelf(a)) {
+        if (partial) continue;                                           // partial: the stable-words timer below decides when it is finished
+        if (dupCmd(k.t + (k as any).q)) return true;
+        silence(); execRef.current(a); return true;
+      }
+    }
+    // a command word glued to the end of the app's own speech ("...cell membrane stop")
+    for (const a of alts) { const tc = tailCmd(a); if (tc && !dupCmd('tail' + tc)) { if (tc === 'stop') silence(); execRef.current(tc); return true; } }
+    return false;
+  };
   const onVoice = (alts: string[]) => {
     if (!alts.length) return;
     setHeard(alts[0].slice(0, 60));
     clearStable();
-    if (choiceSpeaking.current) return;
+    if (hardCmd(alts, false)) { restartListening(60); return; }     // commands first, in every state
+    if (choiceSpeaking.current) return;                              // otherwise the app's own voice: ignore
     if (qRef.current) { feedQuestion(alts[0]); return; }
     for (const a of alts) { const tc = tailCmd(a); if (tc) { execRef.current(tc); restartListening(150); return; } }
     if (choicesRef.current) {
@@ -468,15 +510,17 @@ function Main() {
   };
   const onPartial = (t: string) => {
     if (qRef.current) { clearStable(); return false; }              // never while a question is being dictated
-    if (choiceSpeaking.current || heardSelf(t)) return false;
+    if (hardCmd([t], true)) { clearStable(); return true; }          // commands first, in every state
+    if (choiceSpeaking.current) return false;
+    if (heardSelf(t)) return false;
     const tc = tailCmd(t);
     if (tc) { clearStable(); execRef.current(tc); restartListening(150); return true; }
     if (choicesRef.current) { const n = loosePick([t]); if (n) { execRef.current(WORDS[n - 1]); return true; } }
     const k = parse(stripChoiceEcho(t));
     clearStable();
-    if ((k.t === 'topic' || k.t === 'exact' || k.t === 'explain') && (k as any).q?.trim() && !choicesRef.current) {
+    if ((k.t === 'topic' || k.t === 'exact' || k.t === 'explain') && (k as any).q?.trim()) {
       const snap = t;                                                // same words for 0.7 s = finished: go now instead of waiting for the end-of-speech silence
-      stableT.current = setTimeout(() => { stableT.current = null; if (qRef.current || choiceSpeaking.current) return; markHandled(); execRef.current(snap); }, 700);
+      stableT.current = setTimeout(() => { stableT.current = null; if (qRef.current || dupCmd(k.t + (k as any).q)) return; markHandled(); silence(); execRef.current(snap); }, 600);
       return false;
     }
     if (!FAST.has(k.t) && !(k.t === 'pick' && !!choicesRef.current)) return false;      // "one / two / three" runs the moment it is heard, like stop / pause
