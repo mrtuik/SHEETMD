@@ -7,6 +7,7 @@ import { splitTopics, T } from './mdsplit';
 import { addSource, updateSource, addTopics } from './db';
 import * as P from './pdfnative';
 import { structurePages, chunkPlain } from './pdfstruct';
+import { parseWords, layoutPages, plainText, wordCount, Pg } from './pdflayout';
 import { cleanOcr } from './ocrclean';
 
 const ext = (n: string) => (n.split('.').pop() || '').toLowerCase();
@@ -25,26 +26,62 @@ function toTopics(name: string, md: string, headings: number): T[] {
 
 async function readPdf(uri: string, name: string, say: Say): Promise<{ topics: T[]; pages: number; ocr: number }> {
   const count = await P.open(uri);
-  const texts: string[] = [];
+  const pgs: Pg[] = [];            // pages with word positions (new reader: headings, bullets, tables)
+  const texts: string[] = [];      // plain text per page (fallback reader)
+  let layout = P.hasWords();
   try {
-    for (let s = 1; s <= count; s += 10) {
-      const e = Math.min(count, s + 9);
-      texts.push(...(await P.readPages(s, e)));
-      await say(`reading pages ${e}/${count}`);
+    if (layout) {
+      try {
+        for (let s = 1; s <= count; s += 10) {
+          const e = Math.min(count, s + 9);
+          (await P.readWords(s, e)).forEach((r) => pgs.push(parseWords(r)));
+          await say(`reading pages ${e}/${count}`);
+        }
+      } catch { layout = false; pgs.length = 0; }
+    }
+    if (!layout) {
+      for (let s = 1; s <= count; s += 10) {
+        const e = Math.min(count, s + 9);
+        texts.push(...(await P.readPages(s, e)));
+        await say(`reading pages ${e}/${count}`);
+      }
     }
   } finally { await P.close().catch(() => {}); }
 
   // pages with (almost) no text are scans: OCR them, then repair the usual OCR slips
-  const scan = texts.map((t, i) => (t.trim().length < 40 ? i : -1)).filter((i) => i >= 0);
+  const lenOf = (i: number) => (layout ? wordCount(pgs[i]) : texts[i].trim().length);
+  const scan: number[] = [];
+  for (let i = 0; i < count; i++) if (lenOf(i) < 40) scan.push(i);
   const ocrd = new Map<number, string>();
   for (let k = 0; k < scan.length; k++) {
     const i = scan[k];
     try { ocrd.set(i, await P.ocrPdfPage(uri, i + 1)); } catch { ocrd.set(i, ''); }
     await say(`OCR page ${k + 1}/${scan.length}`);
   }
+  const plain = (i: number) => (layout ? plainText(pgs[i], i) : texts[i]);
   if (ocrd.size) {
-    const whole = texts.map((t, i) => (ocrd.has(i) ? ocrd.get(i)! : t)).join('\n');
-    ocrd.forEach((t, i) => { texts[i] = cleanOcr(t, whole); });
+    const whole = Array.from({ length: count }, (_, i) => (ocrd.has(i) ? ocrd.get(i)! : plain(i))).join('\n');
+    ocrd.forEach((t, i) => { if (layout) pgs[i] = { w: pgs[i].w, h: pgs[i].h, words: [] }; texts[i] = cleanOcr(t, whole); });
+  }
+
+  if (layout) {
+    // text pages -> layout reader; scanned pages -> OCR text. Consecutive pages of one kind are read together.
+    const parts: string[] = [];
+    let heads = 0;
+    let i = 0;
+    while (i < count) {
+      const isScan = ocrd.has(i);
+      let j = i;
+      while (j + 1 < count && ocrd.has(j + 1) === isScan) j++;
+      if (isScan) { const r = structurePages(texts.slice(i, j + 1)); parts.push(r.md); heads += r.headings; }
+      else { const r = layoutPages(pgs.slice(i, j + 1)); parts.push(r.md); heads += r.headings; }
+      i = j + 1;
+    }
+    if (heads >= 2) return { topics: toTopics(name, parts.join('\n\n'), heads), pages: count, ocr: ocrd.size };
+    // flat PDF (one font, no headings): the older text-based heading guesser
+    const flat = Array.from({ length: count }, (_, k) => (ocrd.has(k) ? texts[k] : plainText(pgs[k], k)));
+    const r = structurePages(flat);
+    return { topics: toTopics(name, r.md, r.headings), pages: count, ocr: ocrd.size };
   }
   const { md, headings } = structurePages(texts);
   return { topics: toTopics(name, md, headings), pages: count, ocr: ocrd.size };
