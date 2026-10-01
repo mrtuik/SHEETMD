@@ -6,3 +6,5 @@ export const readPages = (s: number, e: number): Promise<string[]> => need().rea
 export const close = (): Promise<void> => need().close();
 export const ocrPdfPage = (p: string, n: number): Promise<string> => need().ocrPdfPage(p, n);
 export const ocrImage = (p: string): Promise<string> => need().ocrImage(p);
+export const readWords = (s: number, e: number): Promise<string[]> => need().readWords(s, e);
+export const hasWords = (): boolean => !!M && typeof M.readWords === 'function';
