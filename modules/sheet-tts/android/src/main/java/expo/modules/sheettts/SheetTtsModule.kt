@@ -10,6 +10,7 @@ import android.os.Build
 import com.k2fsa.sherpa.onnx.GeneratedAudio
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import expo.modules.kotlin.modules.Module
@@ -28,6 +29,7 @@ import java.util.concurrent.Executors
 class SheetTtsModule : Module() {
   private var tts: OfflineTts? = null
   private var currentModelDir: String = ""
+  @Volatile private var currentKind: String = "vits"      // "vits" (Piper) or "kokoro"
 
   private val playExecutor = Executors.newSingleThreadExecutor()
   private val prepareExecutor = Executors.newSingleThreadExecutor { r ->
@@ -121,6 +123,14 @@ class SheetTtsModule : Module() {
     return Triple(modelFile, tokensFile, dataDir)
   }
 
+  private fun findNamed(baseDir: File, name: String): File? {
+    baseDir.listFiles()?.forEach { f -> if (f.isFile && f.name == name) return f }
+    baseDir.listFiles()?.filter { it.isDirectory }?.forEach { sub ->
+      sub.listFiles()?.forEach { f -> if (f.isFile && f.name == name) return f }
+    }
+    return null
+  }
+
   private fun releaseModel() {
     synchronized(this) {
       try {
@@ -143,7 +153,7 @@ class SheetTtsModule : Module() {
       prepareExecutor.shutdownNow()
     }
 
-    AsyncFunction("init") { modelDir: String ->
+    AsyncFunction("init") { modelDir: String, kind: String, accent: String ->
       try {
         stopPlayback()
         releaseModel()
@@ -156,27 +166,47 @@ class SheetTtsModule : Module() {
           return@AsyncFunction false
         }
 
-        val vits = OfflineTtsVitsModelConfig(
-          model = modelFile.absolutePath,
-          tokens = tokensFile.absolutePath,
-          dataDir = dataDir.absolutePath,
-          lengthScale = 1.0f
-        )
-        val modelConfig = OfflineTtsModelConfig(
-          vits = vits,
-          numThreads = 2,
-          provider = "cpu",
-          debug = false
-        )
+        val modelConfig = if (kind == "kokoro") {
+          val voicesFile = findNamed(dir, "voices.bin") ?: return@AsyncFunction false
+          // lexicon: US or GB English (optional; without it espeak-ng pronounces everything)
+          val lex = findNamed(dir, if (accent == "gb") "lexicon-gb-en.txt" else "lexicon-us-en.txt")
+          OfflineTtsModelConfig(
+            kokoro = OfflineTtsKokoroModelConfig(
+              model = modelFile.absolutePath,
+              voices = voicesFile.absolutePath,
+              tokens = tokensFile.absolutePath,
+              dataDir = dataDir.absolutePath,
+              lexicon = lex?.absolutePath ?: "",
+              lengthScale = 1.0f
+            ),
+            numThreads = 3,
+            provider = "cpu",
+            debug = false
+          )
+        } else {
+          val vits = OfflineTtsVitsModelConfig(
+            model = modelFile.absolutePath,
+            tokens = tokensFile.absolutePath,
+            dataDir = dataDir.absolutePath,
+            lengthScale = 1.0f
+          )
+          OfflineTtsModelConfig(
+            vits = vits,
+            numThreads = 2,
+            provider = "cpu",
+            debug = false
+          )
+        }
         val config = OfflineTtsConfig(model = modelConfig)
         val newTts = OfflineTts(config = config)
 
         synchronized(this@SheetTtsModule) {
           tts = newTts
           currentModelDir = modelDir
+          currentKind = kind
         }
         true
-      } catch (e: Exception) {
+      } catch (e: Throwable) {
         releaseModel()
         false
       }
@@ -195,10 +225,10 @@ class SheetTtsModule : Module() {
       stopPlayback()
     }
 
-    Function("prepare") { text: String, speed: Float ->
+    Function("prepare") { text: String, speed: Float, sid: Int ->
       val currentTts = tts ?: return@Function
       val curDir = currentModelDir
-      val key = "$curDir:$speed:$text"
+      val key = "$curDir:$sid:$speed:$text"
       if (preCache.containsKey(key)) return@Function
 
       val myEpoch = epoch
@@ -208,7 +238,7 @@ class SheetTtsModule : Module() {
             val parts = ArrayList<FloatArray>()
             var total = 0
             synchronized(genLock) {
-              currentTts.generateWithCallback(text, sid = 0, speed = speed) { samples ->
+              currentTts.generateWithCallback(text, sid = sid, speed = speed) { samples ->
                 if (epoch != myEpoch || tts !== currentTts) return@generateWithCallback 0   // a command arrived: give the engine back immediately
                 parts.add(samples); total += samples.size
                 1
@@ -225,7 +255,7 @@ class SheetTtsModule : Module() {
       }
     }
 
-    Function("speak") { id: Int, text: String, speed: Float ->
+    Function("speak") { id: Int, text: String, speed: Float, sid: Int ->
       val currentTts = tts
       if (currentTts == null) {
         sendEvent("onError", mapOf("id" to id, "message" to "TTS model not loaded"))
@@ -302,7 +332,7 @@ class SheetTtsModule : Module() {
           currentAudioTrack = audioTrack
 
           val curDir = currentModelDir
-          val cacheKey = "$curDir:$speed:$text"
+          val cacheKey = "$curDir:$sid:$speed:$text"
           val cached = preCache.remove(cacheKey)
 
           var totalWrittenFrames = 0
@@ -319,21 +349,44 @@ class SheetTtsModule : Module() {
               }
             }
           } else {
-            synchronized(genLock) {
-              currentTts.generateWithCallback(text, sid = 0, speed = speed) { samples ->
-                if (cancelled || activeId != id) {
-                  return@generateWithCallback 0
+            if (currentKind == "kokoro") {
+              // Kokoro is heavy: on a slow phone streaming would stutter (audio underrun). Generate the whole line first, then play it smoothly.
+              val parts = ArrayList<FloatArray>()
+              var total = 0
+              synchronized(genLock) {
+                currentTts.generateWithCallback(text, sid = sid, speed = speed) { samples ->
+                  if (cancelled || activeId != id) return@generateWithCallback 0
+                  parts.add(samples); total += samples.size
+                  1
                 }
-                if (samples.isNotEmpty()) {
-                  if (!started) {
-                    started = true
-                    sendEvent("onStart", mapOf("id" to id))
-                    audioTrack.play()
+              }
+              if (!cancelled && activeId == id && total > 0) {
+                started = true
+                sendEvent("onStart", mapOf("id" to id))
+                audioTrack.play()
+                for (a in parts) {
+                  if (cancelled || activeId != id) break
+                  audioTrack.write(a, 0, a.size, AudioTrack.WRITE_BLOCKING)
+                  totalWrittenFrames += a.size
+                }
+              }
+            } else {
+              synchronized(genLock) {
+                currentTts.generateWithCallback(text, sid = sid, speed = speed) { samples ->
+                  if (cancelled || activeId != id) {
+                    return@generateWithCallback 0
                   }
-                  audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-                  totalWrittenFrames += samples.size
+                  if (samples.isNotEmpty()) {
+                    if (!started) {
+                      started = true
+                      sendEvent("onStart", mapOf("id" to id))
+                      audioTrack.play()
+                    }
+                    audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+                    totalWrittenFrames += samples.size
+                  }
+                  1
                 }
-                1
               }
             }
           }
