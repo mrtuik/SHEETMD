@@ -28,7 +28,7 @@ async function begin() {
   starting = true; last = Date.now();
   try {
     // Voice.start can hang for ever when the engine is busy (that froze listening: "starting" stayed true) -> give up after 5 s
-    await Promise.race([Voice.start(loc(), { EXTRA_PARTIAL_RESULTS: true, EXTRA_MAX_RESULTS: 5 }), new Promise((_, rej) => setTimeout(() => rej(new Error('start timeout')), 5000))]);
+    await Promise.race([Voice.start(loc(), { EXTRA_PARTIAL_RESULTS: true, EXTRA_MAX_RESULTS: 5 }), new Promise((_, rej) => setTimeout(() => rej(new Error('start timeout')), 3000))]);
   }
   catch { errs++; try { await Voice.cancel(); } catch {} schedule(Math.min(800 + errs * 500, 4000)); }
   finally { starting = false; }
@@ -45,11 +45,11 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
     const v: string[] = (e.value || []).filter(Boolean);
     if (v.length && !handled) cb(v);
     handled = false;
-    schedule(120);                                   // restart only now: the result has been delivered
+    schedule(40);                                    // restart only now: the result has been delivered
   };
   Voice.onSpeechEnd = () => {                        // the result normally follows within a moment; if it never comes, restart anyway
     clearTimeout(guard);
-    guard = setTimeout(() => schedule(0), 2500);
+    guard = setTimeout(() => schedule(0), 1500);
   };
   Voice.onSpeechError = async (e: any) => {
     last = Date.now(); clearTimeout(guard);
@@ -57,11 +57,11 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
     const quiet = code === 6 || code === 7;          // timeout / nothing heard: normal while silent
     if (!quiet) errs++;
     try { await Voice.cancel(); } catch {}
-    schedule(quiet ? 100 : Math.min(600 + errs * 400, 3000));
+    schedule(quiet ? 30 : Math.min(400 + errs * 300, 2500));
   };
   clearInterval(dog);
   dog = setInterval(async () => {                    // no result / error / speech for 12 s = the recogniser is dead: restart it
-    if (!on || Date.now() - last < 12000) return;
+    if (!on || Date.now() - last < 8000) return;
     last = Date.now(); starting = false;
     try { await Voice.cancel(); } catch {}
     schedule(100);
