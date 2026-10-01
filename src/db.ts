@@ -119,6 +119,46 @@ export type Found = { kind: 'ok' | 'pick' | 'none'; found: boolean; id: number; 
 const none = (alts: string[] = []): Found => ({ kind: 'none', found: false, id: 0, name: '', body: '', alts });
 
 export const findTopic = (q: string, chatId: number, exact = false) => run((d) => findTopicIn(d, q, chatId, exact));
+
+// "exact <name>": finds ONE topic by its HEADING (no body search, no model) and returns its full, unfiltered text.
+//  1) same heading  2) same heading without "Topic 1:" / "(brackets)"  3) every spoken word is in the heading
+//  4) sound-alike / typo match on the heading names. Unsure -> the closest names to choose from.
+const nz = (s: string) => norm(s).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const canon = (s: string) => nz(s.replace(/\([^)]*\)/g, ' ').replace(/^\s*(?:topic|chapter|unit|lesson|part)?\s*\d+\s*[:.)\-\u2013]\s*/i, ' '));
+export const findExact = (q: string, chatId: number, strict = false) => run(async (d): Promise<Found> => {
+  const scope = "JOIN sources s ON s.id = t.source_id WHERE s.chat_id = ? AND s.status = 'ready'";
+  const rows = await d.getAllAsync<{ id: number; name: string }>(`SELECT t.id AS id, t.name AS name FROM topics t ${scope} ORDER BY t.id`, [chatId]);
+  const ok = async (r: { id: number; name: string }): Promise<Found> => {
+    const body = (await nameBody(d, r.id, r.name)).trim();
+    return body.length ? { kind: 'ok', found: true, id: r.id, name: r.name, body, alts: [] } : none();
+  };
+  const want = q.trim();
+  if (!want || !rows.length) return none();
+  const exactRow = rows.find((r) => r.name.toLowerCase() === want.toLowerCase());
+  if (exactRow) return ok(exactRow);
+  if (strict) return none();
+  const a = nz(want), c = canon(want);
+  const same = rows.find((r) => nz(r.name) === a) || (c && rows.find((r) => canon(r.name) === c));
+  if (same) return ok(same);
+  const qw = words(a);
+  const uniq = (list: { id: number; name: string }[]) => {
+    const seen = new Set<string>();
+    return list.filter((r) => (seen.has(r.name.toLowerCase()) ? false : (seen.add(r.name.toLowerCase()), true)));
+  };
+  if (qw.length) {
+    const hit = uniq(rows.filter((r) => { const nw = words(nz(r.name)); return qw.every((w) => nw.some((x) => x === w || (w.length >= 4 && x.startsWith(w)))); }))
+      .sort((x, y) => x.name.length - y.name.length);
+    if (hit.length === 1) return ok(hit[0]);
+    if (hit.length > 1) return { kind: 'pick', found: false, id: 0, name: '', body: '', alts: hit.slice(0, 3).map((x) => x.name), options: hit.slice(0, 3).map((x) => x.name) };
+  }
+  const toks = queryTokens(want);
+  if (!toks.length) return none();
+  const ranked = rankTopics(toks, rows);
+  const dec = decide(ranked);
+  if (dec.kind === 'auto' && dec.top) return ok(dec.top);
+  if (dec.kind === 'options') return { kind: 'pick', found: false, id: 0, name: '', body: '', alts: dec.options, options: dec.options };
+  return none(dec.options);
+});
 type Row = { topic_id: number; name: string };
 
 async function nameBody(d: DB, id: number, name: string): Promise<string> {
