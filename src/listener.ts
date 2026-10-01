@@ -84,3 +84,6 @@ export async function restartListening(ms = 250) {
   try { await Voice.cancel(); } catch {}
   schedule(ms);
 }
+
+// a command that ran from a partial result: the final result of this utterance must not run it a second time
+export const markHandled = () => { handled = true; };
