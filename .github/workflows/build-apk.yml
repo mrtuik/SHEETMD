@@ -48,6 +48,17 @@ jobs:
           done
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: npm-${{ runner.os }}-
+      - name: Cache C++ compiles (ccache) for llama.rn / native modules
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ runner.os }}-arm64
+          max-size: 1G
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v4
@@ -88,7 +99,13 @@ jobs:
           echo "android.useAndroidX=true" >> android/gradle.properties
           echo "android.enableJetifier=true" >> android/gradle.properties
           echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> android/gradle.properties
-      - run: cd android && chmod +x gradlew && ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a
+          echo "org.gradle.caching=true" >> android/gradle.properties
+          echo "org.gradle.parallel=true" >> android/gradle.properties
+      - name: Build release APK
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: cd android && chmod +x gradlew && ./gradlew assembleRelease --no-daemon --build-cache -PreactNativeArchitectures=arm64-v8a
       - uses: actions/upload-artifact@v4
         with:
           name: Sheet.md-apk
