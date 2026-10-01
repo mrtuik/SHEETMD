@@ -23,6 +23,11 @@ import { pickAndImport } from './src/importer';
 import { startListening, stopListening, restartListening, markHandled } from './src/listener';
 import { updateService, stopService, onServiceAction } from './src/service';
 import { ICONS, IconName } from './src/icons';
+import {
+  VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
+  pauseVoiceDownload, cancelVoiceDownload, deleteVoice, selectVoice, setTtsEngine,
+  speak, stopSpeak, DEFAULT_VOICE_ID,
+} from './src/tts';
 
 type Msg = { id: number; who: 'you' | 'app'; text: string };
 const TOPIC = '\u2063T\u2063';                  // hidden marker: this reply is a topic card
@@ -87,6 +92,8 @@ function Main() {
   const choiceSpeaking = useRef(false);
   const [heard, setHeard] = useState('');                  // last thing the mic heard (so a mis-heard command is visible)
   const askedDl = useRef(false);
+  const [showTtsPrompt, setShowTtsPrompt] = useState(false);
+  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [awake, setAwake] = useState(true);
   const [voices, setVoices] = useState<Vc[]>([]);
   const [, force] = useState(0);
@@ -146,9 +153,13 @@ function Main() {
   useEffect(() => {
     const un = R.subscribe(() => force((x) => x + 1));
     const un2 = subscribeLlm(() => force((x) => x + 1));
+    const un3 = subscribeTts(() => force((x) => x + 1));
     (async () => {
       await cleanupStuck().catch(() => {});
       initLlm().catch(() => {});
+      initTts().catch(() => {});
+      const prompted = await getMeta('tts_prompted').catch(() => '');
+      if (prompted !== '1') setShowTtsPrompt(true);
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
       try {                                           // clearest installed voice, unless one was chosen before
         const all = await loadVoices();
@@ -169,7 +180,7 @@ function Main() {
         if (pts) R.restore(s.topic_id, await topicName(s.topic_id), pts, s.point_n, s.speed);
       }
     })().catch(() => {});
-    return () => { un(); un2(); };
+    return () => { un(); un2(); un3(); };
   }, []);
   useEffect(() => { awake ? activateKeepAwakeAsync() : deactivateKeepAwake(); }, [awake]);
   useEffect(() => {
@@ -192,7 +203,7 @@ function Main() {
     choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
     const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(100); }, 200);   // then a fresh mic: it must not carry the app's own voice into your answer
     setTimeout(() => { choiceSpeaking.current = false; }, Math.min(12000, 2500 + line.length * 80));      // safety: if no callback ever comes, the mic is not left deaf for long
-    Speech.speak(line, { language: /[\u0980-\u09FF]/.test(line) ? 'bn-BD' : 'en-US', rate: 0.95, onDone: done, onStopped: done, onError: done });
+    speak(line, { lang: /[\u0980-\u09FF]/.test(line) ? 'bn' : 'en', voice: R.state.voiceBn || undefined, rate: 0.95, onDone: done, onStopped: done, onError: done });
   };
 
   const beginDownload = async (mobile = false) => {
@@ -583,6 +594,40 @@ function Main() {
         <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
         <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
       </View>
+      {showTtsPrompt && (
+        <View style={[st.group, { marginHorizontal: 14, marginTop: 4, marginBottom: 6, paddingVertical: 10 }]}>
+          <Text style={[st.txt, { fontWeight: '700', fontSize: 14 }]}>Download clear offline voice (Lessac, ~67 MB, Wi-Fi)?</Text>
+          <Text style={[st.sub, { marginTop: 2, marginBottom: 8 }]}>High-quality neural speech that runs fully offline on your device.</Text>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <TouchableOpacity
+              style={[st.miniBtn, { height: 34, paddingHorizontal: 14, backgroundColor: C.acc }]}
+              onPress={async () => {
+                setShowTtsPrompt(false);
+                await setMeta('tts_prompted', '1').catch(() => {});
+                startVoiceDownload(DEFAULT_VOICE_ID);
+              }}>
+              <Text style={[st.txt, { color: '#fff', fontSize: 13, fontWeight: '600' }]}>Download</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[st.miniBtn, { height: 34, paddingHorizontal: 12 }]}
+              onPress={async () => {
+                setShowTtsPrompt(false);
+                await setMeta('tts_prompted', '1').catch(() => {});
+                setShowSet(true);
+              }}>
+              <Text style={[st.txt, { fontSize: 13 }]}>Choose another</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[st.miniBtn, { height: 34, paddingHorizontal: 12 }]}
+              onPress={async () => {
+                setShowTtsPrompt(false);
+                await setMeta('tts_prompted', '1').catch(() => {});
+              }}>
+              <Text style={[st.txt, { fontSize: 13, color: C.sec }]}>Later</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
       <View style={st.chip}><Text style={st.sub}>{working ? working : asking ? 'Listening to your question · say okay when done' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? '  •  listening' : ''}</Text>{listening && !!heard && <Text style={[st.sub, { textAlign: 'center' }]}>heard: “{heard}”</Text>}</View>
 
       <ScrollView
@@ -698,12 +743,91 @@ function Main() {
 
       <Sheet visible={showSet} onClose={() => setShowSet(false)} title="Voice settings" bottom={ins.bottom}>
         <ScrollView style={{ maxHeight: sheetMax }} nestedScrollEnabled contentContainerStyle={{ gap: 10, paddingBottom: 28 }} showsVerticalScrollIndicator={false}>
+          {/* Active status & test button */}
+          <View style={st.group}>
+            <View style={st.line}>
+              <Icon n="speed" size={20} />
+              <View style={{ flex: 1 }}>
+                <Text style={st.txt}>Active speech engine</Text>
+                <Text style={st.val}>
+                  {ttsState.engine === 'piper' && ttsState.isPiperReady
+                    ? `Piper: ${VOICES.find((v) => v.id === ttsState.selectedVoice)?.label || ttsState.selectedVoice}`
+                    : 'Phone voice'}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={[st.miniBtn, { height: 36, paddingHorizontal: 12 }]}
+                onPress={() => {
+                  stopSpeak();
+                  speak('Sheet.md reads your notes clearly with offline neural voices.', {
+                    rate: s.rate,
+                    lang: 'en',
+                  });
+                }}>
+                <Text style={[st.txt, { fontSize: 13, fontWeight: '600' }]}>Test voice</Text>
+              </TouchableOpacity>
+            </View>
+            {!!ttsState.ramReason && (
+              <>
+                <View style={st.sep} />
+                <View style={{ paddingVertical: 8 }}>
+                  <Text style={[st.sub, { color: C.bad }]}>{ttsState.ramReason}</Text>
+                </View>
+              </>
+            )}
+          </View>
+
+          {/* Voice engine toggle */}
+          <Text style={st.secT}>Voice engine</Text>
+          <View style={st.seg}>
+            <TouchableOpacity
+              style={[st.segI, ttsState.engine === 'piper' && st.segOn, !VOICES.some((v) => ttsState.voices[v.id]?.phase === 'ready') && { opacity: 0.5 }]}
+              onPress={async () => {
+                const anyReady = VOICES.some((v) => ttsState.voices[v.id]?.phase === 'ready');
+                if (!anyReady) {
+                  Alert.alert('No offline voice ready', 'Download an English voice below to enable clear offline speech.');
+                  return;
+                }
+                if (ttsState.ramReason) {
+                  Alert.alert('Low RAM', ttsState.ramReason);
+                  return;
+                }
+                if (R.state.status === 'reading') {
+                  R.pause();
+                  await setTtsEngine('piper');
+                  R.resume();
+                } else {
+                  await setTtsEngine('piper');
+                }
+              }}>
+              <Text style={[st.segT, ttsState.engine === 'piper' && { color: '#fff' }]}>Offline voice (Piper)</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[st.segI, ttsState.engine === 'phone' && st.segOn]}
+              onPress={async () => {
+                if (R.state.status === 'reading') {
+                  R.pause();
+                  await setTtsEngine('phone');
+                  R.resume();
+                } else {
+                  await setTtsEngine('phone');
+                }
+              }}>
+              <Text style={[st.segT, ttsState.engine === 'phone' && { color: '#fff' }]}>Phone voice</Text>
+            </TouchableOpacity>
+          </View>
+          {!VOICES.some((v) => ttsState.voices[v.id]?.phase === 'ready') && (
+            <Text style={[st.sub, { paddingHorizontal: 4 }]}>Download an offline voice below to enable Piper.</Text>
+          )}
+
+          {/* Reading Speed & Pause between points */}
           <View style={st.group}>
             <StepRow icon="speed" label="Speed" value={`${s.rate.toFixed(1)}x`} onMinus={() => R.setRate(-0.1)} onPlus={() => R.setRate(0.1)} />
             <View style={st.sep} />
             <StepRow icon="timer" label="Pause between points" value={`${s.pauseSec}s`} onMinus={() => R.setPause(-1)} onPlus={() => R.setPause(1)} />
           </View>
 
+          {/* Language selector */}
           <Text style={st.secT}>Language</Text>
           <View style={st.seg}>
             {(['auto', 'en', 'bn'] as const).map((l) => (
@@ -712,7 +836,160 @@ function Main() {
               </TouchableOpacity>))}
           </View>
 
-          <Text style={st.secT}>Voice clarity</Text>
+          {/* English voices (Piper Catalog grouped by US / GB) */}
+          <Text style={st.secT}>English offline voices (Piper)</Text>
+          {(['US', 'GB'] as const).map((accent) => {
+            const list = VOICES.filter((v) => v.accent === accent);
+            return (
+              <View key={accent} style={st.group}>
+                <Text style={[st.sub, { paddingTop: 10, fontWeight: '700' }]}>{accent === 'US' ? 'United States' : 'British (UK)'}</Text>
+                {list.map((v, idx) => {
+                  const vst = ttsState.voices[v.id] || { phase: 'none', got: 0, total: v.bytes, msg: '' };
+                  const isSelected = ttsState.selectedVoice === v.id && ttsState.engine === 'piper';
+                  const isReady = vst.phase === 'ready';
+                  const pct = Math.min(100, Math.round((vst.got / Math.max(1, vst.total)) * 100));
+
+                  const onDownload = async (mobile = false) => {
+                    const r = await startVoiceDownload(v.id, mobile);
+                    if (r.ok) return;
+                    if (r.reason === 'wifi') {
+                      Alert.alert('Wi-Fi needed', `Connect to Wi-Fi to download ${v.label} (~${mb(v.bytes)} MB).`, [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Use mobile data', onPress: () => onDownload(true) },
+                      ]);
+                    } else if (r.reason === 'space') {
+                      Alert.alert('Not enough storage', `About ${r.needMB} MB is needed, only ${r.freeMB} MB is free.`);
+                    } else {
+                      Alert.alert('No internet', 'Connect to the internet and try again.');
+                    }
+                  };
+
+                  const onSelect = async () => {
+                    if (!isReady) return;
+                    if (R.state.status === 'reading') {
+                      R.pause();
+                      await selectVoice(v.id);
+                      R.resume();
+                    } else {
+                      await selectVoice(v.id);
+                    }
+                  };
+
+                  const onPreview = () => {
+                    stopSpeak();
+                    setPreviewingVoice(v.id);
+                    speak(`Hello, this is ${v.label}.`, {
+                      engine: 'piper',
+                      rate: s.rate,
+                      lang: 'en',
+                      onDone: () => setPreviewingVoice(null),
+                      onStopped: () => setPreviewingVoice(null),
+                      onError: () => setPreviewingVoice(null),
+                    });
+                  };
+
+                  const onDelete = () => {
+                    Alert.alert('Delete voice?', `${v.label} will be removed from private storage.`, [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Delete',
+                        style: 'destructive',
+                        onPress: async () => {
+                          if (R.state.status === 'reading' && ttsState.selectedVoice === v.id) {
+                            R.pause();
+                            await deleteVoice(v.id);
+                            R.resume();
+                          } else {
+                            await deleteVoice(v.id);
+                          }
+                        },
+                      },
+                    ]);
+                  };
+
+                  return (
+                    <View key={v.id}>
+                      {idx > 0 && <View style={st.sep} />}
+                      <View style={[st.voiceRow, { alignItems: 'flex-start', paddingVertical: 10 }]}>
+                        {isReady ? (
+                          <TouchableOpacity onPress={onSelect} style={{ paddingTop: 2 }}>
+                            <Icon n={isSelected ? 'check' : 'play'} size={isSelected ? 18 : 14} color={isSelected ? C.ok : C.disI} />
+                          </TouchableOpacity>
+                        ) : (
+                          <View style={{ width: 18, paddingTop: 4 }}>
+                            <Icon n="speed" size={14} color={C.disI} />
+                          </View>
+                        )}
+
+                        <TouchableOpacity style={{ flex: 1 }} onPress={isReady ? onSelect : undefined} activeOpacity={isReady ? 0.7 : 1}>
+                          <Text style={[st.txt, isSelected && { fontWeight: '700' }]} numberOfLines={1}>{v.label}</Text>
+                          <Text style={st.sub}>{v.gender === 'female' ? 'Female' : 'Male'} · {mb(v.bytes)} MB{v.note ? ` · ${v.note}` : ''}</Text>
+                          <Text style={[st.sub, { color: '#888', fontSize: 11, marginTop: 1 }]}>License: {v.license}</Text>
+
+                          {vst.phase === 'downloading' && (
+                            <View style={{ marginTop: 6 }}>
+                              <View style={st.barBg}><View style={[st.barFg, { width: `${pct}%` }]} /></View>
+                              <Text style={st.sub}>Downloading: {pct}% ({mb(vst.got)}/{mb(vst.total)} MB)</Text>
+                            </View>
+                          )}
+                          {vst.phase === 'paused' && (
+                            <Text style={[st.sub, { marginTop: 4, color: C.sec }]}>Paused at {pct}%</Text>
+                          )}
+                          {vst.phase === 'extracting' && (
+                            <Text style={[st.sub, { marginTop: 4, color: C.acc, fontWeight: '600' }]}>Preparing voice...</Text>
+                          )}
+                          {vst.phase === 'error' && (
+                            <Text style={[st.sub, { marginTop: 4, color: C.bad }]}>{vst.msg || 'Download failed'}</Text>
+                          )}
+                        </TouchableOpacity>
+
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          {isReady && (
+                            <>
+                              <TouchableOpacity style={st.hBtn} onPress={onPreview}>
+                                <Icon n={previewingVoice === v.id ? 'pause' : 'play'} size={16} color={C.acc} />
+                              </TouchableOpacity>
+                              <TouchableOpacity style={st.hBtn} onPress={onDelete}>
+                                <Icon n="trash" size={16} color={C.sec} />
+                              </TouchableOpacity>
+                            </>
+                          )}
+                          {vst.phase === 'none' && (
+                            <TouchableOpacity style={[st.miniBtn, { height: 34, paddingHorizontal: 12 }]} onPress={() => onDownload()}>
+                              <Text style={[st.txt, { fontSize: 13, fontWeight: '600' }]}>Download</Text>
+                            </TouchableOpacity>
+                          )}
+                          {vst.phase === 'downloading' && (
+                            <>
+                              <TouchableOpacity style={[st.miniBtn, { height: 34, paddingHorizontal: 10 }]} onPress={() => pauseVoiceDownload(v.id)}>
+                                <Text style={[st.txt, { fontSize: 12 }]}>Pause</Text>
+                              </TouchableOpacity>
+                              <TouchableOpacity style={[st.miniBtn, { height: 34, paddingHorizontal: 10 }]} onPress={() => cancelVoiceDownload(v.id)}>
+                                <Text style={[st.txt, { fontSize: 12 }]}>Cancel</Text>
+                              </TouchableOpacity>
+                            </>
+                          )}
+                          {(vst.phase === 'paused' || vst.phase === 'error') && (
+                            <>
+                              <TouchableOpacity style={[st.miniBtn, { height: 34, paddingHorizontal: 10, backgroundColor: C.acc }]} onPress={() => onDownload()}>
+                                <Text style={[st.txt, { color: '#fff', fontSize: 12, fontWeight: '600' }]}>{vst.phase === 'paused' ? 'Resume' : 'Retry'}</Text>
+                              </TouchableOpacity>
+                              <TouchableOpacity style={[st.miniBtn, { height: 34, paddingHorizontal: 10 }]} onPress={() => cancelVoiceDownload(v.id)}>
+                                <Text style={[st.txt, { fontSize: 12 }]}>Cancel</Text>
+                              </TouchableOpacity>
+                            </>
+                          )}
+                        </View>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            );
+          })}
+
+          {/* Phone voices (Bangla & system fallback) */}
+          <Text style={st.secT}>Phone voices (Bangla & system fallback)</Text>
           <View style={st.group}>
             {(['en', 'bn'] as const).map((l, li) => {
               const list = voicesFor(voices, l).slice(0, 5);
@@ -720,7 +997,7 @@ function Main() {
               return (
                 <View key={l}>
                   {li > 0 && <View style={st.sep} />}
-                  <Text style={[st.sub, { paddingTop: 10 }]}>{l === 'en' ? 'English voice' : 'Bangla voice'}</Text>
+                  <Text style={[st.sub, { paddingTop: 10 }]}>{l === 'en' ? 'English fallback voice' : 'Bangla voice'}</Text>
                   {list.length === 0 && <Text style={[st.val, { paddingVertical: 10 }]}>No voice found - install one below</Text>}
                   {list.map((v) => (
                     <TouchableOpacity key={v.identifier} style={st.voiceRow}
