@@ -22,6 +22,14 @@ let handled = false;                                  // a partial result of thi
 let last = Date.now();                                // last sign of life from the recognizer
 let dog: any = null;                                  // watchdog: restarts a recogniser that went silent for good
 
+// live feed for the screen (waveform + "what the mic hears right now"). Subscribers update themselves: the whole app does not re-render.
+const levelSubs = new Set<(v: number) => void>();
+const liveSubs = new Set<(t: string) => void>();
+export const subscribeLevel = (f: (v: number) => void) => { levelSubs.add(f); return () => { levelSubs.delete(f); }; };
+export const subscribeLive = (f: (t: string) => void) => { liveSubs.add(f); return () => { liveSubs.delete(f); }; };
+const emitLevel = (v: number) => levelSubs.forEach((f) => f(v));
+const emitLive = (t: string) => liveSubs.forEach((f) => f(t));
+
 const schedule = (ms = 250) => { clearTimeout(timer); timer = setTimeout(begin, ms); };
 async function begin() {
   if (!on || !Voice || starting) return;
@@ -39,9 +47,11 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
   cb = onTexts; loc = getLocale; notify = onState; on = true; errs = 0; partial = onPartial || (() => false); handled = false;
   muteBeep(true);
   Voice.onSpeechStart = () => { last = Date.now(); errs = 0; handled = false; clearTimeout(guard); };
-  Voice.onSpeechPartialResults = (e: any) => { last = Date.now(); const t = e.value?.[0]; if (t && !handled && partial(t)) handled = true; };
+  Voice.onSpeechPartialResults = (e: any) => { last = Date.now(); const t = e.value?.[0]; if (t) emitLive(String(t)); if (t && !handled && partial(t)) handled = true; };
+  Voice.onSpeechVolumeChanged = (e: any) => { const v = Number(e?.value); if (!isNaN(v)) emitLevel(Math.max(0, Math.min(1, (v + 2) / 12))); };   // recogniser loudness: about -2 .. 10
   Voice.onSpeechResults = (e: any) => {
     last = Date.now(); clearTimeout(guard);
+    emitLive('');                                    // the final words go through the normal path (the screen then shows them as "heard")
     const v: string[] = (e.value || []).filter(Boolean);
     if (v.length && !handled) cb(v);
     handled = false;
@@ -52,7 +62,7 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
     guard = setTimeout(() => schedule(0), 1500);
   };
   Voice.onSpeechError = async (e: any) => {
-    last = Date.now(); clearTimeout(guard);
+    last = Date.now(); clearTimeout(guard); emitLive('');
     const code = Number(e?.error?.code ?? e?.error?.message?.match?.(/\d+/)?.[0]);
     const quiet = code === 6 || code === 7;          // timeout / nothing heard: normal while silent
     if (!quiet) errs++;
@@ -74,6 +84,7 @@ export async function stopListening() {
   on = false; clearTimeout(timer); clearTimeout(guard); clearInterval(dog);
   try { await Voice?.cancel(); } catch {}
   muteBeep(false);
+  emitLive(''); emitLevel(0);
   notify(false);
 }
 
