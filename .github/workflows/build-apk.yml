@@ -109,7 +109,7 @@ jobs:
           SHERPA_ONNX_VERSION: "v1.13.8"
         run: |
           D=modules/sheet-tts/android/src/main/java/com/k2fsa/sherpa/onnx
-          for f in OnlineRecognizer OnlineStream FeatureConfig HomophoneReplacerConfig; do
+          for f in OnlineRecognizer OnlineStream FeatureConfig HomophoneReplacerConfig QnnConfig; do
             code=$(curl -sSL -w "%{http_code}" -o "$D/$f.kt" "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/${SHERPA_ONNX_VERSION}/sherpa-onnx/kotlin-api/$f.kt")
             echo "$code $f.kt"
             if [ "$code" != "200" ]; then
