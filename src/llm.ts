@@ -608,7 +608,7 @@ function parseLong(text: string, maxSecs = 12): Point[] {
   return out.slice(0, maxSecs).map((p, i) => ({ n: i + 1, ...p }));
 }
 
-async function geminiCall(model: string, key: string, prompt: string, signal: AbortSignal, maxTokens = 4096): Promise<{ status: number; text: string }> {
+async function geminiCall(model: string, key: string, prompt: string, signal: AbortSignal, maxTokens = 4096): Promise<{ status: number; text: string; err: string }> {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -619,15 +619,50 @@ async function geminiCall(model: string, key: string, prompt: string, signal: Ab
     }),
     signal,
   });
-  if (!r.ok) return { status: r.status, text: '' };
+  if (!r.ok) return { status: r.status, text: '', err: ((await r.text().catch(() => '')) || '').slice(0, 1500) };
   const data: any = await r.json().catch(() => null);
   const parts: any[] = data?.candidates?.[0]?.content?.parts || [];
-  return { status: 200, text: parts.filter((p) => p?.text && !p.thought).map((p) => String(p.text)).join('') };
+  return { status: 200, text: parts.filter((p) => p?.text && !p.thought).map((p) => String(p.text)).join(''), err: '' };
 }
+
+// ---- never pay for the same search twice: finished answers are kept on the phone and reused (works offline, uses no Google quota)
+export const searchInfo = { fromCache: false };
+const normQ = (q: string) => q.toLowerCase().replace(/[^a-z0-9\u0980-\u09ff ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+const cacheKeyOf = (q: string, mode: SearchMode, marks: number) => `sc:${mode}${mode === 'long' ? marks : ''}:${normQ(q)}`;
+async function cacheGet(k: string): Promise<Point[] | null> {
+  try {
+    const v = await getMeta(k);
+    if (!v) return null;
+    const a = JSON.parse(v);
+    return Array.isArray(a) && a.length && a.every((x: any) => x && typeof x.text === 'string') ? (a as Point[]) : null;
+  } catch { return null; }
+}
+async function cachePut(k: string, pts: Point[]) {
+  try {
+    await setMeta(k, JSON.stringify(pts));
+    let idx: string[] = [];
+    try { idx = JSON.parse((await getMeta('sc_index')) || '[]'); } catch {}
+    idx = idx.filter((x) => x !== k); idx.push(k);
+    while (idx.length > 150) { const old = idx.shift(); if (old) await setMeta(old, '').catch(() => {}); }   // keep the newest 150
+    await setMeta('sc_index', JSON.stringify(idx));
+  } catch {}
+}
+// Google tells us when a per-minute limit clears ("retryDelay": "23s"); a daily limit has no short delay
+const retryDelayOf = (err: string): number => { const m = err.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/); return m ? parseFloat(m[1]) : Infinity; };
+const keyInvalid = (status: number, err: string) => status === 401 || status === 403 || (status === 400 && /api[ _]?key[^"]{0,40}(not valid|invalid)|API_KEY_INVALID/i.test(err));
+// last-resort extra model: its free limit is separate from the two in Models, so it helps when those are used up (a retired/unknown id just returns 404 and is skipped)
+const EXTRA_MODELS = ['gemini-3.5-flash-lite'];
 
 export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId, opts: SearchOpts = {}): Promise<Point[]> {
   const key = (apiKey || gem.key || ENV_KEY || '').trim();
   if (!key) throw new GeminiError('nokey');
+  searchInfo.fromCache = false;
+  const long = opts.mode === 'long';                                 // anything else (plain "search", "search short") = short answer
+  const marks = Math.min(15, Math.max(2, opts.marks || 10));
+  const ck = cacheKeyOf(query, long ? 'long' : 'short', marks);
+  const cached = await cacheGet(ck);
+  if (cached) { searchInfo.fromCache = true; return cached; }       // same question asked before: instant, no internet, no quota
+
   let net: any = null;
   try { net = await Network.getNetworkStateAsync(); } catch {}
   if (net && (!net.isConnected || net.isInternetReachable === false)) throw new GeminiError('offline');
@@ -636,32 +671,40 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
   try { searchAbort?.abort(); } catch {}
   const ctl = new AbortController();
   searchAbort = ctl;
-  const long = opts.mode === 'long';                                 // anything else (plain "search", "search short") = short answer
-  const marks = Math.min(15, Math.max(2, opts.marks || 10));
-  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, long ? 90000 : 30000);
+  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, long ? 90000 : 40000);
   const hi = 3;
   const prompt = long ? longPrompt(query.trim(), marks) : shortPrompt(query.trim());
   const first = model || gem.model;
-  const order: GeminiModelId[] = [first, ...GEMINI_MODELS.map((m) => m.id).filter((id) => id !== first)];
+  const order: string[] = Array.from(new Set<string>([first, ...GEMINI_MODELS.map((m) => m.id), ...EXTRA_MODELS]));
   try {
     let text = '';
     let lastStatus = 0;
-    for (const m of order) {
-      let res: { status: number; text: string };
-      try { res = await geminiCall(m, key, prompt, ctl.signal, long ? 8192 : 4096); }
-      catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
-      if (my !== searchJob) throw new GeminiError('cancelled');
-      lastStatus = res.status;
-      if (res.status === 200) { text = res.text; break; }
-      if (res.status === 400 || res.status === 401 || res.status === 403) throw new GeminiError('badkey', `HTTP ${res.status}`);
-      if (res.status === 429) throw new GeminiError('quota', 'HTTP 429');
-      if (res.status !== 404) break;                                  // 404 = this model id was retired: try the next one; anything else: stop
+    let quotaHit = false;
+    for (let round = 0; round < 2 && !text.trim(); round++) {
+      let minWait = Infinity;
+      quotaHit = false;
+      for (const m of order) {
+        let res: { status: number; text: string; err: string };
+        try { res = await geminiCall(m, key, prompt, ctl.signal, long ? 8192 : 4096); }
+        catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
+        if (my !== searchJob) throw new GeminiError('cancelled');
+        lastStatus = res.status;
+        if (res.status === 200) { if (res.text.trim()) { text = res.text; break; } continue; }   // empty answer: try the next model
+        if (keyInvalid(res.status, res.err)) throw new GeminiError('badkey', `HTTP ${res.status}`);
+        if (res.status === 429) { quotaHit = true; minWait = Math.min(minWait, retryDelayOf(res.err)); }   // this model's free limit is used up: each model has its own, so try the next one
+        // 404 (retired model), other 400, 5xx: also just try the next model
+      }
+      if (text.trim() || !quotaHit) break;
+      if (round === 0 && minWait <= 12) {                           // every model hit a per-minute limit that clears in seconds: wait once, then try again
+        await new Promise((r) => setTimeout(r, Math.ceil(minWait) * 1000 + 600));
+        if (my !== searchJob) throw new GeminiError('cancelled');
+      } else break;                                                 // a daily limit: waiting here would not help
     }
-    if (!text.trim()) throw new GeminiError(lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
+    if (!text.trim()) throw new GeminiError(quotaHit ? 'quota' : lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
     const clean = stripCites(text);
     if (long) {
       const lp = parseLong(clean);
-      if (lp.length) return lp;                                       // no "## headings": fall through and read it as numbered points
+      if (lp.length) { await cachePut(ck, lp); return lp; }                                       // no "## headings": fall through and read it as numbered points
     }
     const merged = mergeSub(clean);
     let pts = parseAnswer(merged, '', long ? 12 : hi, false);
@@ -675,6 +718,7 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
       pts = alt.map((p, i) => ({ n: i + 1, ...p }));
     }
     if (!pts.length) throw new GeminiError('empty');
+    await cachePut(ck, pts);
     return pts;
   } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
 }
