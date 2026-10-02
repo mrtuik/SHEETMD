@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Modal, StyleSheet, ScrollView, Pressable, Switch,
-  Platform, PermissionsAndroid, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
+  Platform, PermissionsAndroid, AppState, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
@@ -21,7 +21,8 @@ import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
 import { startListening, stopListening, restartListening, markHandled } from './src/listener';
-import { updateService, stopService, onServiceAction } from './src/service';
+import { updateService, stopService, onServiceAction, batteryUnrestricted, askBatteryUnrestricted } from './src/service';
+import { splitWake } from './src/wake';
 import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
@@ -46,6 +47,7 @@ const COMMANDS: [string, string][] = [
   ['repeat previous', 'Say the previous line again'],
   ['repeat point  /  repeat point 3', 'Read this point (or point 3) again'],
   ['slower  /  faster', 'Change the reading speed'],
+  ['tuik <command>', 'App in background or phone locked: say "tuik" first ("tuik pause", "tuik topic anemia"), or "tuik" and then the command'],
   ['stop', 'Stop reading'],
 ];
 
@@ -484,8 +486,49 @@ function Main() {
     for (const a of alts) { const tc = tailCmd(a); if (tc && !dupCmd('tail' + tc)) { if (tc === 'stop') silence(); execRef.current(tc); return true; } }
     return false;
   };
-  const onVoice = (alts: string[]) => {
-    if (!alts.length) return;
+  // ---- WAKE WORD "tuik": app in background / phone locked -> a command only counts after "tuik" -------------------------
+  const [awakeUI, setAwakeUI] = useState(false);
+  const wakeRef = useRef<{ until: number; paused: boolean; timer: any }>({ until: 0, paused: false, timer: null });
+  const disarm = (resumeReading: boolean) => {
+    const w = wakeRef.current; clearTimeout(w.timer); w.timer = null;
+    const was = w.paused; w.until = 0; w.paused = false; setAwakeUI(false);
+    if (was && resumeReading && R.state.status === 'paused') R.resume();
+  };
+  const armWake = () => {
+    const w = wakeRef.current;
+    if (!w.until && R.state.status === 'reading') { w.paused = true; try { R.pause(); } catch {} }   // so your command is heard clearly
+    w.until = Date.now() + 9000; setAwakeUI(true);
+    clearTimeout(w.timer);
+    w.timer = setTimeout(() => disarm(true), 9000);                  // nothing said: carry on reading
+  };
+  // returns the text(s) to treat as a command, or null = not meant for the app
+  const wakeGate = (alts: string[], partial: boolean): string[] | null => {
+    const cut = alts.map(splitWake);
+    const need = R.state.wakeOn && AppState.currentState !== 'active';
+    if (!need) {                                                     // app open: no wake word needed, "tuik ..." works too
+      const out = alts.map((a, i) => (cut[i].hit ? cut[i].rest : a)).filter(Boolean);
+      return out.length ? out : null;
+    }
+    const withRest = cut.filter((c) => c.hit && c.rest).map((c) => c.rest);
+    if (withRest.length) { if (!partial) disarm(false); else { clearTimeout(wakeRef.current.timer); wakeRef.current.paused = false; wakeRef.current.until = 0; setAwakeUI(false); } return withRest; }
+    if (cut.some((c) => c.hit)) { armWake(); return null; }          // just "tuik": listen for the command
+    const talking = !!choicesRef.current || !!qRef.current;          // options waiting / question being dictated: already in a conversation
+    if (Date.now() < wakeRef.current.until || talking) {
+      const known = alts.some((a) => parse(a).t !== 'unknown');
+      if (known) {
+        const slowFast = alts.some((a) => ['slower', 'faster'].includes(parse(a).t));
+        const resumeAfter = slowFast && wakeRef.current.paused;
+        if (!partial || known) { clearTimeout(wakeRef.current.timer); wakeRef.current.until = 0; wakeRef.current.paused = false; setAwakeUI(false); }
+        if (resumeAfter) setTimeout(() => { if (R.state.status === 'paused') R.resume(); }, 400);
+      }
+      return alts;
+    }
+    return null;                                                     // background speech without "tuik": ignore
+  };
+  const onVoice = (alts0: string[]) => {
+    if (!alts0.length) return;
+    const g = wakeGate(alts0, false); if (!g) return;
+    let alts = g;
     setHeard(alts[0].slice(0, 60));
     clearStable();
     if (hardCmd(alts, false)) { restartListening(60); return; }     // commands first, in every state
@@ -513,7 +556,9 @@ function Main() {
     if (heardSelf(t)) return;
     execRef.current(t);
   };
-  const onPartial = (t: string) => {
+  const onPartial = (t0: string) => {
+    const g = wakeGate([t0], true); if (!g) return false;
+    const t = g[0];
     if (qRef.current) { clearStable(); return false; }              // never while a question is being dictated
     if (hardCmd([t], true)) { clearStable(); return true; }          // commands first, in every state
     if (choiceSpeaking.current) return false;
@@ -564,10 +609,10 @@ function Main() {
   useEffect(() => {
     if (!listening && s.status === 'idle') { stopService(); return; }
     const pt = s.points[s.idx];
-    const text = s.status === 'idle' ? 'Listening for commands'
+    const text = s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
       : `${s.topic} — point ${pt?.n ?? 0}/${s.points.length}${s.status === 'paused' ? ' (paused)' : ''}`;
     updateService('Sheet.md', text, s.status === 'reading', listening);
-  }, [s.status, s.idx, s.topic, listening]);
+  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn]);
 
   // keep the point being read in view (stops as soon as you scroll yourself)
   useEffect(() => {
@@ -888,6 +933,18 @@ function Main() {
             </View>
             <View style={st.sep} />
             <StepRow icon="speed" label="Sound boost (offline voice)" value={ttsState.boost <= 1 ? 'off' : `${ttsState.boost.toFixed(1)}x louder`} onMinus={() => setBoost(-0.5)} onPlus={() => setBoost(0.5)} />
+            <View style={st.sep} />
+            <View style={st.line}>
+              <Icon n="mic" size={20} />
+              <View style={{ flex: 1 }}><Text style={st.txt}>Wake word “tuik”</Text><Text style={st.val}>{s.wakeOn ? 'background / locked: say “tuik”, then the command' : 'off: every sound is a command'}</Text></View>
+              <Switch value={s.wakeOn} onValueChange={R.setWake} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+            <View style={st.sep} />
+            <View style={st.line}>
+              <Icon n="timer" size={20} />
+              <View style={{ flex: 1 }}><Text style={st.txt}>Keep listening when locked</Text><Text style={st.val}>{batteryUnrestricted() ? 'allowed' : 'tap Allow, or the phone may stop the mic'}</Text></View>
+              {!batteryUnrestricted() && <TouchableOpacity style={[st.step, { width: 'auto', paddingHorizontal: 14, borderRadius: 18 }]} onPress={askBatteryUnrestricted}><Text style={[st.txt, { fontSize: 13, fontWeight: '600' }]}>Allow</Text></TouchableOpacity>}
+            </View>
           </View>
 
           {/* Language selector */}
