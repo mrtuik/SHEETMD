@@ -1,3 +1,5 @@
+import { queryTokens, rankTopics } from './match';
+
 export type Cmd =
   | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'question'; q?: string }
   | { t: 'repeat'; arg?: string } | { t: 'pick'; n: number }
@@ -19,9 +21,9 @@ const PICK: Record<string, number> = {
 const PICK_FILL = new Set(['option', 'number', 'no', 'choose', 'select', 'pick', 'say', 'the', 'please', 'ok', 'okay', 'it', 'is', 'that', 'this', 'i', 'want', 'নম্বর', 'অপশন']);
 // what the recogniser writes for a lone "one / two / three" when it mishears: only used while the 3 options are waiting
 const PICK_LOOSE: Record<string, number> = {
-  on: 1, own: 1, when: 1, want: 1, juan: 1, oun: 1, wun: 1, run: 1, 'ওয়ানা': 1, 'এক্': 1,
-  do: 2, dew: 2, tue: 2, tuu: 2, 'তু': 2, 'দু': 2, 'দুটো': 2,
-  thee: 3, thre: 3, thrie: 3, fee: 3, sri: 3, shree: 3, three: 3, 'ত্রি': 3, 'তিনটা': 3,
+  on: 1, own: 1, van: 1, von: 1, wann: 1, aan: 1, ann: 1, un: 1, when: 1, want: 1, juan: 1, oun: 1, wun: 1, run: 1, 'ওয়ানা': 1, 'এক্': 1,
+  do: 2, dew: 2, tou: 2, tau: 2, doo: 2, tooth: 2, tuo: 2, tue: 2, tuu: 2, 'তু': 2, 'দু': 2, 'দুটো': 2,
+  thee: 3, sethu: 3, setu: 3, sethoo: 3, tri: 3, tee: 3, ti: 3, thri: 3, treee: 3, thre: 3, thrie: 3, fee: 3, sri: 3, shree: 3, three: 3, 'ত্রি': 3, 'তিনটা': 3,
 };
 const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -33,10 +35,36 @@ export function parsePick(s: string, loose = false): number {
   const ns = toks.map((t) => (has(PICK, t) ? PICK[t] : loose && has(PICK_LOOSE, t) ? PICK_LOOSE[t] : 0));
   return ns[0] && ns.every((n) => n === ns[0]) ? ns[0] : 0;
 }
-// the phone's mic can hear the app reading "Did you mean ... Say one, two or three." and then the answer: keep only the answer
+// names of the options now waiting: the phone's mic hears the app reading "Did you mean A, or B, or C?" and often glues
+// it in front of your answer ("did you mean A or B or C one" / "... exact anemia"): that echo must be cut off first.
+let CHOICES: string[] = [];
+export const setChoiceNames = (n: string[] | null) => { CHOICES = n || []; };
+const plain = (n: string) => n.replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 export function stripChoiceEcho(s: string): string {
   const m = s.toLowerCase().match(/(?:did you mean|say one)[\s\S]*?(?:two|to|too|2)\s*(?:or|and)\s*(?:three|tree|free|3)\s*[.!?।]*\s*(.*)$/);
-  return m ? m[1].trim() : s;
+  if (m) return m[1].trim();
+  if (!CHOICES.length) return s;
+  const low = s.toLowerCase();
+  const said = CHOICES.map(plain).filter((nm) => nm.length >= 3 && low.includes(nm));
+  const heardLine = /did you mean/.test(low);
+  if (!heardLine && said.length < 2) return s;                       // not the app's own voice
+  let cut = -1;
+  for (const nm of said) cut = Math.max(cut, low.lastIndexOf(nm) + nm.length);
+  if (cut >= 0) return s.slice(cut).replace(/^[\s.,!?।]+/, '').trim();
+  const k = low.match(/\b(?:topic|exact|explain|question|stop|pause|next|previous|continue|slower|faster|repeat)\b[\s\S]*$/);
+  if (k) return k[0].trim();
+  const last = low.replace(/[.!?।,]+/g, ' ').trim().split(/\s+/).pop() || '';
+  return has(PICK, last) || has(PICK_LOOSE, last) ? last : '';
+}
+// the user said the NAME of an option ("urine sample") instead of one / two / three
+export function pickByName(s: string): number {
+  if (!CHOICES.length) return 0;
+  const toks = queryTokens(s);
+  if (!toks.length || toks.length > 6) return 0;
+  const r = rankTopics(toks, CHOICES.map((name, i) => ({ id: i, name })));
+  if (!r.length || r[0].score < 0.8) return 0;
+  if (r[1] && r[0].score - r[1].score < 0.1) return 0;
+  return r[0].id + 1;
 }
 
 export const OK_END = /(?:^|\s)(?:okay|ok|okey|o\.k\.?|ওকে|ঠিক আছে)\s*[.!?।]*$/i;
