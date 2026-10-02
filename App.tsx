@@ -26,7 +26,7 @@ import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
   pauseVoiceDownload, cancelVoiceDownload, deleteVoice, selectVoice, setTtsEngine,
-  speak, stopSpeak, DEFAULT_VOICE_ID,
+  speak, stopSpeak, DEFAULT_VOICE_ID, pickCustomVoice,
 } from './src/tts';
 
 type Msg = { id: number; who: 'you' | 'app'; text: string };
@@ -795,7 +795,7 @@ function Main() {
                 <Text style={st.txt}>Active speech engine</Text>
                 <Text style={st.val}>
                   {ttsState.engine === 'piper' && ttsState.isPiperReady
-                    ? `${VOICES.find((v) => v.id === ttsState.selectedVoice)?.engine === 'kokoro' ? 'Kokoro' : 'Piper'}: ${VOICES.find((v) => v.id === ttsState.selectedVoice)?.label || ttsState.selectedVoice}`
+                    ? `${VOICES.find((v) => v.id === ttsState.selectedVoice)?.engine === 'pocket' ? 'Pocket' : 'Piper'}: ${VOICES.find((v) => v.id === ttsState.selectedVoice)?.label || ttsState.selectedVoice}`
                     : 'Phone voice'}
                 </Text>
               </View>
@@ -880,13 +880,13 @@ function Main() {
               </TouchableOpacity>))}
           </View>
 
-          {/* English voices (Piper Catalog grouped by US / GB) */}
+          {/* English voices (Piper catalog grouped by US / GB / Indian accent, plus Pocket) */}
           <Text style={st.secT}>English offline voices</Text>
-          {(['US', 'GB', 'KO'] as const).map((accent) => {
+          {(['US', 'GB', 'IN', 'PK'] as const).map((accent) => {
             const list = VOICES.filter((v) => v.accent === accent);
             return (
               <View key={accent} style={st.group}>
-                <Text style={[st.sub, { paddingTop: 10, fontWeight: '700' }]}>{accent === 'US' ? 'United States (Piper)' : accent === 'GB' ? 'British (UK) (Piper)' : 'Kokoro - higher quality (one 132 MB download, heavier: needs a strong phone)'}</Text>
+                <Text style={[st.sub, { paddingTop: 10, fontWeight: '700' }]}>{accent === 'US' ? 'United States (Piper)' : accent === 'GB' ? 'British (UK) (Piper)' : accent === 'IN' ? 'Indian-accent English (Piper, multi-speaker: one download per group)' : 'Pocket TTS - natural + voice cloning (one ~190 MB download, heavier: needs a strong phone)'}</Text>
                 {list.map((v, idx) => {
                   const vst = ttsState.voices[v.id] || { phase: 'none', got: 0, total: v.bytes, msg: '' };
                   const isSelected = ttsState.selectedVoice === v.id && ttsState.engine === 'piper';
@@ -908,8 +908,16 @@ function Main() {
                     }
                   };
 
+                  const needsWav = v.ref === 'custom' && !ttsState.customVoice;
+                  const onPickWav = async () => {
+                    const r = await pickCustomVoice();
+                    if (!r.ok) { if (r.msg) Alert.alert('Voice file', r.msg); return; }
+                    if (R.state.status === 'reading') { R.pause(); await selectVoice(v.id); R.resume(); } else { await selectVoice(v.id); }
+                  };
+
                   const onSelect = async () => {
                     if (!isReady) return;
+                    if (needsWav) { await onPickWav(); return; }
                     if (R.state.status === 'reading') {
                       R.pause();
                       await selectVoice(v.id);
@@ -920,6 +928,7 @@ function Main() {
                   };
 
                   const onPreview = async () => {
+                    if (needsWav) { await onPickWav(); return; }
                     stopSpeak();
                     setPreviewingVoice(v.id);
                     if (isReady && ttsState.selectedVoice !== v.id) await selectVoice(v.id);     // the preview must use THIS voice
@@ -934,7 +943,7 @@ function Main() {
                   };
 
                   const onDelete = () => {
-                    Alert.alert('Delete voice?', v.engine === 'kokoro' ? 'All Kokoro voices share one download. It will be removed from private storage.' : `${v.label} will be removed from private storage.`, [
+                    Alert.alert('Delete voice?', v.pack ? 'All voices of this group share one download. It will be removed from private storage.' : `${v.label} will be removed from private storage.`, [
                       { text: 'Cancel', style: 'cancel' },
                       {
                         text: 'Delete',
@@ -968,7 +977,7 @@ function Main() {
 
                         <TouchableOpacity style={{ flex: 1 }} onPress={isReady ? onSelect : undefined} activeOpacity={isReady ? 0.7 : 1}>
                           <Text style={[st.txt, isSelected && { fontWeight: '700' }]} numberOfLines={1}>{v.label}</Text>
-                          <Text style={st.sub}>{v.gender === 'female' ? 'Female' : 'Male'} · {mb(v.bytes)} MB{v.note ? ` · ${v.note}` : ''}</Text>
+                          <Text style={st.sub}>{v.gender === 'female' ? 'Female' : v.gender === 'male' ? 'Male' : 'Your own sample'} · {v.approx ? '~' : ''}{mb(v.bytes)} MB{v.note ? ` · ${v.note}` : ''}</Text>
                           <Text style={[st.sub, { color: '#888', fontSize: 11, marginTop: 1 }]}>License: {v.license}</Text>
 
                           {vst.phase === 'downloading' && (
@@ -989,6 +998,11 @@ function Main() {
                         </TouchableOpacity>
 
                         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          {isReady && v.ref === 'custom' && (
+                            <TouchableOpacity style={[st.miniBtn, { height: 34, paddingHorizontal: 10 }]} onPress={onPickWav}>
+                              <Text style={[st.txt, { fontSize: 12, fontWeight: '600' }]}>{ttsState.customVoice ? 'Change WAV' : 'Choose WAV'}</Text>
+                            </TouchableOpacity>
+                          )}
                           {isReady && (
                             <>
                               <TouchableOpacity style={st.hBtn} onPress={onPreview}>
