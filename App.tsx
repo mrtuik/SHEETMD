@@ -231,7 +231,7 @@ function Main() {
     setChoiceNames(names);
     choicesRef.current = names; choiceMarks.current = marks; choiceExact.current = exactMode; rowY.current = {};
     push('app', CHOICE + JSON.stringify(names));
-    const line = 'Did you mean: ' + names.map((n) => n.replace(/\s*\(.*?\)\s*/g, ' ').trim().split(/\s+/).slice(0, 6).join(' ')).join(', or ') + '?';   // only the first words of each option: long titles made this line 20 s long   // no number words spoken: the mic cannot mistake the app's own voice for your "one / two / three", so you may answer at any moment
+    const line = 'Did you mean: ' + names.map((n) => n.replace(/\s*\(.*?\)\s*/g, ' ').trim()).join(', or ') + '?';   // no number words spoken: the mic cannot mistake the app's own voice for your "one / two / three", so you may answer at any moment
     try { R.stop(); } catch {}
     choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
     const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(100); }, 200);   // then a fresh mic: it must not carry the app's own voice into your answer
