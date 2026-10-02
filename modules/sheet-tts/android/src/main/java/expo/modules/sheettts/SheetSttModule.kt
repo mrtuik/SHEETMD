@@ -180,6 +180,9 @@ class SheetSttModule : Module() {
         val dec = d.listFiles()?.firstOrNull { it.name.startsWith("decoder") && it.name.endsWith(".onnx") && it.length() > 0 } ?: return@AsyncFunction false
         val join = d.listFiles()?.firstOrNull { it.name.startsWith("joiner") && it.name.endsWith(".onnx") && it.length() > 0 && it.name.contains("int8") }
           ?: d.listFiles()?.firstOrNull { it.name.startsWith("joiner") && it.name.endsWith(".onnx") && it.length() > 0 } ?: return@AsyncFunction false
+        // sherpa-onnx aborts the whole process on a bad model, so refuse obviously broken files before loading
+        if (tokens.readLines().count { it.isNotBlank() } < 20) { sendEvent("onError", mapOf("message" to "STT tokens file is broken")); return@AsyncFunction false }
+        if (enc.length() < 20_000_000L || dec.length() < 100_000L || join.length() < 50_000L) { sendEvent("onError", mapOf("message" to "STT model files incomplete")); return@AsyncFunction false }
         val cfg = OnlineRecognizerConfig(
           featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
           modelConfig = OnlineModelConfig(
