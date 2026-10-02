@@ -2,8 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Modal, StyleSheet, ScrollView, Pressable, Switch,
   Platform, PermissionsAndroid, AppState, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
-  Animated, Easing, ActivityIndicator, ToastAndroid,
+  Animated, Easing, ActivityIndicator, ToastAndroid, Share,
 } from 'react-native';
+import LottieView from 'lottie-react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
@@ -16,10 +17,11 @@ import { splitSentences } from './src/cleaner';
 import * as R from './src/reader';
 import {
   findTopic, findExact, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
-  listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, setMsgData, getMeta, setMeta, Source, Chat,
+  listTopics, listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, setMsgData, getMeta, setMeta, Source, Chat,
 } from './src/db';
 import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis,
-  searchWithGoogle, searchInfo, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
+  searchWithCloud, searchInfo, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
+import { cloud, cloudReady, loadCloud, saveProvider, saveCloudKey, saveCloudModel, saveCustomUrl, openRouterFreeModels, PROVIDERS, KEY_LINK, DEFAULT_MODEL, ProviderId, OrModel } from './src/cloud';
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
@@ -51,7 +53,7 @@ const COMMANDS: [string, string][] = [
   ['topic <name>', 'Read that topic from your sources, point by point'],
   ['exact <name>', 'Read that topic word for word from its heading to the next heading (fast, no AI)'],
   ['explain <name>', 'Explain it from my own knowledge + web (not your sources)'],
-  ['search <topic>  /  search short <topic>', 'Live Google search (Gemini, needs internet + a key in Models): a short answer'],
+  ['search <topic>  /  search short <topic>', 'Live search (Google Gemini, or the Cloud API you choose in Models; needs internet + a key): a short answer'],
   ['search long <topic>  /  search long <topic> 5 marks', 'The same search written as a full exam answer (sections, numbered lab steps), read point by point'],
   ['question ... okay', 'Say "question", then your full question, then "okay": I think, use your sources, add my own knowledge'],
   ['pause  /  continue', 'Hold, or carry on from the same sentence'],
@@ -117,6 +119,18 @@ function Main() {
   const [keyDraft, setKeyDraft] = useState('');
   const [keyShown, setKeyShown] = useState(false);
   const modelsScroll = useRef<ScrollView>(null);
+  // Cloud API (Models): which provider answers "search ...", and the key / model of each one
+  const [prov, setProv] = useState<ProviderId>(cloud.provider);
+  const [provOpen, setProvOpen] = useState(false);             // the provider dropdown
+  const [modelDraft, setModelDraft] = useState('');
+  const [urlDraft, setUrlDraft] = useState('');
+  const [orList, setOrList] = useState<OrModel[] | null>(null);   // OpenRouter free models, read live
+  const [orBusy, setOrBusy] = useState(false);
+  const [cloudTick, setCloudTick] = useState(0);              // re-draw after a key / model is saved
+  // floating Topics list (topics found in this chat's sources)
+  const [showTopics, setShowTopics] = useState(false);
+  const [topicList, setTopicList] = useState<{ id: number; name: string; pri: number }[]>([]);
+  const [topicQ, setTopicQ] = useState('');
   const [showMenu, setShowMenu] = useState(false);
   const [chats, setChats] = useState<Chat[]>([]);
   const [chatId, setChatId] = useState(0);
@@ -231,6 +245,7 @@ function Main() {
       const prompted = await getMeta('tts_prompted').catch(() => '');
       if (prompted !== '1') setShowTtsPrompt(true);
       await loadGemini(); setHasKey(hasGeminiKey()); setGemModel(gem.model);
+      await loadCloud(); setProv(cloud.provider); syncDrafts(cloud.provider); setCloudTick((n) => n + 1);
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
       setFastTopic((await getMeta('fast_topic').catch(() => '1')) !== '0');
       try {                                           // clearest installed voice, unless one was chosen before
@@ -434,15 +449,53 @@ function Main() {
 
   // ---------------------------------------------------------------------------------------------------------------
   // search <anything>: live Google search through Gemini. Online only; the answer is shown and read point by point like any topic.
+  // current provider's drafts (model / URL) follow the provider that is open in Models
+  const syncDrafts = (id: ProviderId) => {
+    setKeyDraft(''); setKeyShown(false); setProvOpen(false);
+    if (id !== 'gemini') { setModelDraft(cloud.model[id] || ''); setUrlDraft(cloud.customUrl || ''); }
+  };
+  const pickProvider = async (id: ProviderId) => { setProv(id); await saveProvider(id); syncDrafts(id); };
+  const providerOn = (id: ProviderId) => (id === 'gemini' ? hasKey : cloudReady(id));
   const saveKey = async () => {
     const k = keyDraft.trim();
-    if (k.length < 20) { Alert.alert('Gemini API key', 'That key looks too short. Copy the full key from Google AI Studio.'); return; }
-    await saveGeminiKey(k); setHasKey(true); setKeyDraft(''); setKeyShown(false); Keyboard.dismiss();
-    ToastAndroid.show('Gemini key saved', ToastAndroid.SHORT);
+    if (prov === 'gemini') {
+      if (k.length < 20) { Alert.alert('Gemini API key', 'That key looks too short. Copy the full key from Google AI Studio.'); return; }
+      await saveGeminiKey(k); setHasKey(true); setKeyDraft(''); setKeyShown(false); Keyboard.dismiss();
+      ToastAndroid.show('Gemini key saved', ToastAndroid.SHORT);
+      return;
+    }
+    const id = prov;
+    if (k) {
+      if (k.length < 8) { Alert.alert('API key', 'That key looks too short. Copy the full key.'); return; }
+      await saveCloudKey(id, k);
+    }
+    const m = modelDraft.trim();
+    if (m) await saveCloudModel(id, m); else if (id !== 'custom') await saveCloudModel(id, DEFAULT_MODEL[id]);
+    if (id === 'custom') {
+      const u = urlDraft.trim();
+      if (!/^https?:\/\//i.test(u)) { Alert.alert('Custom API', 'Base URL must start with https:// (example: https://api.groq.com/openai/v1)'); return; }
+      await saveCustomUrl(u);
+      if (!m) { Alert.alert('Custom API', 'Type the model name too (example: llama-3.3-70b-versatile).'); return; }
+    }
+    setKeyDraft(''); setKeyShown(false); setCloudTick((n) => n + 1); Keyboard.dismiss();
+    ToastAndroid.show('Saved', ToastAndroid.SHORT);
   };
-  const removeKey = () => Alert.alert('Remove Gemini key?', 'Live Google search stops working until you add a key again.', [
-    { text: 'Cancel', style: 'cancel' },
-    { text: 'Remove', style: 'destructive', onPress: async () => { await saveGeminiKey(''); setHasKey(hasGeminiKey()); } }]);
+  const removeKey = () => {
+    const nm = PROVIDERS.find((x) => x.id === prov)?.label || 'API';
+    Alert.alert(`Remove ${nm} key?`, 'Search with this provider stops working until you add a key again.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: async () => {
+        if (prov === 'gemini') { await saveGeminiKey(''); setHasKey(hasGeminiKey()); }
+        else { await saveCloudKey(prov, ''); setCloudTick((n) => n + 1); }
+      } }]);
+  };
+  const loadFreeModels = async () => {
+    setOrBusy(true);
+    try { setOrList(await openRouterFreeModels()); }
+    catch { ToastAndroid.show('Could not load the list. Check internet.', ToastAndroid.SHORT); }
+    setOrBusy(false);
+  };
+  const useModel = async (id: string) => { setModelDraft(id); if (prov !== 'gemini') { await saveCloudModel(prov, id); setCloudTick((n) => n + 1); } };
   const pickGemModel = async (m: GeminiModelId) => { setGemModel(m); await saveGeminiModel(m); };
 
   const searchTopic = async (qRaw: string, mode: 'short' | 'long' = 'short') => {
@@ -451,33 +504,35 @@ function Main() {
     const q = sm.q.trim();
     if (!q) { push('app', 'Say or type: search <topic>, or search long <topic> for a full exam answer'); return; }
     if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
-    if (!hasGeminiKey()) { push('app', 'Live Google search needs a Gemini API key. Add it in Models (top right).'); setShowModels(true); return; }
+    if (!hasGeminiKey() && !cloudReady(cloud.provider)) { push('app', 'Search needs an API key. Add one in Models > Cloud API (top right).'); setShowModels(true); return; }
     const myReq = ++reqRef.current;
     let offlineFallback = false;                                       // Gemini limit used up -> answer with the offline model after this block
     makingRef.current = true; setWorking(mode === 'long' ? 'Searching Google live… writing full notes' : 'Searching Google live…');
     try {
-      const pts = await searchWithGoogle(q, undefined, undefined, { mode, marks });
+      const pts = await searchWithCloud(q, { mode, marks });
       if (reqRef.current !== myReq) return;                            // a newer request took over
       rowY.current = {}; cardY.current = null;
       const nm = (mode === 'long' ? 'Search (long): ' : 'Search: ') + (q.length > 60 ? q.slice(0, 57) + '...' : q);
-      push('app', searchInfo.fromCache ? 'Saved answer from your earlier search (no Google call used). Not from your sources'
-        : mode === 'long' ? `Live Google search (Gemini): full ${marks}-mark answer. Not from your sources` : 'Live Google search (Gemini): short answer. Not from your sources');
+      const live = /^Google/.test(searchInfo.via);
+      push('app', searchInfo.fromCache ? 'Saved answer from your earlier search (no API call used). Not from your sources'
+        : live ? (mode === 'long' ? `Live Google search (Gemini): full ${marks}-mark answer. Not from your sources` : 'Live Google search (Gemini): short answer. Not from your sources')
+        : `${searchInfo.via}: ${mode === 'long' ? `full ${marks}-mark answer` : 'short answer'} from the model's own knowledge. NOT live Google and not from your sources, so double-check important facts`);
       push('app', TOPIC + nm);
       R.startTopic(0, nm, pts, `Search. ${pts.length} points.`);       // shown 1, 2, 3... and read aloud at once
     } catch (e: any) {
       const k = e instanceof GeminiError ? e.kind : 'http';
       if (k === 'cancelled') { if (reqRef.current === myReq) push('app', 'Stopped.'); return; }
       if (k === 'nokey' || k === 'badkey') {
-        push('app', k === 'nokey' ? 'Live Google search needs a Gemini API key. Add it in Models (top right).' : 'Google did not accept the Gemini API key. Check it in Models.');
+        push('app', k === 'nokey' ? 'Search needs an API key. Add one in Models > Cloud API (top right).' : 'The API key was not accepted. Check it in Models > Cloud API.');
         setShowModels(true);
       } else if (k === 'quota') {
         if (smart && llm.phase === 'ready') {
           offlineFallback = true;
-          push('app', 'The Gemini free limit is used up for now. Answering with the offline model instead. This is NOT live Google search, so double-check important facts');
-        } else push('app', 'The Gemini free limit is used up for now (it resets daily). Try again later. Download the smart model in Models to get offline answers when this happens');
+          push('app', 'The free limit of your cloud API is used up for now. Answering with the offline model instead. This is NOT live search, so double-check important facts');
+        } else push('app', 'The free limit of your cloud API is used up for now (it usually resets daily). Try again later, or pick another provider in Models > Cloud API. Download the smart model in Models to get offline answers when this happens');
       }
       else {
-        const msg = 'Could not fetch live search results, please check internet.';
+        const msg = 'Could not get a search answer. Check internet, or the model name in Models > Cloud API.';
         push('app', msg);
         ToastAndroid.show(msg, ToastAndroid.LONG);
       }
@@ -570,6 +625,19 @@ function Main() {
       }
       else push('app', 'Try: topic <name>, exact <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
     }
+  };
+  // floating Topics: the topics that were found in this chat's sources when the files were added; tapping one runs "exact <topic>"
+  const toggleTopics = async () => {
+    if (showTopics) { setShowTopics(false); return; }
+    try {
+      const l = await listTopics(chatRef.current);
+      setTopicList([...l.filter((x) => x.pri === 0), ...l.filter((x) => x.pri !== 0)]);
+    } catch { setTopicList([]); }
+    setTopicQ(''); setShowTopics(true);
+  };
+  const pickTopicName = (name: string) => {
+    setShowTopics(false); setTopicQ(''); follow.current = true;
+    exec(`exact ${name}`, 'text'); keepFocus();
   };
   const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t, 'text'); keepFocus(); };
 
@@ -889,6 +957,13 @@ function Main() {
     try { await Clipboard.setStringAsync(cardText(name, pts)); ToastAndroid.show('Copied', ToastAndroid.SHORT); }
     catch { ToastAndroid.show('Could not copy', ToastAndroid.SHORT); }
   }, []);
+  const shareCard = useCallback(async (id: number) => {
+    const m = msgsRef.current.find((x) => x.id === id); if (!m) return;
+    const name = m.text.slice(TOPIC.length);
+    const pts = m.data?.pts?.length ? m.data.pts : R.state.topic === name ? R.state.points : [];
+    if (!pts.length) return;
+    try { await Share.share({ message: cardText(name, pts) }); } catch { ToastAndroid.show('Could not share', ToastAndroid.SHORT); }
+  }, []);
   const likeCard = useCallback((id: number) => {
     const m = msgsRef.current.find((x) => x.id === id); if (!m) return;
     const name = m.text.slice(TOPIC.length);
@@ -903,7 +978,7 @@ function Main() {
       if (!live) {
         const pts = m.data?.pts;
         if (pts && pts.length) {
-          return <TopicCard key={m.id} id={m.id} name={name} pts={pts} liked={!!m.data?.liked} writing={writing} onPlay={onPlayBtn} onGo={playCard} onCopy={copyCard} onLike={likeCard} />;
+          return <TopicCard key={m.id} id={m.id} name={name} pts={pts} liked={!!m.data?.liked} writing={writing} onPlay={onPlayBtn} onGo={playCard} onCopy={copyCard} onShare={shareCard} onLike={likeCard} />;
         }
         // an older reply from before replies were saved: only its title is known
         return (
@@ -921,7 +996,7 @@ function Main() {
             const act = k === s.idx && s.status !== 'idle';
             return <PointBlock key={p.n} p={p} k={k} line={act ? R.lineOf(p, s.chunk - 1) : -1} sent={act ? s.chunk - 1 : -1} onGo={goPoint} onY={setRowY} />;
           })}
-          {!writing && <CardActions id={m.id} playing={playing} liked={!!m.data?.liked} onPlay={onPlayBtn} onCopy={copyCard} onLike={likeCard} />}
+          {!writing && <CardActions id={m.id} playing={playing} liked={!!m.data?.liked} onPlay={onPlayBtn} onCopy={copyCard} onShare={shareCard} onLike={likeCard} />}
         </View>);
     }
     if (m.text.startsWith(CHOICE)) {
@@ -966,12 +1041,35 @@ function Main() {
         {(working || indexing) ? (
           <View style={st.statusRow}>
             {/* tiny pulsing dot, left-aligned right where the reply text will start (like ChatGPT / Claude); mounted only while working, so it stops when the reply is done */}
-            <PulseDot />
+            <WritingAnim />
             <Text style={st.statusT}>{working || 'Indexing…'}</Text>
           </View>) : null}
       </ScrollView>
 
       <View style={[st.dock, { paddingBottom: kbPad > 0 ? 8 : ins.bottom + 14 }]}>
+        {/* floating Topics button (right side, just above the input box) with a drop-up list. Black and white only. */}
+        <View style={st.tpWrap}>
+          {showTopics && (
+            <View style={st.tpPanel}>
+              <TextInput style={st.tpSearch} value={topicQ} onChangeText={setTopicQ} placeholder="Search topics" placeholderTextColor="#000000" autoCapitalize="none" autoCorrect={false} />
+              <ScrollView style={{ maxHeight: Math.min(300, Math.round(winH * 0.38)) }} nestedScrollEnabled keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+                {(() => {
+                  const q = topicQ.trim().toLowerCase();
+                  const rows = (q ? topicList.filter((x) => x.name.toLowerCase().includes(q)) : topicList).slice(0, 80);
+                  if (!rows.length) return <Text style={st.tpEmpty}>{topicList.length ? 'No topic matches.' : 'No topics yet. Add a PDF or file with the + button.'}</Text>;
+                  return rows.map((x) => (
+                    <Pressable key={x.id} onPress={() => pickTopicName(x.name)} style={({ pressed }) => [st.tpRow, pressed && { backgroundColor: C.tx }]}>
+                      {({ pressed }) => <Text style={[st.tpRowT, pressed && { color: '#FFFFFF' }]} numberOfLines={2}>{x.name}</Text>}
+                    </Pressable>));
+                })()}
+              </ScrollView>
+            </View>)}
+          <TouchableOpacity style={st.tpBtn} activeOpacity={0.7} onPress={toggleTopics}>
+            <Icon n="file" size={16} />
+            <Text style={st.tpBtnT}>Topics</Text>
+            <Icon n="chevronDown" size={14} style={{ transform: [{ rotate: showTopics ? '0deg' : '180deg' }] }} />
+          </TouchableOpacity>
+        </View>
         <View style={st.box}>
           {/* top card (like the "Start interview" card in Claude): what the mic hears, the player, or a prompt - always inside the input box */}
           {(listening || s.points.length > 0) && (
@@ -1145,51 +1243,105 @@ function Main() {
               </>)}
           </View>
 
-          <Text style={st.secT}>Online search · Google (Gemini)</Text>
+          <Text style={st.secT}>Cloud API</Text>
           <View style={st.group}>
             <View style={st.mHead}>
               <View style={st.mTile}><Icon n="models" size={20} /></View>
               <View style={{ flex: 1 }}>
-                <Text style={st.txt}>Live Google search</Text>
-                <Text style={st.val}>{hasKey ? (gem.key ? 'Your Gemini key is saved' : 'Using the key built into this app') : 'Add a Gemini API key to turn it on'}</Text>
+                <Text style={st.txt}>Search with a cloud model</Text>
+                <Text style={st.val}>{providerOn(prov) ? `${PROVIDERS.find((x) => x.id === prov)?.label} is ready` : 'Pick a provider and add its key'}</Text>
               </View>
-              <View style={[st.badge, { backgroundColor: hasKey ? '#DCFCE7' : '#EDEDEB' }]}>
-                <Text style={[st.badgeT, { color: hasKey ? C.ok : C.sec }]}>{hasKey ? 'On' : 'No key'}</Text>
-              </View>
-            </View>
-            <View style={st.sep} />
-            <View style={{ paddingVertical: 12, gap: 10 }}>
-              <Text style={st.txt}>Gemini API key</Text>
-              <View style={st.keyRow}>
-                <TextInput
-                  style={st.keyInput} value={keyDraft} onChangeText={setKeyDraft}
-                  placeholder={gem.key ? '•••••••• saved. Paste a new key to replace' : 'Paste your key (AIza…)'} placeholderTextColor={C.disI}
-                  secureTextEntry={!keyShown} autoCapitalize="none" autoCorrect={false} spellCheck={false} contextMenuHidden={false}
-                  onFocus={() => setTimeout(() => modelsScroll.current?.scrollToEnd({ animated: true }), 300)} onSubmitEditing={saveKey} />
-                <TouchableOpacity style={st.miniBtn} onPress={() => setKeyShown((v) => !v)}><Text style={st.txt}>{keyShown ? 'Hide' : 'Show'}</Text></TouchableOpacity>
-              </View>
-              <View style={[st.keyRow, { flexWrap: 'wrap' }]}>
-                <TouchableOpacity style={[st.miniBtn, { backgroundColor: C.acc, opacity: keyDraft.trim() ? 1 : 0.4 }]} disabled={!keyDraft.trim()} onPress={saveKey}>
-                  <Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>Save key</Text>
-                </TouchableOpacity>
-                {!!gem.key && <TouchableOpacity style={st.miniBtn} onPress={removeKey}><Text style={[st.txt, { color: C.bad }]}>Remove</Text></TouchableOpacity>}
-                <TouchableOpacity style={st.miniBtn} onPress={() => Linking.openURL('https://aistudio.google.com/apikey').catch(() => {})}><Text style={st.txt}>Get a free key</Text></TouchableOpacity>
+              <View style={[st.badge, { backgroundColor: providerOn(prov) ? '#DCFCE7' : '#EDEDEB' }]}>
+                <Text style={[st.badgeT, { color: providerOn(prov) ? C.ok : C.sec }]}>{providerOn(prov) ? 'On' : 'No key'}</Text>
               </View>
             </View>
             <View style={st.sep} />
             <View style={{ paddingVertical: 12, gap: 8 }}>
-              <Text style={st.txt}>Model</Text>
-              <View style={st.seg}>
-                {GEMINI_MODELS.map((m) => (
-                  <TouchableOpacity key={m.id} style={[st.segI, gemModel === m.id && st.segOn]} onPress={() => pickGemModel(m.id)}>
-                    <Text style={[st.segT, gemModel === m.id && { color: '#fff' }]} numberOfLines={1}>{m.label}</Text>
-                  </TouchableOpacity>))}
-              </View>
-              <Text style={st.val}>{GEMINI_MODELS.find((m) => m.id === gemModel)?.note}. If a model's free limit is used up or Google retires it, the next model is used automatically. Finished searches are saved and reused without using any limit.</Text>
+              <Text style={st.txt}>Provider</Text>
+              <TouchableOpacity style={st.dd} activeOpacity={0.7} onPress={() => setProvOpen((v) => !v)}>
+                <Text style={st.ddT} numberOfLines={1}>{PROVIDERS.find((x) => x.id === prov)?.label}</Text>
+                <Icon n="chevronDown" size={16} style={{ transform: [{ rotate: provOpen ? '180deg' : '0deg' }] }} />
+              </TouchableOpacity>
+              {provOpen && (
+                <View style={st.ddList}>
+                  {PROVIDERS.map((p) => (
+                    <TouchableOpacity key={p.id} style={st.ddItem} activeOpacity={0.7} onPress={() => pickProvider(p.id)}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[st.txt, prov === p.id && { fontWeight: '700' }]}>{p.label}</Text>
+                        <Text style={st.val}>{p.note}</Text>
+                      </View>
+                      {providerOn(p.id) && <Icon n="check" size={16} color={C.ok} />}
+                    </TouchableOpacity>))}
+                </View>)}
             </View>
             <View style={st.sep} />
-            <View style={{ paddingVertical: 12 }}>
-              <Text style={st.val}>Say or type “search sickle cell anemia” for a short answer (2-3 points), or “search long sickle cell anemia” for a full exam answer (add “5 marks” or “10 marks” if you like). Needs internet; each search is sent to Google through your own key.</Text>
+            <View style={{ paddingVertical: 12, gap: 10 }}>
+              <Text style={st.txt}>{prov === 'gemini' ? 'Gemini API key' : `${PROVIDERS.find((x) => x.id === prov)?.label} API key${prov === 'custom' ? ' (optional for a local server)' : ''}`}</Text>
+              {prov === 'custom' && (
+                <TextInput style={st.keyInput} value={urlDraft} onChangeText={setUrlDraft} placeholder="Base URL, e.g. https://api.groq.com/openai/v1" placeholderTextColor={C.disI}
+                  autoCapitalize="none" autoCorrect={false} spellCheck={false} keyboardType="url" />)}
+              <View style={st.keyRow}>
+                <TextInput
+                  style={st.keyInput} value={keyDraft} onChangeText={setKeyDraft}
+                  placeholder={(prov === 'gemini' ? gem.key : cloud.key[prov as 'openrouter' | 'openai' | 'custom']) ? '•••••••• saved. Paste a new key to replace' : prov === 'gemini' ? 'Paste your key (AIza…)' : prov === 'openrouter' ? 'Paste your key (sk-or-…)' : prov === 'openai' ? 'Paste your key (sk-…)' : 'Paste your key'} placeholderTextColor={C.disI}
+                  secureTextEntry={!keyShown} autoCapitalize="none" autoCorrect={false} spellCheck={false} contextMenuHidden={false}
+                  onFocus={() => setTimeout(() => modelsScroll.current?.scrollToEnd({ animated: true }), 300)} onSubmitEditing={saveKey} />
+                <TouchableOpacity style={st.miniBtn} onPress={() => setKeyShown((v) => !v)}><Text style={st.txt}>{keyShown ? 'Hide' : 'Show'}</Text></TouchableOpacity>
+              </View>
+              {prov !== 'gemini' && (
+                <>
+                  <Text style={st.txt}>Model</Text>
+                  <TextInput style={st.keyInput} value={modelDraft} onChangeText={setModelDraft}
+                    placeholder={prov === 'openrouter' ? 'openrouter/free' : prov === 'openai' ? 'gpt-4o-mini' : 'model name'} placeholderTextColor={C.disI}
+                    autoCapitalize="none" autoCorrect={false} spellCheck={false} />
+                  {prov === 'openrouter' && (
+                    <>
+                      <TouchableOpacity style={[st.miniBtn, { alignSelf: 'flex-start', flexDirection: 'row', gap: 8 }]} onPress={loadFreeModels} disabled={orBusy}>
+                        {orBusy && <ActivityIndicator size="small" color={C.tx} />}
+                        <Text style={st.txt}>{orList ? 'Reload free models' : 'Show free models'}</Text>
+                      </TouchableOpacity>
+                      {!!orList && (
+                        <View style={st.ddList}>
+                          <ScrollView style={{ maxHeight: 240 }} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                            {orList.length === 0 ? <Text style={[st.val, { padding: 12 }]}>No free models found right now.</Text> : orList.map((m) => (
+                              <TouchableOpacity key={m.id} style={st.ddItem} activeOpacity={0.7} onPress={() => useModel(m.id)}>
+                                <View style={{ flex: 1 }}>
+                                  <Text style={[st.txt, cloud.model.openrouter === m.id && { fontWeight: '700' }]} numberOfLines={1}>{m.name}</Text>
+                                  <Text style={st.val} numberOfLines={1}>{m.id}</Text>
+                                </View>
+                                {cloud.model.openrouter === m.id && <Icon n="check" size={16} color={C.ok} />}
+                              </TouchableOpacity>))}
+                          </ScrollView>
+                        </View>)}
+                    </>)}
+                </>)}
+              <View style={[st.keyRow, { flexWrap: 'wrap' }]}>
+                <TouchableOpacity style={[st.miniBtn, { backgroundColor: C.acc, opacity: (prov === 'gemini' ? keyDraft.trim() : (keyDraft.trim() || modelDraft.trim() || urlDraft.trim())) ? 1 : 0.4 }]}
+                  disabled={!(prov === 'gemini' ? keyDraft.trim() : (keyDraft.trim() || modelDraft.trim() || urlDraft.trim()))} onPress={saveKey}>
+                  <Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>{prov === 'gemini' ? 'Save key' : 'Save'}</Text>
+                </TouchableOpacity>
+                {!!(prov === 'gemini' ? gem.key : cloud.key[prov as 'openrouter' | 'openai' | 'custom']) && <TouchableOpacity style={st.miniBtn} onPress={removeKey}><Text style={[st.txt, { color: C.bad }]}>Remove</Text></TouchableOpacity>}
+                {!!KEY_LINK[prov] && <TouchableOpacity style={st.miniBtn} onPress={() => Linking.openURL(KEY_LINK[prov]).catch(() => {})}><Text style={st.txt}>Get a free key</Text></TouchableOpacity>}
+              </View>
+            </View>
+            {prov === 'gemini' && (
+              <>
+                <View style={st.sep} />
+                <View style={{ paddingVertical: 12, gap: 8 }}>
+                  <Text style={st.txt}>Model</Text>
+                  <View style={st.seg}>
+                    {GEMINI_MODELS.map((m) => (
+                      <TouchableOpacity key={m.id} style={[st.segI, gemModel === m.id && st.segOn]} onPress={() => pickGemModel(m.id)}>
+                        <Text style={[st.segT, gemModel === m.id && { color: '#fff' }]} numberOfLines={1}>{m.label}</Text>
+                      </TouchableOpacity>))}
+                  </View>
+                  <Text style={st.val}>{GEMINI_MODELS.find((m) => m.id === gemModel)?.note}. If a model's free limit is used up or Google retires it, the next model is used automatically. Finished searches are saved and reused without using any limit.</Text>
+                </View>
+              </>)}
+            <View style={st.sep} />
+            <View style={{ paddingVertical: 12, gap: 6 }}>
+              <Text style={st.val}>Say or type “search sickle cell anemia” for a short answer (2-3 points), or “search long sickle cell anemia” for a full exam answer (add “5 marks” or “10 marks” if you like). Needs internet; each search is sent to the provider through your own key.</Text>
+              {prov !== 'gemini' && <Text style={st.val}>{PROVIDERS.find((x) => x.id === prov)?.label} answers from the model's own knowledge, not live Google. If it fails or its free limit is used up, your Gemini key (if saved) is tried next, then the offline model.</Text>}
             </View>
           </View>
         </ScrollView>
@@ -1623,18 +1775,12 @@ function Wave({ active, mic, color, height = 28 }: { active: boolean; mic?: bool
   );
 }
 
-// One small dot that gently breathes - shown at the start of the reply while it is being written
-function PulseDot() {
-  const v = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    const loop = Animated.loop(Animated.sequence([
-      Animated.timing(v, { toValue: 1, duration: 650, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-      Animated.timing(v, { toValue: 0, duration: 650, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-    ]));
-    loop.start();
-    return () => loop.stop();
-  }, []);
-  return <Animated.View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: C.tx, opacity: v.interpolate({ inputRange: [0, 1], outputRange: [0.35, 1] }), transform: [{ scale: v.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1.15] }) }] }} />;
+// Lottie loader (assets/animations/writing_animation.json) at the start of the reply while it is being written. Small, like the old dot:
+// make WRITING_SIZE bigger / smaller if you want.
+const WRITING_ANIM = require('./assets/animations/writing_animation.json');
+const WRITING_SIZE = 22;
+function WritingAnim() {
+  return <LottieView source={WRITING_ANIM} autoPlay loop style={{ width: WRITING_SIZE, height: WRITING_SIZE }} />;
 }
 
 // Three dots that rise one after the other (shown while notes are being written)
@@ -1723,23 +1869,26 @@ const PointBlock = React.memo(function PointBlock({ p, k, line, sent, onGo, onY 
 });
 
 const noY = () => {};
-// Play / Copy / Like under a finished reply (icons: assets/icons/ic_tuik_play.png, ic_tuik_copy.png, ic_tuik_like.png)
-const CardActions = React.memo(function CardActions({ id, playing, liked, onPlay, onCopy, onLike }: { id: number; playing: boolean; liked: boolean; onPlay: (id: number) => void; onCopy: (id: number) => void; onLike: (id: number) => void }) {
+// Copy / Play / Share / Like under a finished reply. Small, close together, always black (icons: assets/icons/*.png)
+const ACT_SIZE = 16;
+const CardActions = React.memo(function CardActions({ id, playing, liked, onPlay, onCopy, onShare, onLike }: { id: number; playing: boolean; liked: boolean; onPlay: (id: number) => void; onCopy: (id: number) => void; onShare: (id: number) => void; onLike: (id: number) => void }) {
+  const hit = { top: 8, bottom: 8, left: 2, right: 2 };
   return (
     <View style={st.actRow}>
-      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }} onPress={() => onPlay(id)}><Icon n={playing ? 'pause' : 'play'} size={20} color={C.sec} /></TouchableOpacity>
-      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }} onPress={() => onCopy(id)}><Icon n="copy" size={20} color={C.sec} /></TouchableOpacity>
-      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }} onPress={() => onLike(id)}><Icon n="like" size={20} color={liked ? C.bad : C.sec} /></TouchableOpacity>
+      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={hit} onPress={() => onCopy(id)}><Icon n="copy" size={ACT_SIZE} color={C.tx} /></TouchableOpacity>
+      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={hit} onPress={() => onPlay(id)}><Icon n={playing ? 'pause' : 'play'} size={ACT_SIZE} color={C.tx} /></TouchableOpacity>
+      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={hit} onPress={() => onShare(id)}><Icon n="share" size={ACT_SIZE} color={C.tx} /></TouchableOpacity>
+      <TouchableOpacity style={[st.actBtn, liked && st.actOn]} activeOpacity={0.6} hitSlop={hit} onPress={() => onLike(id)}><Icon n="like" size={ACT_SIZE} color={C.tx} /></TouchableOpacity>
     </View>);
 });
 
 // A saved reply that is not being read now: the complete text, nothing collapsed. Memoised, so the reading highlight on another card never re-renders it.
-const TopicCard = React.memo(function TopicCard({ id, name, pts, liked, writing, onPlay, onGo, onCopy, onLike }: { id: number; name: string; pts: Point[]; liked: boolean; writing: boolean; onPlay: (id: number) => void; onGo: (id: number, k: number) => void; onCopy: (id: number) => void; onLike: (id: number) => void }) {
+const TopicCard = React.memo(function TopicCard({ id, name, pts, liked, writing, onPlay, onGo, onCopy, onShare, onLike }: { id: number; name: string; pts: Point[]; liked: boolean; writing: boolean; onPlay: (id: number) => void; onGo: (id: number, k: number) => void; onCopy: (id: number) => void; onShare: (id: number) => void; onLike: (id: number) => void }) {
   return (
     <View style={st.card}>
       <Text style={st.topicT}>{name}</Text>
       {pts.map((p, k) => <PointBlock key={p.n} p={p} k={k} line={-1} sent={-1} onGo={(kk) => onGo(id, kk)} onY={noY} />)}
-      {!writing && <CardActions id={id} playing={false} liked={liked} onPlay={onPlay} onCopy={onCopy} onLike={onLike} />}
+      {!writing && <CardActions id={id} playing={false} liked={liked} onPlay={onPlay} onCopy={onCopy} onShare={onShare} onLike={onLike} />}
     </View>);
 });
 
@@ -1758,7 +1907,7 @@ const st = StyleSheet.create({
   you: { backgroundColor: C.acc, alignSelf: 'flex-end', borderRadius: 18, borderBottomRightRadius: 6, paddingHorizontal: 14, paddingVertical: 9, maxWidth: '80%' },
   status: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6, paddingHorizontal: 2 },
   statusT: { color: C.sec, fontSize: 14 },
-  statusRow: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 8, paddingVertical: 4, paddingHorizontal: 2 },
+  statusRow: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 6, paddingVertical: 2, paddingHorizontal: 0 },
   empty: { borderWidth: 1, borderColor: C.bd, borderRadius: 14, padding: 18, alignItems: 'center', marginTop: 40, flexDirection: 'row', justifyContent: 'center', gap: 8 },
   emptyT: { color: C.tx, fontSize: 16 },
 
@@ -1770,8 +1919,9 @@ const st = StyleSheet.create({
   ptBody: { flex: 1 },
   ptTitle: { fontWeight: '700', fontSize: 16, lineHeight: 24, color: C.tx, marginBottom: 3 },
   ptLine: { color: C.tx, fontSize: 15.5, lineHeight: 24, marginBottom: 4 },
-  actRow: { flexDirection: 'row', alignItems: 'center', gap: 14, paddingTop: 6, paddingLeft: 2 },
-  actBtn: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center' },
+  actRow: { flexDirection: 'row', alignItems: 'center', gap: 2, paddingTop: 4, paddingLeft: 0 },
+  actBtn: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  actOn: { borderWidth: 1.5, borderColor: C.tx },
   cardHead: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2 },
   cardT: { flex: 1, fontWeight: '700', fontSize: 16, color: C.tx },
   ptRow: { flexDirection: 'row', gap: 10, paddingVertical: 7, paddingHorizontal: 8, borderRadius: 10 },
@@ -1786,6 +1936,16 @@ const st = StyleSheet.create({
   bul: { color: C.sec, fontSize: 15, lineHeight: 22, width: 16 },
   hint: { color: C.sec, fontSize: 14, lineHeight: 20, fontStyle: 'italic', marginTop: 2 },
 
+  tpWrap: { alignItems: 'flex-end', marginBottom: 8 },
+  tpBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, height: 38, paddingHorizontal: 14, borderRadius: 19, backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.tx,
+    elevation: 5, shadowColor: '#000', shadowOpacity: 0.12, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } },
+  tpBtnT: { fontSize: 14, fontWeight: '700', color: C.tx },
+  tpPanel: { width: '86%', backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.tx, borderRadius: 20, padding: 10, marginBottom: 8, gap: 8,
+    elevation: 8, shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 12, shadowOffset: { width: 0, height: 3 } },
+  tpSearch: { height: 40, borderWidth: 1.5, borderColor: C.tx, borderRadius: 14, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.bg },
+  tpRow: { paddingVertical: 11, paddingHorizontal: 12, borderRadius: 12 },
+  tpRowT: { fontSize: 15, fontWeight: '600', color: C.tx },
+  tpEmpty: { fontSize: 14, color: C.tx, padding: 12 },
   dock: { paddingHorizontal: 12, paddingTop: 6 },
   box: {
     borderWidth: 1, borderColor: '#E1DFD9', borderRadius: 30, backgroundColor: C.bg, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 8,
@@ -1855,6 +2015,10 @@ const st = StyleSheet.create({
   mTile: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
   badge: { paddingHorizontal: 10, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
   badgeT: { fontSize: 12, fontWeight: '700' },
+  dd: { height: 46, borderWidth: 1.5, borderColor: C.tx, borderRadius: 14, paddingHorizontal: 14, backgroundColor: C.bg, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  ddT: { flex: 1, fontSize: 15, fontWeight: '600', color: C.tx },
+  ddList: { borderWidth: 1.5, borderColor: C.tx, borderRadius: 14, backgroundColor: C.bg, overflow: 'hidden' },
+  ddItem: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, paddingHorizontal: 14 },
   keyRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   keyInput: { flex: 1, height: 46, borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.bg },
   miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
