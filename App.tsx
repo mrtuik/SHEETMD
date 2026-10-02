@@ -107,6 +107,8 @@ function Main() {
   const [renaming, setRenaming] = useState<Chat | null>(null);
   const [renameText, setRenameText] = useState('');
   const [smart, setSmartOn] = useState(true);
+  const [fastTopic, setFastTopic] = useState(true);          // topic <name>: start reading at once from the source (no waiting for the AI)
+  const reqRef = useRef(0);
   const [working, setWorking] = useState('');
   const [asking, setAsking] = useState(false);
   const qRef = useRef<{ parts: string[]; timer: any } | null>(null);   // a spoken question being dictated (ends with "okay")
@@ -187,6 +189,7 @@ function Main() {
       const prompted = await getMeta('tts_prompted').catch(() => '');
       if (prompted !== '1') setShowTtsPrompt(true);
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
+      setFastTopic((await getMeta('fast_topic').catch(() => '1')) !== '0');
       try {                                           // clearest installed voice, unless one was chosen before
         const all = await loadVoices();
         setVoices(all);
@@ -247,6 +250,7 @@ function Main() {
     Alert.alert('Smart notes', `Download the offline ${m.label} model once (${Math.round(m.bytes / 1e6)} MB, Wi-Fi)? Until then notes use the basic method.`, [
       { text: 'Later', style: 'cancel' }, { text: 'Download', onPress: () => beginDownload() }]);
   };
+  const toggleFast = (v: boolean) => { setFastTopic(v); setMeta('fast_topic', v ? '1' : '0').catch(() => {}); };
   const toggleSmart = (v: boolean) => {
     setSmartOn(v); setMeta('smart', v ? '1' : '0').catch(() => {});
     if (v && llm.phase === 'none') { askedDl.current = true; beginDownload(); }            // first Smart use: check + download
@@ -283,9 +287,10 @@ function Main() {
     if (f.kind === 'pick' && f.options?.length) { showChoices(f.options, sm.marks); return; }
     if (!f.found) { notFound(f.alts); return; }
     choicesRef.current = null;
+    const myReq = ++reqRef.current;
 
-    const useLlm = smart && llm.phase === 'ready';
-    if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
+    const useLlm = smart && !fastTopic && llm.phase === 'ready';        // fast topics: no AI wait, the reading starts in about a second
+    if (smart && !fastTopic && llm.phase === 'none' && !askedDl.current) offerDownload();
     let pts = await getNotes(f.id, useLlm ? 'llm' : 'rule', sm.marks);   // id 0 (part of a big file) is never cached
     if (!pts && useLlm) {
       makingRef.current = true; setWorking('Writing notes…');
@@ -297,11 +302,12 @@ function Main() {
         if (se.started) R.endStream();                                    // nothing more is coming: the reading may finish
         makingRef.current = false; setWorking('');
       }
-      if (r.cancelled) return;                                            // you said stop / asked something newer
+      if (r.cancelled) { if (reqRef.current === myReq) push('app', 'Stopped. Say or type the topic again.'); return; }   // never leave an empty reply
       if (r.notInSource) { notFound(f.alts); return; }                   // the model found nothing about it in the source
       if (r.pts) { await saveNotes(f.id, r.pts, 'llm', sm.marks); if (se.started) return; pts = r.pts; }   // already on screen and being read when it was streamed
     }
-    if (!pts) { pts = makeNotes(f.name, f.body); await saveNotes(f.id, pts, 'rule', 0); }
+    if (!pts || !pts.length) { pts = makeNotes(f.name, f.body); await saveNotes(f.id, pts, 'rule', 0); }
+    if (!pts || !pts.length) { push('app', `Found “${f.name}” but there is no readable text in it.`); return; }
     rowY.current = {};
     cardY.current = null;
     push('app', TOPIC + f.name);
@@ -489,6 +495,16 @@ function Main() {
     const sp = new Set(tok(R.getSpoken()).map(stem));
     return ht.filter((w) => sp.has(stem(w))).length / ht.length >= 0.75;      // misheard by a word or two: still the app's voice
   };
+  // The app's OWN reading that the mic picked up (even misheard by a word or two): never shown as "heard" and never a command.
+  // A real command (stop / next / topic ... / tuik) is not hidden, only plain reading words are.
+  const ownVoice = (t: string) => {
+    if (!t || R.state.status !== 'reading') return false;
+    if (parse(t).t !== 'unknown') return false;
+    const ht = tok(t);
+    if (ht.length < 2) return false;
+    const sp = new Set(tok(R.getSpoken()).map((w) => w.slice(0, 4)));
+    return ht.filter((w) => sp.has(w.slice(0, 4))).length / ht.length >= 0.5;
+  };
   // "Topic X. 6 points." is spoken by the app itself; the mic hears "topic X" and used to open the topic AGAIN, over and over
   // (so the lines were never reached). While that intro plays (and for 2.5 s after) a topic / exact / explain command made only of its words is ignored.
   const introEcho = (q: string) => {
@@ -616,9 +632,9 @@ function Main() {
   const onVoice = (alts0: string[]) => {
     if (!alts0.length) return;
     const g = wakeGate(alts0, false);
-    if (!g) { setHeard(alts0[0].slice(0, 40) + '  (ignored: say "tuik" first)'); return; }
+    if (!g) { if (!ownVoice(alts0[0])) setHeard(alts0[0].slice(0, 40) + '  (ignored: say "tuik" first)'); return; }
     let alts = g;
-    setHeard(alts[0].slice(0, 60));
+    if (!ownVoice(alts[0])) setHeard(alts[0].slice(0, 60));          // the app's own reading is not shown as something you said
     clearStable();
     if (hardCmd(alts, false)) { restartListening(60); return; }     // commands first, in every state
     if (choiceSpeaking.current) return;                              // otherwise the app's own voice: ignore
@@ -701,12 +717,12 @@ function Main() {
 
   // Foreground service lives while reading/paused or while the mic is on
   useEffect(() => {
-    if (!listening && s.status === 'idle') { stopService(); return; }
+    if (!listening && s.status === 'idle' && !working) { stopService(); return; }
     const pt = s.points[s.idx];
-    const text = s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
+    const text = (s.status === 'idle' && working) ? working : s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
       : `${s.topic} — point ${pt?.n ?? 0}/${s.points.length}${s.status === 'paused' ? ' (paused)' : ''}`;
     updateService('Sheet.md', text, s.status === 'reading', listening);
-  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn]);
+  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn, !!working]);
 
   // keep the point being read in view (stops as soon as you scroll yourself)
   useEffect(() => {
@@ -785,7 +801,7 @@ function Main() {
             <Icon n="plus" size={22} /><Text style={st.emptyT}>Add a source to begin</Text>
           </TouchableOpacity>) : null}
         {msgs.map(renderMsg)}
-        {(working || indexing) ? <View style={st.status}><ActivityIndicator size="small" color={C.sec} /><Text style={st.statusT}>{working || 'Indexing…'}</Text></View> : null}
+        {(working || indexing) ? <View style={st.status}><Dots /><Text style={st.statusT}>{working || 'Indexing…'}</Text></View> : null}
       </ScrollView>
 
       <View style={[st.dock, { paddingBottom: kbPad > 0 ? 8 : ins.bottom + 14 }]}>
@@ -795,15 +811,15 @@ function Main() {
             <View style={st.tcard}>
               {listening && (
                 <View style={st.liveRow}>
-                  <Wave mic active color={C.on} height={22} />
-                  <LiveText heard={heard} status={asking ? 'Listening to your question · say okay when done' : awakeUI ? 'Listening… say your command' : 'Listening'} />
+                  <Wave mic active color={C.on} height={28} />
+                  <LiveText hide={ownVoice} heard={heard} status={asking ? 'Listening to your question · say okay when done' : awakeUI ? 'Listening… say your command' : 'Listening'} />
                 </View>)}
               {listening && s.points.length > 0 && <View style={st.tsep} />}
               {s.points.length > 0 && (
                 <View style={st.playRow}>
                   <View style={st.playInfo}>
-                    <Wave active={playing} color={C.tx} height={16} />
-                    <Text style={[st.sub, { fontSize: 11 }]} numberOfLines={1}>{s.status === 'idle' ? 'Finished' : `Point ${Math.min(s.idx + 1, s.points.length)}/${s.points.length}`} · {s.rate.toFixed(1)}x</Text>
+                    <Wave active={playing} color={C.tx} height={20} />
+                    <Text style={[st.sub, { fontSize: 13 }]} numberOfLines={1}>{s.status === 'idle' ? 'Finished' : `Point ${Math.min(s.idx + 1, s.points.length)}/${s.points.length}`} · {s.rate.toFixed(1)}x</Text>
                   </View>
                   <View style={st.playBtns}>
                     <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.prev(); keepFocus(); }}><Icon n="prev" size={15} /></TouchableOpacity>
@@ -833,6 +849,7 @@ function Main() {
               </View>
             </View>)}
           <TextInput ref={inputRef} style={st.boxInput} value={input} onChangeText={setInput} multiline blurOnSubmit={false}
+            onPressIn={() => { if (!Keyboard.metrics()) { inputRef.current?.blur(); setTimeout(() => inputRef.current?.focus(), 60); } }}   // already focused but keyboard hidden: tap must bring it back
             placeholder="Ask anything · or: topic anemia, exact anemia, explain anemia" placeholderTextColor="#8A8A8A" />
           <View style={st.boxRow}>
             <TouchableOpacity style={st.boxPlus} onPress={() => { setShowSrc(true); }}><Icon n="plus" size={24} /></TouchableOpacity>
@@ -1231,6 +1248,14 @@ function Main() {
             </TouchableOpacity>
           </View>
 
+          <Text style={st.secT}>Topic speed</Text>
+          <View style={st.group}>
+            <View style={st.line}>
+              <View style={{ flex: 1 }}><Text style={st.txt}>Fast topics</Text><Text style={st.val}>{fastTopic ? 'On: topic starts reading at once from your source' : 'Off: AI rewrites the notes first (slow on the phone)'}</Text></View>
+              <Switch value={fastTopic} onValueChange={toggleFast} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+          </View>
+
           <Text style={st.secT}>Smart notes</Text>
           <View style={st.group}>
             <View style={st.line}>
@@ -1321,11 +1346,35 @@ function Wave({ active, mic, color, height = 28 }: { active: boolean; mic?: bool
   );
 }
 
+// Three dots that rise one after the other (shown while notes are being written)
+function Dots() {
+  const v = useRef([0, 1, 2].map(() => new Animated.Value(0))).current;
+  useEffect(() => {
+    const loops = v.map((x, i) => Animated.loop(Animated.sequence([
+      Animated.delay(i * 140),
+      Animated.timing(x, { toValue: 1, duration: 320, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+      Animated.timing(x, { toValue: 0, duration: 320, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+      Animated.delay((2 - i) * 140 + 200),
+    ])));
+    loops.forEach((l) => l.start());
+    return () => loops.forEach((l) => l.stop());
+  }, []);
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, height: 18, width: 30 }}>
+      {v.map((x, i) => (
+        <Animated.View key={i} style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.tx,
+          opacity: x.interpolate({ inputRange: [0, 1], outputRange: [0.3, 1] }),
+          transform: [{ translateY: x.interpolate({ inputRange: [0, 1], outputRange: [0, -6] }) }] }} />))}
+    </View>
+  );
+}
+
 // What the mic hears right now (updates while you speak); when you stop, the last heard command stays for a few seconds.
-function LiveText({ heard, status }: { heard: string; status: string }) {
+function LiveText({ heard, status, hide }: { heard: string; status: string; hide: (t: string) => boolean }) {
   const [live, setLive] = useState('');
   useEffect(() => subscribeLive(setLive), []);
-  const text = live || heard;
+  const raw = live || heard;
+  const text = raw && hide(raw) ? '' : raw;                           // the app's own voice picked up by the mic is not shown
   return (
     <View style={{ flex: 1, minWidth: 0 }}>
       <Text style={st.liveS} numberOfLines={1}>{status}</Text>
@@ -1426,13 +1475,13 @@ const st = StyleSheet.create({
   circle: { width: 42, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F1EFEA' },
 
   // the card on top of the input (same place as Claude's "Start interview" card)
-  tcard: { backgroundColor: '#F1EFEA', borderRadius: 16, paddingHorizontal: 11, paddingVertical: 6, marginBottom: 6 },
-  tsep: { height: 1, backgroundColor: '#E1DFD9', marginVertical: 5 },
-  liveRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  liveS: { fontSize: 10, color: C.sec },
-  liveT: { fontSize: 13, fontWeight: '600', color: C.tx },
+  tcard: { backgroundColor: '#F1EFEA', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 9, marginBottom: 7 },
+  tsep: { height: 1, backgroundColor: '#E1DFD9', marginVertical: 8 },
+  liveRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  liveS: { fontSize: 12, color: C.sec },
+  liveT: { fontSize: 15, fontWeight: '600', color: C.tx },
   playRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  playInfo: { flex: 1, minWidth: 0, gap: 2 },
+  playInfo: { flex: 1, minWidth: 0, gap: 3 },
   playBtns: { flexDirection: 'row', alignItems: 'center', gap: 4 },
   pBtn: { width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
   pBtnMain: { width: 34, height: 34, borderRadius: 17, backgroundColor: C.acc },
