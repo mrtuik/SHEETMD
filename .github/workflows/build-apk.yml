@@ -53,6 +53,14 @@ jobs:
             if [ "$code" != "200" ] && [ "$code" != "206" ]; then echo "::error::voice model link is broken: $u"; exit 1; fi
             if [ "$magic" != "BZh" ]; then echo "::error::not a tar.bz2 file: $u"; exit 1; fi
           done
+      - name: Verify the offline listening (STT) model links
+        run: |
+          base="https://huggingface.co/csukuangfanj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main"
+          for f in tokens.txt encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx decoder-epoch-99-avg-1-chunk-16-left-128.onnx joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx; do
+            code=$(curl -sIL -o /dev/null -w "%{http_code}" "$base/$f")
+            echo "$code $f"
+            if [ "$code" != "200" ]; then echo "::error::STT model file link is broken: $base/$f"; exit 1; fi
+          done
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - name: Cache npm downloads
@@ -96,6 +104,20 @@ jobs:
             echo "Verified $f size: $(wc -c < "$p") bytes"
           done
           rm -rf /tmp/sherpa_extracted /tmp/sherpa-android.tar.bz2
+      - name: Download sherpa-onnx Kotlin API for speech recognition (same version as the native libs)
+        env:
+          SHERPA_ONNX_VERSION: "v1.13.8"
+        run: |
+          D=modules/sheet-tts/android/src/main/java/com/k2fsa/sherpa/onnx
+          for f in OnlineRecognizer OnlineStream FeatureConfig HomophoneReplacerConfig; do
+            code=$(curl -sSL -w "%{http_code}" -o "$D/$f.kt" "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/${SHERPA_ONNX_VERSION}/sherpa-onnx/kotlin-api/$f.kt")
+            echo "$code $f.kt"
+            if [ "$code" != "200" ]; then
+              if [ "$f" = "HomophoneReplacerConfig" ]; then rm -f "$D/$f.kt"; continue; fi
+              echo "::error::Could not download $f.kt"; exit 1
+            fi
+          done
+          ls -la "$D"
       - run: npx expo prebuild --platform android --clean
       - name: Copy notification icons into Android resources
         run: |
