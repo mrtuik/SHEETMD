@@ -70,18 +70,27 @@ function Main() {
   const kbTop = useRef(0);
   const [kbPad, setKbPad] = useState(0);
   useEffect(() => {
-    // bottom padding = exactly how much of the screen the keyboard still covers, so the input box always sits right on top of it.
-    // Measured again after the window has settled: Android resizes the window a moment AFTER the keyboard event (one early
-    // measurement left the box under the keyboard, or floating too high).
-    let timers: any[] = [];
-    const measure = () => rootRef.current?.measureInWindow((_x, y, _w, h) => { if (kbOpen.current) setKbPad(Math.max(0, Math.round(y + h - kbTop.current))); });
-    const a = Keyboard.addListener('keyboardDidShow', (e) => {
-      kbOpen.current = true; kbTop.current = e.endCoordinates.screenY;
-      timers.forEach(clearTimeout);
-      measure(); timers = [setTimeout(measure, 120), setTimeout(measure, 350)];
-    });
-    const b = Keyboard.addListener('keyboardDidHide', () => { kbOpen.current = false; timers.forEach(clearTimeout); setKbPad(0); });
-    return () => { a.remove(); b.remove(); timers.forEach(clearTimeout); };
+    // bottom padding = how much of the screen the keyboard still covers, so the input box always sits right on top of it.
+    // measureInWindow() is relative to the window BELOW the status bar, while the keyboard position is in screen coordinates,
+    // so the status bar height is added (without it the bottom row of the box stayed under the keyboard).
+    // The keyboard is read with Keyboard.metrics() on every check (not from a flag), and re-checked while it is open,
+    // so a missed show / hide event can never leave the box hidden behind it.
+    const sb = Platform.OS === 'android' ? (StatusBar.currentHeight || 0) : 0;
+    let timer: any = null;
+    const measure = () => {
+      const m = Keyboard.metrics();
+      if (!m || !m.height) { kbOpen.current = false; setKbPad((p) => (p === 0 ? p : 0)); return; }
+      kbOpen.current = true; kbTop.current = m.screenY;
+      rootRef.current?.measureInWindow((_x, y, _w, h) => {
+        const pad = Math.max(0, Math.round(y + h + sb - kbTop.current));
+        setKbPad((p) => (Math.abs(p - pad) < 2 ? p : pad));
+      });
+    };
+    const start = () => { measure(); if (timer) clearInterval(timer); timer = setInterval(measure, 300); };
+    const stop = () => { if (timer) { clearInterval(timer); timer = null; } kbOpen.current = false; setKbPad(0); };
+    const a = Keyboard.addListener('keyboardDidShow', (e) => { kbOpen.current = true; kbTop.current = e.endCoordinates.screenY; start(); });
+    const b = Keyboard.addListener('keyboardDidHide', stop);
+    return () => { a.remove(); b.remove(); if (timer) clearInterval(timer); };
   }, []);
   const keepFocus = () => { if (kbOpen.current) setTimeout(() => inputRef.current?.focus(), 30); };        // buttons never take the keyboard away
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -786,23 +795,23 @@ function Main() {
             <View style={st.tcard}>
               {listening && (
                 <View style={st.liveRow}>
-                  <Wave mic active color={C.on} height={34} />
+                  <Wave mic active color={C.on} height={22} />
                   <LiveText heard={heard} status={asking ? 'Listening to your question · say okay when done' : awakeUI ? 'Listening… say your command' : 'Listening'} />
                 </View>)}
               {listening && s.points.length > 0 && <View style={st.tsep} />}
               {s.points.length > 0 && (
                 <View style={st.playRow}>
                   <View style={st.playInfo}>
-                    <Wave active={playing} color={C.tx} height={26} />
-                    <Text style={st.sub} numberOfLines={1}>{s.status === 'idle' ? 'Finished' : `Point ${Math.min(s.idx + 1, s.points.length)}/${s.points.length}`} · {s.rate.toFixed(1)}x</Text>
+                    <Wave active={playing} color={C.tx} height={16} />
+                    <Text style={[st.sub, { fontSize: 11 }]} numberOfLines={1}>{s.status === 'idle' ? 'Finished' : `Point ${Math.min(s.idx + 1, s.points.length)}/${s.points.length}`} · {s.rate.toFixed(1)}x</Text>
                   </View>
                   <View style={st.playBtns}>
-                    <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.prev(); keepFocus(); }}><Icon n="prev" size={20} /></TouchableOpacity>
+                    <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.prev(); keepFocus(); }}><Icon n="prev" size={15} /></TouchableOpacity>
                     <TouchableOpacity style={[st.pBtn, st.pBtnMain]} onPress={() => { follow.current = true; playing ? R.pause() : R.resume(); keepFocus(); }}>
-                      <Icon n={playing ? 'pause' : 'play'} size={20} color="#fff" />
+                      <Icon n={playing ? 'pause' : 'play'} size={15} color="#fff" />
                     </TouchableOpacity>
-                    <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.next(); keepFocus(); }}><Icon n="next" size={20} /></TouchableOpacity>
-                    <TouchableOpacity style={st.pBtn} onPress={() => { R.stop(); cancelGen(); choicesRef.current = null; setWorking(''); keepFocus(); }}><Icon n="close" size={18} /></TouchableOpacity>
+                    <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.next(); keepFocus(); }}><Icon n="next" size={15} /></TouchableOpacity>
+                    <TouchableOpacity style={st.pBtn} onPress={() => { cancelGen(); choicesRef.current = null; setWorking(''); resetReader(); keepFocus(); }}><Icon n="close" size={14} /></TouchableOpacity>
                   </View>
                 </View>)}
             </View>)}
@@ -1320,7 +1329,7 @@ function LiveText({ heard, status }: { heard: string; status: string }) {
   return (
     <View style={{ flex: 1, minWidth: 0 }}>
       <Text style={st.liveS} numberOfLines={1}>{status}</Text>
-      <Text style={[st.liveT, !text && { color: C.disI }]} numberOfLines={2}>{text ? `“${text}”` : 'Say a command…'}</Text>
+      <Text style={[st.liveT, !text && { color: C.disI }]} numberOfLines={1}>{text ? `“${text}”` : 'Say a command…'}</Text>
     </View>
   );
 }
@@ -1417,16 +1426,16 @@ const st = StyleSheet.create({
   circle: { width: 42, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F1EFEA' },
 
   // the card on top of the input (same place as Claude's "Start interview" card)
-  tcard: { backgroundColor: '#F1EFEA', borderRadius: 22, paddingHorizontal: 14, paddingVertical: 12, marginBottom: 8 },
-  tsep: { height: 1, backgroundColor: '#E1DFD9', marginVertical: 10 },
-  liveRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  liveS: { fontSize: 12, color: C.sec },
-  liveT: { fontSize: 16, fontWeight: '600', color: C.tx, marginTop: 1 },
-  playRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  playInfo: { flex: 1, minWidth: 0, gap: 4 },
-  playBtns: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  pBtn: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
-  pBtnMain: { width: 44, height: 44, borderRadius: 22, backgroundColor: C.acc },
+  tcard: { backgroundColor: '#F1EFEA', borderRadius: 16, paddingHorizontal: 11, paddingVertical: 6, marginBottom: 6 },
+  tsep: { height: 1, backgroundColor: '#E1DFD9', marginVertical: 5 },
+  liveRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  liveS: { fontSize: 10, color: C.sec },
+  liveT: { fontSize: 13, fontWeight: '600', color: C.tx },
+  playRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  playInfo: { flex: 1, minWidth: 0, gap: 2 },
+  playBtns: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  pBtn: { width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
+  pBtnMain: { width: 34, height: 34, borderRadius: 17, backgroundColor: C.acc },
   promoHead: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   promoT: { flex: 1, fontSize: 16, fontWeight: '700', color: C.tx },
   promoX: { width: 30, height: 30, alignItems: 'center', justifyContent: 'center' },
