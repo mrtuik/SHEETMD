@@ -55,8 +55,8 @@ jobs:
           done
       - name: Verify the offline listening (STT) model links
         run: |
-          base="https://huggingface.co/csukuangfanj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main"
-          for f in tokens.txt encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx decoder-epoch-99-avg-1-chunk-16-left-128.onnx joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx; do
+          base="https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main"
+          for f in tokens.txt encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx; do
             code=$(curl -sIL -o /dev/null -w "%{http_code}" "$base/$f")
             echo "$code $f"
             if [ "$code" != "200" ]; then echo "::error::STT model file link is broken: $base/$f"; exit 1; fi
