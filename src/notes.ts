@@ -1,4 +1,4 @@
-// Rule-based exam notes built from the markdown structure:
+// Rule-based exam notes built from the markdown structure (every point = short title + explanation, never the same words twice):
 // sub-headings -> points (Principle, Procedure...), tables -> spoken rows, bullets -> sentences.
 // Swap makeNotes() for an LLM later; the Point shape stays the same.
 import { stripMarkdown, splitSentences } from './cleaner';
@@ -92,12 +92,47 @@ function parse(body: string): { pre: string[]; secs: Sec[] } {
   return { pre, secs: secs.filter((s) => s.items.length) };
 }
 
-const label = (it: string) => {
-  const m = it.match(/^([^:]{2,40}):\s+\S/);
-  if (m) return m[1].trim();
-  const w = it.replace(/^[^A-Za-z\u0980-\u09FF0-9]+/, '').split(/\s+/).slice(0, 5).join(' ').replace(/[,;:.\-–—]+$/, '');
-  return w.length >= 3 ? w : 'Point';
-};
+// ---- clean "title + explanation" points ------------------------------------------------------------------------------
+// One place that makes sure a point never says the same word twice: the title is split from the body, and a body that
+// only repeats the title is dropped (or loses the repeated words). Used by the rule-based notes AND the LLM parser.
+const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const cap = (s: string) => s.replace(/^[^\p{L}\p{N}]+/u, '').replace(/^\p{L}/u, (c) => c.toUpperCase());
+const LINK = /^(?:is defined as|is called|is known as|refers to|means|is|are|was|were)\s+/i;
+const endS = (s: string) => (!s || /[.!?।]$/.test(s) ? s : s + '.');
+
+// "Protein is a macronutrient found in meat." -> { title: 'Protein', body: 'A macronutrient found in meat.' }
+// "Normal range: 12-16 g/dl"                -> { title: 'Normal range', body: '12-16 g/dl' }
+// no natural split -> no title (better than a title that is just the first words of the sentence)
+function splitLead(s: string): { title: string; body: string } {
+  const c = s.match(/^([^:]{2,40}):\s+(\S.*)$/);
+  if (c) return { title: c[1].trim(), body: c[2].trim() };
+  const d = s.match(/^(.{2,48}?)\s+(is defined as|is called|is known as|refers to|means|is|are)\s+(\S.*)$/i);
+  if (d) {
+    const subj = d[1].trim(), rest = d[3].trim();
+    const ok = subj.split(/\s+/).length <= 5 && !/[,;()]/.test(subj) && !/^(it|this|that|these|those|they|there|which|who)\b/i.test(subj)
+      && !/^(not|also|very|often|usually|always|never)\b/i.test(rest) && !/(ed|ing)$/i.test(rest.split(/\s+/)[0] || '');   // "Blood is collected in..." is passive: no split
+    if (ok) return { title: subj, body: cap(rest) };
+  }
+  return { title: '', body: s };
+}
+
+export function tidyPoint(title: string, body: string): { title: string; text: string } {
+  const clean = (x: string) => x.replace(/\*+/g, '').replace(/\s+/g, ' ').trim();
+  let t = clean(title).replace(/^\d+[.)]\s*/, '').replace(/[:：.\-–—]+$/, '').trim();
+  let b = clean(body);
+  if (!t && b) { const sp = splitLead(b); t = sp.title; b = sp.body; }
+  if (!t) return { title: '', text: endS(cap(b)) };
+  const nt = norm(t), nb = norm(b);
+  if (!nb || nb === nt) b = '';                                           // "protein" + "protein." -> just the title
+  else if (nb.startsWith(nt + ' ')) {                                     // the body begins by repeating the title: drop those words
+    const w = b.split(/\s+/), tw = t.split(/\s+/).length;
+    if (norm(w.slice(0, tw).join(' ')) === nt) {
+      const rest = w.slice(tw).join(' ').replace(/^[\s:,;\-–—]+/, '').replace(LINK, '').trim();
+      b = rest.length >= 3 ? cap(rest) : '';
+    }
+  }
+  return { title: t, text: endS(b) };
+}
 
 function groups(items: string[]): string[][] {
   const out: string[][] = [];
@@ -123,7 +158,7 @@ export function makeNotes(name: string, body: string): Point[] {
     const rest = pre.filter((_, i) => i !== di);
     const examples = rest.filter((s) => EX.test(s));
     if (di >= 0) pts.push({ title: 'Definition', text: endP(def) });
-    rest.filter((s) => !EX.test(s)).slice(0, 25).forEach((k) => pts.push({ title: label(k), text: endP(k) }));
+    rest.filter((s) => !EX.test(s)).slice(0, 25).forEach((k) => pts.push(tidyPoint('', k)));
     if (examples.length) pts.push({ title: 'Examples', text: examples.slice(0, 4).map(endP).join(' ') });
   } else {
     const hasDef = secs.some((s) => /^definition/i.test(s.title));
@@ -132,16 +167,16 @@ export function makeNotes(name: string, body: string): Point[] {
       const di = pre.slice(0, 3).findIndex((s) => isDef(s, nm));
       if (di >= 0) { def = unlabel(pre[di]); rest = pre.filter((_, i) => i !== di); pts.push({ title: 'Definition', text: endP(def) }); }
     }
-    groups(rest).forEach((g, k) => pts.push({ title: k ? `Overview, part ${k + 1}` : 'Overview', text: g.map(endP).join(' ') }));
+    groups(rest).forEach((g, k) => pts.push(tidyPoint(k ? `Overview, part ${k + 1}` : 'Overview', g.map(endP).join(' '))));
     for (const s of secs) {
-      groups(s.items).forEach((g, k) => pts.push({ title: k ? `${s.title}, part ${k + 1}` : s.title, text: g.map(endP).join(' ') }));
+      groups(s.items).forEach((g, k) => pts.push(tidyPoint(k ? `${s.title}, part ${k + 1}` : s.title, g.map(endP).join(' '))));
     }
   }
 
   if (pts.length > 40) pts.length = 40;
   if (pts.length >= 3) {
     const d = def ? splitSentences(def)[0] : '';
-    pts.push({ title: 'Quick summary', text: d ? `${nm}. ${endP(d)}` : `${nm}. Covered: ${pts.map((p) => p.title).join(', ')}.` });
+    pts.push({ title: 'Quick summary', text: d ? endP(d) : `${nm}. Covered: ${pts.map((p) => p.title).filter(Boolean).join(', ')}.` });
   }
   return pts.map((p, i) => ({ n: i + 1, ...p }));
 }
