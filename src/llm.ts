@@ -254,7 +254,7 @@ let active: Promise<any> | null = null;          // the native completion that i
 const cancelHooks = new Set<() => void>();
 export function cancelGen() { jobId++; try { ctx?.stopCompletion?.(); } catch {} cancelHooks.forEach((f) => f()); }   // waiting jobs return at once
 
-async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number): Promise<{ text: string; cancelled: boolean }> {
+async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number, onToken?: (t: string) => void): Promise<{ text: string; cancelled: boolean }> {
   if (job !== jobId) return { text: '', cancelled: true };
   let timer: any;
   let hook: (() => void) | null = null;
@@ -262,7 +262,7 @@ async function complete(c: any, job: number, messages: any[], nPredict: number, 
     const run = c.completion({
       messages, n_predict: nPredict, temperature, top_p: 0.9, penalty_repeat: 1.1,
       stop: ['<|im_end|>', '<|endoftext|>'],
-    });
+    }, onToken ? (d: any) => { if (job === jobId && d?.token) onToken(String(d.token)); } : undefined);   // tokens arrive while the model writes: the screen can show every finished line at once
     const tracked: Promise<any> = Promise.resolve(run).catch(() => {}).then(() => { if (active === tracked) active = null; });
     active = tracked;
     const out: any = await Promise.race([
@@ -292,8 +292,24 @@ function pieces(body: string, max: number): string[] {
   return out;
 }
 
+// Cuts the model's output into finished lines while it is still being written.
+function lineStream(onLine: (line: string) => void) {
+  let buf = '';
+  let tokens = 0;
+  return {
+    push(t: string) {
+      tokens++; buf += t;
+      let i: number;
+      while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (l.trim()) onLine(l); }
+    },
+    flush() { if (buf.trim()) onLine(buf); buf = ''; },
+    got: () => tokens,
+  };
+}
+
 // null pts = the model was not usable / gave nothing good -> caller uses the rule-based notes
-export async function llmNotes(name: string, body: string, marks: number, onProgress?: (i: number, n: number) => void): Promise<LlmResult> {
+// onPoint: every point is handed over the moment its line is finished (the screen shows it and the voice starts reading it).
+export async function llmNotes(name: string, body: string, marks: number, onProgress?: (i: number, n: number) => void, onPoint?: (p: Point) => void): Promise<LlmResult> {
   const c = await getCtx();
   if (!c) return { pts: null, notInSource: false };
   const job = ++jobId;
@@ -301,23 +317,37 @@ export async function llmNotes(name: string, body: string, marks: number, onProg
   const [lo0, hi0] = parts.length > 1 ? [4, 8] : range(marks);        // long topic: every piece gets its own points
   const kind = kindOf(name);
   const all: Omit<Point, 'n'>[] = [];
+  const seen = new Set<string>();
   let missing = 0;
   for (let i = 0; i < parts.length; i++) {
     onProgress?.(i + 1, parts.length);
     const src = parts[i];
+    // every finished line becomes a point at once (checked against the source like before, repeats dropped)
+    let taken = 0;
+    const take = (line: string) => {
+      if (taken >= hi0 || all.length >= 40) return;
+      for (const p of parseAnswer(line, src, hi0)) {
+        const k = (p.title + p.text).toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k); taken++;
+        all.push({ title: p.title, text: p.text });
+        onPoint?.({ n: all.length, title: p.title, text: p.text });
+      }
+    };
+    const ls = lineStream(take);
     const r = await complete(c, job, [
       { role: 'system', content: SYSTEM(lo0, hi0, kind) },
       { role: 'user', content: `Topic: ${name}\nMarks: ${marks}${parts.length > 1 ? `\nPart ${i + 1} of ${parts.length} of the source` : ''}\n\nSOURCE:\n${src}\n\nWrite the answer.` },
-    ], tokens(hi0), 0.1);
+    ], tokens(hi0), 0.1, onPoint ? (t) => ls.push(t) : undefined);
     if (r.cancelled) return { pts: null, notInSource: false, cancelled: true };
     if (!r.text) { missing++; continue; }
     if (/NOT_IN_SOURCE/.test(r.text)) { if (parts.length === 1) return { pts: null, notInSource: true }; continue; }
-    for (const p of parseAnswer(r.text, src, hi0)) all.push({ title: p.title, text: p.text });
+    if (onPoint) { if (ls.got()) ls.flush(); else r.text.split('\n').forEach((l) => { if (l.trim()) take(l); }); }   // last line (no newline after it) / a model build that gives no live tokens
+    else for (const p of parseAnswer(r.text, src, hi0)) { const k = (p.title + p.text).toLowerCase(); if (!seen.has(k)) { seen.add(k); all.push({ title: p.title, text: p.text }); } }
   }
-  if (missing) return { pts: null, notInSource: false };             // a piece failed: better the complete rule-based notes than notes with a hole
-  const seen = new Set<string>();
-  const pts = all.filter((p) => { const k = (p.title + p.text).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
-  return { pts: pts.length >= 2 ? pts.slice(0, 40).map((p, i) => ({ n: i + 1, ...p })) : null, notInSource: false };
+  // streaming: points were already shown and spoken, so a failed piece is skipped; without streaming a hole means "use the complete rule-based notes"
+  if (missing && !onPoint) return { pts: null, notInSource: false };
+  return { pts: all.length >= 2 ? all.slice(0, 40).map((p, i) => ({ n: i + 1, ...p })) : null, notInSource: false };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -377,7 +407,7 @@ function parseSection(text: string, seen: Set<string>): { bullets: string[]; hin
   return { bullets, hint };
 }
 
-export async function llmExplain(name: string, marks: number, ref = '', onProgress?: (i: number, n: number, title: string) => void): Promise<LlmResult> {
+export async function llmExplain(name: string, marks: number, ref = '', onProgress?: (i: number, n: number, title: string) => void, onPoint?: (p: Point) => void): Promise<LlmResult> {
   const c = await getCtx();
   if (!c) return { pts: null, notInSource: false };
   const job = ++jobId;
@@ -403,7 +433,9 @@ export async function llmExplain(name: string, marks: number, ref = '', onProgre
     }
     if (got.bullets.length < 2) continue;                                 // section skipped / not usable
     got.bullets.forEach((b) => seen.add(b.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()));
-    pts.push({ n: pts.length + 1, title: sec, text: got.bullets.join(' '), bullets: got.bullets, hint: got.hint || undefined });
+    const pt: Point = { n: pts.length + 1, title: sec, text: got.bullets.join(' '), bullets: got.bullets, hint: got.hint || undefined };
+    pts.push(pt);
+    onPoint?.(pt);                                                        // this section is shown and read while the next one is written
   }
   return { pts: pts.length >= 2 ? pts : null, notInSource: false };
 }
@@ -422,18 +454,32 @@ Only the points the question needs - no fixed template, no "Classification" unle
 export type Basis = 'source' | 'mixed' | 'own';
 export type AnswerResult = { pts: Point[] | null; basis: Basis; cancelled?: boolean };
 
-export async function llmAnswer(question: string, chunks: { name: string; body: string }[]): Promise<AnswerResult> {
+export async function llmAnswer(question: string, chunks: { name: string; body: string }[], onPoint?: (p: Point) => void): Promise<AnswerResult> {
   const c = await getCtx();
   if (!c) return { pts: null, basis: 'own' };
   const job = ++jobId;
   const per = llm.model === 'q05' ? 900 : 1500;
   const src = chunks.map((x, i) => `[${i + 1}] ${x.name}\n${x.body.slice(0, per)}`).join('\n\n').slice(0, MAXSRC());
+  let shown = 0;
+  const seenA = new Set<string>();
+  const takeA = (line: string) => {
+    if (shown >= 10) return;
+    for (const p of parseAnswer(line, '', 10, false)) {
+      const k = (p.title + p.text).toLowerCase();
+      if (seenA.has(k)) continue;
+      seenA.add(k); shown++;
+      onPoint?.({ n: shown, title: p.title, text: p.text });
+    }
+  };
+  const lsA = lineStream(takeA);
   const r = await complete(c, job, [
     { role: 'system', content: ANSWER_SYS },
     { role: 'user', content: `QUESTION: ${question}\n\nSOURCE:\n${src || '(nothing found in the sources)'}\n\nWrite the answer.` },
-  ], 420, 0.2);
+  ], 420, 0.2, onPoint ? (t) => lsA.push(t) : undefined);
   if (r.cancelled) return { pts: null, basis: 'own', cancelled: true };
-  const pts = parseAnswer(r.text, '', 10, false);
+  if (onPoint) { if (lsA.got()) lsA.flush(); else r.text.split('\n').forEach((l) => { if (l.trim()) takeA(l); }); }
+  const seenF = new Set<string>();
+  const pts = parseAnswer(r.text, '', 10, false).filter((p) => { const k = (p.title + p.text).toLowerCase(); if (seenF.has(k)) return false; seenF.add(k); return true; }).map((p, i) => ({ ...p, n: i + 1 }));
   if (pts.length < 2) return { pts: null, basis: 'own' };
   // how much of the answer is really supported by the source excerpts (checked in code, not trusted from the model)
   const srcN = flat(src);
