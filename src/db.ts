@@ -16,6 +16,7 @@ function openDb(): Promise<DB> {
       const d = await SQLite.openDatabaseAsync('sheetmd.db');
       await d.execAsync(`
         PRAGMA journal_mode=WAL;
+        PRAGMA busy_timeout=8000;
         CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY, name TEXT, type TEXT, status TEXT, info TEXT);
         CREATE TABLE IF NOT EXISTS topics(id INTEGER PRIMARY KEY, source_id INTEGER, name TEXT, body TEXT);
         CREATE TABLE IF NOT EXISTS notes(topic_id INTEGER PRIMARY KEY, points_json TEXT, created_at INTEGER);
