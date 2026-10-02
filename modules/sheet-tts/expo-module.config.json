@@ -1,6 +1,6 @@
 {
   "platforms": ["android"],
   "android": {
-    "modules": ["expo.modules.sheettts.SheetTtsModule"]
+    "modules": ["expo.modules.sheettts.SheetTtsModule", "expo.modules.sheettts.SheetSttModule"]
   }
 }
