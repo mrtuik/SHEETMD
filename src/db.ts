@@ -237,6 +237,7 @@ async function findTopicIn(d: DB, q: string, chatId: number, exact: boolean): Pr
   const allHave = (para: string) => { const w = words(norm(para)); return stems.every((st) => w.some((x) => x.startsWith(st))); };
   type Piece = { name: string; text: string; score: number };
   const pieces: Piece[] = [];
+  const asked = ex.map((t) => t.charAt(0).toUpperCase() + t.slice(1)).join(' ');                // what you asked for, as a title
   for (const c of cands) {
     await new Promise((r) => setTimeout(r, 0));                 // let the screen / mic breathe between heavy steps
     const one = await d.getFirstAsync<{ name: string; body: string }>('SELECT name, body FROM topics WHERE id=?', [c.topic_id]);
@@ -245,7 +246,10 @@ async function findTopicIn(d: DB, q: string, chatId: number, exact: boolean): Pr
     if (part && (covers(toks, part.name) || covers(ex, part.name))) {
       const body = stripQuestions(part.body);
       if (body.length >= 20 && !isQuestionBody(body)) {
-        const nm = isJunkHeading(part.name) ? one.name : GENERIC.has(part.name.toLowerCase()) ? `${one.name} - ${part.name}` : part.name;
+        // a sentence-like (junk) heading falls back to the chunk's own name ONLY when that name is about the topic;
+        // otherwise the card used to carry an unrelated name (asking "meningitis" showed "Lymphocyte")
+        const own = covers(toks, one.name) || covers(ex, one.name);
+        const nm = isJunkHeading(part.name) ? (own ? one.name : asked) : GENERIC.has(part.name.toLowerCase()) ? (own ? `${one.name} - ${part.name}` : `${asked} - ${part.name}`) : part.name;
         pieces.push({ name: nm, text: body, score: 100 + Math.min(body.length, 3000) / 100 });
         continue;
       }
