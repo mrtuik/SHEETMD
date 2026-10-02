@@ -3,6 +3,7 @@
 export const ICONS = {
   menu: require('../assets/icons/ic_tuik_menu.png'),
   settings: require('../assets/icons/ic_tuik_settings.png'),
+  models: require('../assets/icons/ic_tuik_models.png'),
   close: require('../assets/icons/ic_tuik_close.png'),
   plus: require('../assets/icons/ic_tuik_plus.png'),
   minus: require('../assets/icons/ic_tuik_minus.png'),
