@@ -26,7 +26,6 @@ import { startListening, stopListening, restartListening, markHandled, subscribe
 import { updateService, stopService, onServiceAction, batteryUnrestricted, askBatteryUnrestricted } from './src/service';
 import { splitWake } from './src/wake';
 import { Stt, sttState, subscribeStt, initStt, downloadStt, deleteStt, setSttGoogle, setSttAec, setSttGain } from './src/stt';
-import LottieView from 'lottie-react-native';
 import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
@@ -38,7 +37,7 @@ type Msg = { id: number; who: 'you' | 'app'; text: string };
 const TOPIC = '\u2063T\u2063';                  // hidden marker: this reply is a topic card
 const CHOICE = '\u2063C\u2063';                 // hidden marker: this reply is the "did you mean" list (top 3 topics)
 
-const C = { bg: '#FFFFFF', surf: '#F6F6F5', bd: '#E4E4E2', tx: '#0A0A0A', sec: '#737373', acc: '#0A0A0A', on: '#4338ca', ok: '#16a34a', bad: '#dc2626', dis: '#EDEDEB', disI: '#A3A3A3' };
+const C = { bg: '#FFFFFF', surf: '#F6F6F5', bd: '#E4E4E2', tx: '#0A0A0A', sec: '#737373', acc: '#0A0A0A', on: '#0A0A0A', ok: '#16a34a', bad: '#dc2626', dis: '#EDEDEB', disI: '#A3A3A3' };
 const LANG_LABEL = { auto: 'Auto', en: 'English', bn: 'Bangla' } as const;
 const COMMANDS: [string, string][] = [
   ['topic <name>', 'Read that topic from your sources, point by point'],
@@ -851,7 +850,7 @@ function Main() {
         <View style={st.hSide}>
           <TouchableOpacity style={st.hBtn} onPress={() => { refreshChats(); setShowMenu(true); }}><Icon n="menu" size={24} /></TouchableOpacity>
         </View>
-        <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
+        <View style={st.brand}><Text style={st.title}>Sheet.md</Text></View>
         <View style={[st.hSide, { justifyContent: 'flex-end' }]}>
           <TouchableOpacity style={st.hBtn} onPress={() => setShowModels(true)}><Icon n="models" size={24} /></TouchableOpacity>
           <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
@@ -867,9 +866,9 @@ function Main() {
           </TouchableOpacity>) : null}
         {msgs.map(renderMsg)}
         {(working || indexing) ? (
-          <View style={st.statusCol}>
-            {/* mounted only while something is being written: when it finishes this View disappears, the animation unmounts and stops using CPU */}
-            <LottieView source={require('./assets/animations/writing_animation.json')} autoPlay loop resizeMode="contain" style={st.writeAnim} />
+          <View style={st.statusRow}>
+            {/* tiny pulsing dot, left-aligned right where the reply text will start (like ChatGPT / Claude); mounted only while working, so it stops when the reply is done */}
+            <PulseDot />
             <Text style={st.statusT}>{working || 'Indexing…'}</Text>
           </View>) : null}
       </ScrollView>
@@ -1526,6 +1525,20 @@ function Wave({ active, mic, color, height = 28 }: { active: boolean; mic?: bool
   );
 }
 
+// One small dot that gently breathes - shown at the start of the reply while it is being written
+function PulseDot() {
+  const v = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(v, { toValue: 1, duration: 650, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      Animated.timing(v, { toValue: 0, duration: 650, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, []);
+  return <Animated.View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: C.tx, opacity: v.interpolate({ inputRange: [0, 1], outputRange: [0.35, 1] }), transform: [{ scale: v.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1.15] }) }] }} />;
+}
+
 // Three dots that rise one after the other (shown while notes are being written)
 function Dots() {
   const v = useRef([0, 1, 2].map(() => new Animated.Value(0))).current;
@@ -1617,7 +1630,7 @@ const st = StyleSheet.create({
   hBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
   hSide: { width: 84, flexDirection: 'row', alignItems: 'center' },
   title: { fontSize: 18, fontWeight: '600', color: C.tx },
-  brand: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  brand: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   logo: { width: 34, height: 24 },
   sub: { color: C.sec, fontSize: 12 },
   txt: { color: C.tx, fontSize: 15 },
@@ -1625,9 +1638,8 @@ const st = StyleSheet.create({
   reply: { color: C.tx, fontSize: 14, lineHeight: 20, alignSelf: 'flex-start', maxWidth: '92%', paddingHorizontal: 2 },
   you: { backgroundColor: C.acc, alignSelf: 'flex-end', borderRadius: 18, borderBottomRightRadius: 6, paddingHorizontal: 14, paddingVertical: 9, maxWidth: '80%' },
   status: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6, paddingHorizontal: 2 },
-  statusT: { color: C.sec, fontSize: 14, textAlign: 'center' },
-  statusCol: { alignItems: 'center', gap: 2, paddingVertical: 8, paddingHorizontal: 2 },
-  writeAnim: { width: 120, height: 120 },
+  statusT: { color: C.sec, fontSize: 14 },
+  statusRow: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 8, paddingVertical: 4, paddingHorizontal: 2 },
   empty: { borderWidth: 1, borderColor: C.bd, borderRadius: 14, padding: 18, alignItems: 'center', marginTop: 40, flexDirection: 'row', justifyContent: 'center', gap: 8 },
   emptyT: { color: C.tx, fontSize: 16 },
 
