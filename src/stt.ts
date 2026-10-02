@@ -22,6 +22,12 @@ export const sttState = { downloaded: false, ready: false, downloading: false, p
 const subs = new Set<() => void>();
 export const subscribeStt = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
 const emit = () => subs.forEach((f) => f());
+let lastProg = 0;
+const emitProgress = () => { const n = Date.now(); if (n - lastProg < 400) return; lastProg = n; emit(); };   // the whole app re-renders on emit: do not do it 100x a second
+
+// Crash guard: a native abort in sherpa-onnx cannot be caught in JS. We write a marker before the risky step and clear it after.
+// If the app dies in between, the marker is still there on the next launch, so we know where it died and skip that step (no crash loop).
+const setStage = (v: string) => setMeta('stt_stage', v).catch(() => {});
 
 async function haveAll(): Promise<boolean> {
   for (const f of STT_FILES) {
@@ -37,10 +43,25 @@ export async function initStt(): Promise<boolean> {
     sttState.aec = (await getMeta('stt_aec')) !== '0';
     const g = Number(await getMeta('stt_gain')); if (g >= 1 && g <= 12) sttState.gain = g;
   } catch {}
+  try {
+    const stage = await getMeta('stt_stage');
+    if (stage === 'init') {
+      await setStage('');
+      sttState.error = 'The app closed while loading the offline model last time, so loading is paused. Delete the model and download again, or keep Google speech on.';
+      sttState.downloaded = await haveAll(); sttState.ready = false; emit();
+      return false;
+    }
+    if (stage === 'download') {
+      await setStage('');
+      sttState.error = 'The app closed while downloading last time. Tap Download to try again.';
+    }
+  } catch {}
   sttState.downloaded = await haveAll();
   if (!Stt || !sttState.downloaded) { emit(); return false; }
   if (sttState.ready || Stt.isReady()) { sttState.ready = true; emit(); return true; }
+  await setStage('init');
   try { sttState.ready = !!(await Stt.init(np(DIR()), 2)); } catch { sttState.ready = false; }
+  await setStage('');
   if (!sttState.ready) sttState.error = 'Model could not be loaded';
   emit();
   return sttState.ready;
@@ -49,6 +70,7 @@ export async function initStt(): Promise<boolean> {
 export async function downloadStt(): Promise<boolean> {
   if (sttState.downloading) return false;
   sttState.downloading = true; sttState.error = ''; sttState.progress = 0; emit();
+  await setStage('download');
   try {
     await FS.makeDirectoryAsync(DIR(), { intermediates: true }).catch(() => {});
     const total = STT_FILES.reduce((a, f) => a + f.mb, 0) || 1;
@@ -62,7 +84,7 @@ export async function downloadStt(): Promise<boolean> {
       await FS.deleteAsync(part, { idempotent: true }).catch(() => {});
       const dl = FS.createDownloadResumable(HF + f.name, part, {}, (p) => {
         const frac = p.totalBytesExpectedToWrite ? p.totalBytesWritten / p.totalBytesExpectedToWrite : 0;
-        sttState.progress = Math.min(0.99, (done + f.mb * frac) / total); emit();
+        sttState.progress = Math.min(0.99, (done + f.mb * frac) / total); emitProgress();
       });
       const r: any = await dl.downloadAsync();
       if (!r || (r.status && r.status >= 400)) throw new Error('Download failed (' + (r?.status ?? '?') + ')');
@@ -74,11 +96,11 @@ export async function downloadStt(): Promise<boolean> {
       await FS.moveAsync({ from: part, to: dest });
       done += f.mb;
     }
-    sttState.progress = 1; sttState.downloading = false; emit();
+    sttState.progress = 1; sttState.downloading = false; await setStage(''); emit();
     await new Promise((r) => setTimeout(r, 300));   // let the UI settle before the heavy native model load
     return await initStt();
   } catch (e: any) {
-    sttState.downloading = false; sttState.error = String(e?.message || e || 'Download failed'); emit();
+    sttState.downloading = false; await setStage(''); sttState.error = String(e?.message || e || 'Download failed'); emit();
     return false;
   }
 }
