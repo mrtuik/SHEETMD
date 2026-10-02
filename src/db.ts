@@ -29,6 +29,7 @@ function openDb(): Promise<DB> {
       `);
       // each chat owns its sources (old databases get the column added; old sources are adopted by adoptOldSources)
       try { await d.execAsync('ALTER TABLE sources ADD COLUMN chat_id INTEGER'); } catch {}
+      try { await d.execAsync('ALTER TABLE msgs ADD COLUMN data TEXT'); } catch {}                       // a topic reply keeps its full points here (never hidden, survives restart)
       try { await d.execAsync('ALTER TABLE topics ADD COLUMN pri INTEGER DEFAULT 1'); } catch {}      // 0 = numbered main topic ("1. Define ...")
       await d.execAsync('CREATE INDEX IF NOT EXISTS src_chat ON sources(chat_id)');
       // Typo-tolerant index (FTS5 trigram tokenizer, built into SQLite on the phone - nothing to download).
@@ -359,13 +360,16 @@ export const deleteChat = (id: number) => run(async (d) => {
 export const renameChat = (id: number, title: string) =>
   run((d) => d.runAsync('UPDATE chats SET title=? WHERE id=?', [title.trim().slice(0, 60) || 'New chat', id]));
 export const loadMsgs = (chatId: number) =>
-  run((d) => d.getAllAsync<{ id: number; who: 'you' | 'app'; text: string }>('SELECT id,who,text FROM msgs WHERE chat_id=? ORDER BY id', [chatId]));
-export const addMsg = (chatId: number, who: 'you' | 'app', text: string) => run(async (d) => {
-  await d.runAsync('INSERT INTO msgs(chat_id,who,text) VALUES(?,?,?)', [chatId, who, text]);
+  run((d) => d.getAllAsync<{ id: number; who: 'you' | 'app'; text: string; data: string | null }>('SELECT id,who,text,data FROM msgs WHERE chat_id=? ORDER BY id', [chatId]));
+export const setMsgData = (id: number, data: string) => run((d) => d.runAsync('UPDATE msgs SET data=? WHERE id=?', [data, id]));
+// returns the database id of the new message (so a topic reply can be saved into it later)
+export const addMsg = (chatId: number, who: 'you' | 'app', text: string) => run(async (d): Promise<number> => {
+  const ins = await d.runAsync('INSERT INTO msgs(chat_id,who,text) VALUES(?,?,?)', [chatId, who, text]);
   const first = await d.getFirstAsync<{ title: string }>('SELECT title FROM chats WHERE id=?', [chatId]);
   if (first?.title === 'New chat' && who === 'you') {
     await d.runAsync('UPDATE chats SET title=?, updated_at=? WHERE id=?', [text.trim().slice(0, 40) || 'New chat', Date.now(), chatId]);
   } else await d.runAsync('UPDATE chats SET updated_at=? WHERE id=?', [Date.now(), chatId]);
+  return Number(ins.lastInsertRowId);
 });
 
 // Small key/value settings (e.g. the chosen voice)
