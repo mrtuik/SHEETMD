@@ -24,6 +24,11 @@ let spoken = '';
 let resumeAt = 0;
 let release: (() => void) | null = null;
 export const getSpoken = () => spoken;
+// true while the app says its own intro ("Topic X. 6 points."): the mic hears that and must not take it as a new command
+let inIntro = false;
+let introText = '';
+let introGrace = 0;                                  // the recogniser delivers the echo a little late: keep ignoring for 2.5 s
+export const introActive = () => (inIntro || Date.now() < introGrace ? introText : '');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // chunk 0 = "Point 2. Principle." ; chunk 1.. = the sentences (the screen highlights the same chunks)
@@ -51,6 +56,7 @@ export function lineOf(p: Point, chunk: number): number {
 
 let sayId = 0;
 function halt() {
+  inIntro = false; introGrace = 0; introText = '';
   sayId++;
   stopSpeak();
   const r = release; release = null;
@@ -116,7 +122,11 @@ async function run(from: number, intro?: string, chunk = 0) {
   const my = ++token;
   halt();
   state.idx = from; state.chunk = chunk; state.status = 'reading'; emit();
-  if (intro) { await say(speechChunks(intro)); if (my !== token) return; }
+  if (intro) {
+    inIntro = true; introText = intro;
+    try { await say(speechChunks(intro)); } finally { if (my === token) { inIntro = false; introGrace = Date.now() + 2500; } }
+    if (my !== token) return;
+  }
   let start = chunk;
   while (my === token && state.idx < state.points.length) {
     const p = state.points[state.idx];
