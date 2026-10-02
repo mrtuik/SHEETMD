@@ -151,7 +151,7 @@ export async function pickAndImport(onChange: () => void, chatId: number): Promi
       if (!topics.length) { await updateSource(id, 'failed', 'no readable text found'); done.push(`${a.name}: no readable text`); }
       else {
         await say('saving topics');
-        for (let i = 0; i < topics.length; i += 40) await addTopics(id, topics.slice(i, i + 40));
+        for (let i = 0; i < topics.length; i += 20) { await addTopics(id, topics.slice(i, i + 20)); await new Promise((r) => setTimeout(r, 0)); }   // small chunks + a breath between them: search / mic stay responsive while a big file is saved
         await updateSource(id, 'ready', `${topics.length} topics${info ? ' · ' + info : ''}`);
         done.push(`${a.name}: ${topics.length} topics`);
       }
