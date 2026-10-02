@@ -27,7 +27,7 @@ const emitProgress = () => { const n = Date.now(); if (n - lastProg < 400) retur
 
 // Crash guard: a native abort in sherpa-onnx cannot be caught in JS. We write a marker before the risky step and clear it after.
 // If the app dies in between, the marker is still there on the next launch, so we know where it died and skip that step (no crash loop).
-const setStage = (v: string) => setMeta('stt_stage', v).catch(() => {});
+const setStage = (v: string) => setMeta('stt_stage2', v).catch(() => {});
 
 async function haveAll(): Promise<boolean> {
   for (const f of STT_FILES) {
@@ -44,7 +44,7 @@ export async function initStt(): Promise<boolean> {
     const g = Number(await getMeta('stt_gain')); if (g >= 1 && g <= 12) sttState.gain = g;
   } catch {}
   try {
-    const stage = await getMeta('stt_stage');
+    const stage = await getMeta('stt_stage2');
     if (stage === 'init') {
       await setStage('');
       sttState.error = 'The app closed while loading the offline model last time, so loading is paused. Delete the model and download again, or keep Google speech on.';
