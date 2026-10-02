@@ -1,14 +1,15 @@
 import { speak, stopSpeak } from './tts';
 import { cleanForSpeech, speechChunks } from './cleaner';
-import { saveSession } from './db';
+import { saveSession, getMeta, setMeta } from './db';
 import type { Point } from './notes';
 
 export type RState = {
   topicId: number; topic: string; points: Point[]; idx: number; chunk: number;
   status: 'idle' | 'reading' | 'paused'; rate: number; pauseSec: number; lang: 'auto' | 'en' | 'bn';
   voiceEn: string; voiceBn: string;      // voice identifiers ('' = phone default)
+  repeatOn: boolean; repeatN: number;    // say every line of a point 2-3 times (like a teacher)
 };
-export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto', voiceEn: '', voiceBn: '' };
+export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto', voiceEn: '', voiceBn: '', repeatOn: true, repeatN: 2 };
 
 const subs = new Set<() => void>();
 export const subscribe = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
@@ -59,9 +60,15 @@ function say(parts: string[], from = 0, track = false): Promise<void> {
     if (!todo.length) { res(); return; }
     const rate = slow ? state.rate * 0.9 : state.rate;
     slow = false;
-    let left = todo.length;
-    release = () => res();
+    // every spoken line of a point is queued N times when "Repeat lines" is on (the heading line "Point 2. ..." is said once)
+    const items: { text: string; k: number }[] = [];
     todo.forEach((text, k) => {
+      const times = track && state.repeatOn && from + k > 0 ? Math.max(1, state.repeatN) : 1;
+      for (let r = 0; r < times; r++) items.push({ text, k });
+    });
+    let left = items.length;
+    release = () => res();
+    items.forEach(({ text, k }) => {
       let done = false;
       const fin = () => { if (done) return; done = true; if (--left <= 0) { release = null; res(); } };
       const bn = state.lang === 'bn' || (state.lang === 'auto' && /[\u0980-\u09FF]/.test(text));
@@ -101,7 +108,7 @@ export function startTopic(id: number, name: string, points: Point[], intro?: st
   run(0, intro ?? `Topic ${name}. ${points.length} points.`);
 }
 export function restore(id: number, name: string, points: Point[], n: number, rate: number) {
-  Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), chunk: 0, rate, status: 'paused' });
+  Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), chunk: 0, status: 'paused' });   // speed = the saved setting, not the old session's
   resumeAt = 0;
   emit();
 }
@@ -140,13 +147,29 @@ export function repeat(arg?: string) {
 }
 let rateT: any = null;
 export function setRate(d: number) {
-  state.rate = Math.min(1.5, Math.max(0.3, +(state.rate + d).toFixed(1))); emit();
+  state.rate = Math.min(1.5, Math.max(0.3, +(state.rate + d).toFixed(1))); emit(); keep('rate', state.rate);
   // apply NOW: re-start the sentence being read with the new speed (taps are batched, so +,+,+ restarts once)
   if (state.status === 'reading') {
     clearTimeout(rateT);
     rateT = setTimeout(() => { if (state.status === 'reading') { const c = state.chunk; resumeAt = 0; run(state.idx, undefined, c); } }, 500);
   }
 }
-export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); }
-export function setLang(l: RState['lang']) { state.lang = l; emit(); }
+export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); keep('pause', state.pauseSec); }
+export function setLang(l: RState['lang']) { state.lang = l; emit(); keep('lang', l); }
 export function setVoice(lang: 'en' | 'bn', id: string) { if (lang === 'bn') state.voiceBn = id; else state.voiceEn = id; emit(); }
+
+// ---- settings that stay the same in every chat and after the app is closed ----
+const keep = (k: string, v: string | number | boolean) => { setMeta('set_' + k, String(v)).catch(() => {}); };
+export function setRepeat(on: boolean) { state.repeatOn = on; emit(); keep('repeat', on ? '1' : '0'); }
+export function setRepeatN(d: number) { state.repeatN = Math.min(3, Math.max(2, state.repeatN + d)); emit(); keep('repeatn', state.repeatN); }
+export async function loadSettings() {
+  try {
+    const g = (k: string) => getMeta('set_' + k).catch(() => '');
+    const rate = parseFloat(await g('rate')); if (!isNaN(rate)) state.rate = Math.min(1.5, Math.max(0.3, rate));
+    const pz = parseInt(await g('pause'), 10); if (!isNaN(pz)) state.pauseSec = Math.min(10, Math.max(0, pz));
+    const lg = await g('lang'); if (lg === 'auto' || lg === 'en' || lg === 'bn') state.lang = lg;
+    const ro = await g('repeat'); if (ro) state.repeatOn = ro === '1';
+    const rn = parseInt(await g('repeatn'), 10); if (!isNaN(rn)) state.repeatN = Math.min(3, Math.max(2, rn));
+  } catch {}
+  emit();
+}
