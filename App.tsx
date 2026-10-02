@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Modal, StyleSheet, ScrollView, Pressable, Switch,
   Platform, PermissionsAndroid, AppState, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
-  Animated, Easing, ActivityIndicator,
+  Animated, Easing, ActivityIndicator, ToastAndroid,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
@@ -17,7 +17,8 @@ import {
   findTopic, findExact, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
   listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
 } from './src/db';
-import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis } from './src/llm';
+import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis,
+  searchWithGoogle, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
@@ -25,6 +26,7 @@ import { startListening, stopListening, restartListening, markHandled, subscribe
 import { updateService, stopService, onServiceAction, batteryUnrestricted, askBatteryUnrestricted } from './src/service';
 import { splitWake } from './src/wake';
 import { Stt, sttState, subscribeStt, initStt, downloadStt, deleteStt, setSttGoogle, setSttAec, setSttGain } from './src/stt';
+import LottieView from 'lottie-react-native';
 import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
@@ -42,6 +44,8 @@ const COMMANDS: [string, string][] = [
   ['topic <name>', 'Read that topic from your sources, point by point'],
   ['exact <name>', 'Read that topic word for word from its heading to the next heading (fast, no AI)'],
   ['explain <name>', 'Explain it from my own knowledge + web (not your sources)'],
+  ['search <topic>  /  search short <topic>', 'Live Google search (Gemini, needs internet + a key in Models): a short answer'],
+  ['search long <topic>  /  search long <topic> 5 marks', 'The same search written as a full exam answer (sections, numbered lab steps), read point by point'],
   ['question ... okay', 'Say "question", then your full question, then "okay": I think, use your sources, add my own knowledge'],
   ['pause  /  continue', 'Hold, or carry on from the same sentence'],
   ['next  /  previous', 'Jump to the next or earlier point'],
@@ -100,6 +104,12 @@ function Main() {
   const [busy, setBusy] = useState(false);
   const [showSrc, setShowSrc] = useState(false);
   const [showSet, setShowSet] = useState(false);
+  const [showModels, setShowModels] = useState(false);
+  const [hasKey, setHasKey] = useState(false);           // a Gemini key is saved (or built in)
+  const [gemModel, setGemModel] = useState<GeminiModelId>(gem.model);
+  const [keyDraft, setKeyDraft] = useState('');
+  const [keyShown, setKeyShown] = useState(false);
+  const modelsScroll = useRef<ScrollView>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [chats, setChats] = useState<Chat[]>([]);
   const [chatId, setChatId] = useState(0);
@@ -191,6 +201,7 @@ function Main() {
       await R.loadSettings();                         // speed, pause, language, repeat lines, sound boost: same in every chat
       const prompted = await getMeta('tts_prompted').catch(() => '');
       if (prompted !== '1') setShowTtsPrompt(true);
+      await loadGemini(); setHasKey(hasGeminiKey()); setGemModel(gem.model);
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
       setFastTopic((await getMeta('fast_topic').catch(() => '1')) !== '0');
       try {                                           // clearest installed voice, unless one was chosen before
@@ -231,7 +242,7 @@ function Main() {
     setChoiceNames(names);
     choicesRef.current = names; choiceMarks.current = marks; choiceExact.current = exactMode; rowY.current = {};
     push('app', CHOICE + JSON.stringify(names));
-    const line = 'Did you mean: ' + names.map((n) => n.replace(/\s*\(.*?\)\s*/g, ' ').trim()).join(', or ') + '?';   // no number words spoken: the mic cannot mistake the app's own voice for your "one / two / three", so you may answer at any moment
+    const line = 'Did you mean: ' + names.map((n) => n.replace(/\s*\(.*?\)\s*/g, ' ').trim().split(/\s+/).slice(0, 6).join(' ')).join(', or ') + '?';   // only the first words of each option: long titles made this line 20 s long   // no number words spoken: the mic cannot mistake the app's own voice for your "one / two / three", so you may answer at any moment
     try { R.stop(); } catch {}
     choiceSpeaking.current = true;                                   // the mic must not hear this as an answer
     const done = () => setTimeout(() => { choiceSpeaking.current = false; restartListening(100); }, 200);   // then a fresh mic: it must not carry the app's own voice into your answer
@@ -346,7 +357,7 @@ function Main() {
         pts = r.pts;
       }
       if (!pts && web) { pts = makeNotes(web.title, web.text); label = 'From the web (Wikipedia). The smart model is not ready yet'; }
-      if (!pts) { push('app', 'I cannot explain this now: no internet, and the smart model is not downloaded (Settings > Smart notes).'); return; }
+      if (!pts) { push('app', 'I cannot explain this now: no internet, and the smart model is not downloaded (Models).'); return; }
       rowY.current = {}; cardY.current = null;
       push('app', label);
       const nm = 'Explain: ' + name;
@@ -382,13 +393,58 @@ function Main() {
         const w = await wikiLookup(q).catch(() => null);
         if (w) { pts = makeNotes(w.title, w.text); label = 'Nothing in your sources. From the web (Wikipedia)'; }
       }
-      if (!pts) { push('app', 'I could not answer: nothing in your sources, and the smart model is not downloaded (Settings > Smart notes).'); return; }
+      if (!pts) { push('app', 'I could not answer: nothing in your sources, and the smart model is not downloaded (Models).'); return; }
       rowY.current = {}; cardY.current = null;
       push('app', label);
       const nm = 'Answer: ' + (q.length > 60 ? q.slice(0, 57) + '...' : q);
       push('app', TOPIC + nm);
       R.startTopic(0, nm, pts, `Answer. ${pts.length} points.`);
     } finally { R.endStream(); makingRef.current = false; setWorking(''); }
+  };
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // search <anything>: live Google search through Gemini. Online only; the answer is shown and read point by point like any topic.
+  const saveKey = async () => {
+    const k = keyDraft.trim();
+    if (k.length < 20) { Alert.alert('Gemini API key', 'That key looks too short. Copy the full key from Google AI Studio.'); return; }
+    await saveGeminiKey(k); setHasKey(true); setKeyDraft(''); setKeyShown(false); Keyboard.dismiss();
+    ToastAndroid.show('Gemini key saved', ToastAndroid.SHORT);
+  };
+  const removeKey = () => Alert.alert('Remove Gemini key?', 'Live Google search stops working until you add a key again.', [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Remove', style: 'destructive', onPress: async () => { await saveGeminiKey(''); setHasKey(hasGeminiKey()); } }]);
+  const pickGemModel = async (m: GeminiModelId) => { setGemModel(m); await saveGeminiModel(m); };
+
+  const searchTopic = async (qRaw: string, mode: 'short' | 'long' = 'short') => {
+    const sm = mode === 'long' ? splitMarks(qRaw) : { q: qRaw.trim(), marks: 10 };      // "search long anemia 5 marks"; no marks said = 10
+    const marks = mode === 'long' && /\b(\d{1,2}|two|three|four|five|six|seven|eight|ten|twelve)\s*(?:marks?|m)\b/i.test(qRaw) ? sm.marks : 10;
+    const q = sm.q.trim();
+    if (!q) { push('app', 'Say or type: search <topic>, or search long <topic> for a full exam answer'); return; }
+    if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
+    if (!hasGeminiKey()) { push('app', 'Live Google search needs a Gemini API key. Add it in Models (top right).'); setShowModels(true); return; }
+    const myReq = ++reqRef.current;
+    makingRef.current = true; setWorking(mode === 'long' ? 'Searching Google live… writing full notes' : 'Searching Google live…');
+    try {
+      const pts = await searchWithGoogle(q, undefined, undefined, { mode, marks });
+      if (reqRef.current !== myReq) return;                            // a newer request took over
+      rowY.current = {}; cardY.current = null;
+      const nm = (mode === 'long' ? 'Search (long): ' : 'Search: ') + (q.length > 60 ? q.slice(0, 57) + '...' : q);
+      push('app', mode === 'long' ? `Live Google search (Gemini): full ${marks}-mark answer. Not from your sources` : 'Live Google search (Gemini): short answer. Not from your sources');
+      push('app', TOPIC + nm);
+      R.startTopic(0, nm, pts, `Search. ${pts.length} points.`);       // shown 1, 2, 3... and read aloud at once
+    } catch (e: any) {
+      const k = e instanceof GeminiError ? e.kind : 'http';
+      if (k === 'cancelled') { if (reqRef.current === myReq) push('app', 'Stopped.'); return; }
+      if (k === 'nokey' || k === 'badkey') {
+        push('app', k === 'nokey' ? 'Live Google search needs a Gemini API key. Add it in Models (top right).' : 'Google did not accept the Gemini API key. Check it in Models.');
+        setShowModels(true);
+      } else if (k === 'quota') push('app', 'The Gemini free limit is reached for now. Try again in a little while.');
+      else {
+        const msg = 'Could not fetch live search results, please check internet.';
+        push('app', msg);
+        ToastAndroid.show(msg, ToastAndroid.LONG);
+      }
+    } finally { makingRef.current = false; setWorking(''); }
   };
 
   // spoken question: "question" -> say the whole question -> "okay"
@@ -455,12 +511,13 @@ function Main() {
       case 'slower': R.setRate(-0.1); break;
       case 'faster': R.setRate(0.1); break;
     }
-    if (c.t === 'topic' || c.t === 'exact' || c.t === 'explain') { try { R.pause(); } catch {} stopSpeak(); choicesRef.current = null; }   // new request: nothing old keeps talking
+    if (c.t === 'topic' || c.t === 'exact' || c.t === 'explain' || c.t === 'search') { try { R.pause(); } catch {} stopSpeak(); choicesRef.current = null; }   // new request: nothing old keeps talking
     if (c.t === 'question' && via === 'voice') { startQuestion(c.q); return; }
     push('you', text);
     if (c.t === 'topic') await openTopic(c.q);
     else if (c.t === 'exact') await exactTopic(c.q);
     else if (c.t === 'explain') await explainTopic(c.q);
+    else if (c.t === 'search') await searchTopic(c.q, c.mode);
     else if (c.t === 'question') { if (c.q) await answerQuestion(c.q); else push('app', 'Type your question and send it.'); }
     else if (c.t === 'pick') {
       const names = choicesRef.current;
@@ -791,9 +848,14 @@ function Main() {
     <View ref={rootRef} collapsable={false} style={[st.root, { paddingTop: ins.top + 4, paddingBottom: kbPad }]}>
       <StatusBar barStyle="dark-content" />
       <View style={st.header}>
-        <TouchableOpacity style={st.hBtn} onPress={() => { refreshChats(); setShowMenu(true); }}><Icon n="menu" size={24} /></TouchableOpacity>
+        <View style={st.hSide}>
+          <TouchableOpacity style={st.hBtn} onPress={() => { refreshChats(); setShowMenu(true); }}><Icon n="menu" size={24} /></TouchableOpacity>
+        </View>
         <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
-        <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
+        <View style={[st.hSide, { justifyContent: 'flex-end' }]}>
+          <TouchableOpacity style={st.hBtn} onPress={() => setShowModels(true)}><Icon n="models" size={24} /></TouchableOpacity>
+          <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
+        </View>
       </View>
       <ScrollView
         ref={list} style={{ flex: 1 }} contentContainerStyle={{ padding: 16, gap: 12 }}
@@ -804,7 +866,12 @@ function Main() {
             <Icon n="plus" size={22} /><Text style={st.emptyT}>Add a source to begin</Text>
           </TouchableOpacity>) : null}
         {msgs.map(renderMsg)}
-        {(working || indexing) ? <View style={st.statusCol}><Text style={st.statusT}>{working || 'Indexing…'}</Text><SkeletonShimmer /></View> : null}
+        {(working || indexing) ? (
+          <View style={st.statusCol}>
+            {/* mounted only while something is being written: when it finishes this View disappears, the animation unmounts and stops using CPU */}
+            <LottieView source={require('./assets/animations/writing_animation.json')} autoPlay loop resizeMode="contain" style={st.writeAnim} />
+            <Text style={st.statusT}>{working || 'Indexing…'}</Text>
+          </View>) : null}
       </ScrollView>
 
       <View style={[st.dock, { paddingBottom: kbPad > 0 ? 8 : ins.bottom + 14 }]}>
@@ -933,6 +1000,101 @@ function Main() {
               </View>
               <TouchableOpacity style={st.hBtn} onPress={async () => { await removeSource(x.id); refresh(); }}><Icon n="trash" size={20} /></TouchableOpacity>
             </View>))}
+        </ScrollView>
+      </Sheet>
+
+      <Sheet visible={showModels} onClose={() => { setShowModels(false); Keyboard.dismiss(); }} title="Models" subtitle="Offline AI on your phone, and live Google search" bottom={ins.bottom}>
+        <ScrollView ref={modelsScroll} style={{ maxHeight: sheetMax }} nestedScrollEnabled keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 10, paddingBottom: 28 + kbPad }} showsVerticalScrollIndicator={false}>
+          <Text style={st.secT}>Offline model</Text>
+          <View style={st.group}>
+            <View style={st.mHead}>
+              <View style={st.mTile}><Icon n="file" size={20} /></View>
+              <View style={{ flex: 1 }}>
+                <Text style={st.txt}>Smart notes</Text>
+                <Text style={st.val}>{llmLine}</Text>
+              </View>
+              <View style={[st.badge, { backgroundColor: llm.phase === 'ready' ? '#DCFCE7' : llm.phase === 'error' ? '#FEE2E2' : '#EDEDEB' }]}>
+                <Text style={[st.badgeT, { color: llm.phase === 'ready' ? C.ok : llm.phase === 'error' ? C.bad : C.sec }]}>
+                  {llm.phase === 'ready' ? 'Ready' : llm.phase === 'downloading' ? `${llmPct}%` : llm.phase === 'paused' ? 'Paused' : llm.phase === 'checking' ? 'Checking' : llm.phase === 'error' ? 'Error' : 'Not downloaded'}
+                </Text>
+              </View>
+            </View>
+            <View style={st.sep} />
+            <View style={st.line}>
+              <View style={{ flex: 1 }}><Text style={st.txt}>Use Smart notes</Text><Text style={st.val}>{mLabel} · works fully offline</Text></View>
+              <Switch value={smart} onValueChange={toggleSmart} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+            {(llm.phase === 'downloading' || llm.phase === 'paused') && (
+              <View style={st.barBg}><View style={[st.barFg, { width: `${llmPct}%` }]} /></View>)}
+            {llm.phase !== 'ready' && (
+              <>
+                <View style={st.sep} />
+                <View style={[st.line, { gap: 8 }]}>
+                  {llm.phase === 'checking' ? <Text style={st.sub}>Checking Wi-Fi and storage…</Text>
+                    : llm.phase === 'downloading' ? (
+                      <>
+                        <TouchableOpacity style={st.miniBtn} onPress={() => pauseDownload()}><Text style={st.txt}>Pause</Text></TouchableOpacity>
+                        <TouchableOpacity style={st.miniBtn} onPress={() => cancelDownload()}><Text style={st.txt}>Cancel</Text></TouchableOpacity>
+                      </>
+                    ) : (
+                      <>
+                        <TouchableOpacity style={[st.miniBtn, { backgroundColor: C.acc }]} onPress={() => beginDownload()}>
+                          <Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>{llm.phase === 'paused' ? 'Resume' : 'Download'}</Text>
+                        </TouchableOpacity>
+                        {llm.phase === 'paused' && <TouchableOpacity style={st.miniBtn} onPress={() => cancelDownload()}><Text style={st.txt}>Cancel</Text></TouchableOpacity>}
+                      </>
+                    )}
+                </View>
+              </>)}
+          </View>
+
+          <Text style={st.secT}>Online search · Google (Gemini)</Text>
+          <View style={st.group}>
+            <View style={st.mHead}>
+              <View style={st.mTile}><Icon n="models" size={20} /></View>
+              <View style={{ flex: 1 }}>
+                <Text style={st.txt}>Live Google search</Text>
+                <Text style={st.val}>{hasKey ? (gem.key ? 'Your Gemini key is saved' : 'Using the key built into this app') : 'Add a Gemini API key to turn it on'}</Text>
+              </View>
+              <View style={[st.badge, { backgroundColor: hasKey ? '#DCFCE7' : '#EDEDEB' }]}>
+                <Text style={[st.badgeT, { color: hasKey ? C.ok : C.sec }]}>{hasKey ? 'On' : 'No key'}</Text>
+              </View>
+            </View>
+            <View style={st.sep} />
+            <View style={{ paddingVertical: 12, gap: 10 }}>
+              <Text style={st.txt}>Gemini API key</Text>
+              <View style={st.keyRow}>
+                <TextInput
+                  style={st.keyInput} value={keyDraft} onChangeText={setKeyDraft}
+                  placeholder={gem.key ? '•••••••• saved. Paste a new key to replace' : 'Paste your key (AIza…)'} placeholderTextColor={C.disI}
+                  secureTextEntry={!keyShown} autoCapitalize="none" autoCorrect={false} spellCheck={false} contextMenuHidden={false}
+                  onFocus={() => setTimeout(() => modelsScroll.current?.scrollToEnd({ animated: true }), 300)} onSubmitEditing={saveKey} />
+                <TouchableOpacity style={st.miniBtn} onPress={() => setKeyShown((v) => !v)}><Text style={st.txt}>{keyShown ? 'Hide' : 'Show'}</Text></TouchableOpacity>
+              </View>
+              <View style={[st.keyRow, { flexWrap: 'wrap' }]}>
+                <TouchableOpacity style={[st.miniBtn, { backgroundColor: C.acc, opacity: keyDraft.trim() ? 1 : 0.4 }]} disabled={!keyDraft.trim()} onPress={saveKey}>
+                  <Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>Save key</Text>
+                </TouchableOpacity>
+                {!!gem.key && <TouchableOpacity style={st.miniBtn} onPress={removeKey}><Text style={[st.txt, { color: C.bad }]}>Remove</Text></TouchableOpacity>}
+                <TouchableOpacity style={st.miniBtn} onPress={() => Linking.openURL('https://aistudio.google.com/apikey').catch(() => {})}><Text style={st.txt}>Get a free key</Text></TouchableOpacity>
+              </View>
+            </View>
+            <View style={st.sep} />
+            <View style={{ paddingVertical: 12, gap: 8 }}>
+              <Text style={st.txt}>Model</Text>
+              <View style={st.seg}>
+                {GEMINI_MODELS.map((m) => (
+                  <TouchableOpacity key={m.id} style={[st.segI, gemModel === m.id && st.segOn]} onPress={() => pickGemModel(m.id)}>
+                    <Text style={[st.segT, gemModel === m.id && { color: '#fff' }]} numberOfLines={1}>{m.label}</Text>
+                  </TouchableOpacity>))}
+              </View>
+              <Text style={st.val}>{GEMINI_MODELS.find((m) => m.id === gemModel)?.note}. If Google retires a model, the other one is used automatically.</Text>
+            </View>
+            <View style={st.sep} />
+            <View style={{ paddingVertical: 12 }}>
+              <Text style={st.val}>Say or type “search sickle cell anemia” for a short answer (2-3 points), or “search long sickle cell anemia” for a full exam answer (add “5 marks” or “10 marks” if you like). Needs internet; each search is sent to Google through your own key.</Text>
+            </View>
+          </View>
         </ScrollView>
       </Sheet>
 
@@ -1259,37 +1421,6 @@ function Main() {
             </View>
           </View>
 
-          <Text style={st.secT}>Smart notes</Text>
-          <View style={st.group}>
-            <View style={st.line}>
-              <Icon n="file" size={20} />
-              <View style={{ flex: 1 }}><Text style={st.txt}>Smart notes (offline AI)</Text><Text style={st.val}>{llmLine}</Text></View>
-              <Switch value={smart} onValueChange={toggleSmart} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
-            </View>
-            {(llm.phase === 'downloading' || llm.phase === 'paused') && (
-              <View style={st.barBg}><View style={[st.barFg, { width: `${llmPct}%` }]} /></View>)}
-            {llm.phase !== 'ready' && (
-              <>
-                <View style={st.sep} />
-                <View style={[st.line, { gap: 8 }]}>
-                  {llm.phase === 'checking' ? <Text style={st.sub}>Checking Wi-Fi and storage…</Text>
-                    : llm.phase === 'downloading' ? (
-                      <>
-                        <TouchableOpacity style={st.miniBtn} onPress={() => pauseDownload()}><Text style={st.txt}>Pause</Text></TouchableOpacity>
-                        <TouchableOpacity style={st.miniBtn} onPress={() => cancelDownload()}><Text style={st.txt}>Cancel</Text></TouchableOpacity>
-                      </>
-                    ) : (
-                      <>
-                        <TouchableOpacity style={[st.miniBtn, { backgroundColor: C.acc }]} onPress={() => beginDownload()}>
-                          <Text style={[st.txt, { color: '#fff', fontWeight: '600' }]}>{llm.phase === 'paused' ? 'Resume' : 'Download'}</Text>
-                        </TouchableOpacity>
-                        {llm.phase === 'paused' && <TouchableOpacity style={st.miniBtn} onPress={() => cancelDownload()}><Text style={st.txt}>Cancel</Text></TouchableOpacity>}
-                      </>
-                    )}
-                </View>
-              </>)}
-          </View>
-
           <Text style={st.secT}>Background</Text>
           <View style={st.group}>
             <View style={st.line}>
@@ -1395,37 +1526,6 @@ function Wave({ active, mic, color, height = 28 }: { active: boolean; mic?: bool
   );
 }
 
-// Skeleton lines with a soft light band sweeping left to right (shown while notes are being written).
-// No gradient library: the band is a few narrow strips with rising/falling opacity. Native driver only, so it never touches JS.
-const SK_LINES = ['92%', '78%', '56%'];
-const SK_BAND = 120;
-const SK_STRIPS = [0.08, 0.2, 0.38, 0.55, 0.38, 0.2, 0.08];
-function SkeletonShimmer() {
-  const { width } = useWindowDimensions();
-  const x = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    const loop = Animated.loop(Animated.sequence([
-      Animated.timing(x, { toValue: 1, duration: 1300, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-      Animated.delay(250),
-    ]));
-    loop.start();
-    return () => loop.stop();
-  }, []);
-  const travel = width;                                              // enough to cross any line
-  const tx = x.interpolate({ inputRange: [0, 1], outputRange: [-SK_BAND, travel] });
-  return (
-    <View style={{ gap: 9 }}>
-      {SK_LINES.map((w, i) => (
-        <View key={i} style={{ width: w as any, height: 12, borderRadius: 6, backgroundColor: C.dis, overflow: 'hidden' }}>
-          <Animated.View style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: SK_BAND, flexDirection: 'row', transform: [{ translateX: tx }] }}>
-            {SK_STRIPS.map((o, k) => (
-              <View key={k} style={{ flex: 1, backgroundColor: `rgba(255,255,255,${o + 0.1})` }} />))}
-          </Animated.View>
-        </View>))}
-    </View>
-  );
-}
-
 // Three dots that rise one after the other (shown while notes are being written)
 function Dots() {
   const v = useRef([0, 1, 2].map(() => new Animated.Value(0))).current;
@@ -1495,14 +1595,19 @@ const StepRow = ({ icon, label, value, onMinus, onPlus }:
 
 // One point of the open topic. Memoised: while reading, only the point that changed re-renders (the whole screen used to re-render on every spoken line -> lag, heat, battery).
 const PointBlock = React.memo(function PointBlock({ p, k, line, sent, onGo, onY }: { p: Point; k: number; line: number; sent: number; onGo: (k: number) => void; onY: (k: number, y: number) => void }) {
-  const lines = p.bullets?.length ? p.bullets : [p.text];
+  const lines = p.bullets?.length ? p.bullets : p.text ? [p.text] : [];
   return (
     <TouchableOpacity activeOpacity={0.8} style={st.ptBlock} onLayout={(e) => onY(k, e.nativeEvent.layout.y)} onPress={() => onGo(k)}>
-      <Text style={st.ptTitle}>{p.title}</Text>
-      {p.bullets ? lines.map((ln, j) => <Text key={j} style={[st.ptLine, line === j && st.sentOn]}>{ln}</Text>) : (
-        <Text style={st.ptLine}>{splitSentences(lines.join(' ')).map((c, j) => <Text key={j} style={j === sent ? st.sentOn : undefined}>{c + ' '}</Text>)}</Text>
-      )}
-      {!!p.hint && <Text style={st.hint}>Banglish: {p.hint}</Text>}
+      <View style={st.ptItem}>
+        <Text style={st.ptNum}>{p.n}.</Text>
+        <View style={st.ptBody}>
+          {!!p.title && <Text style={st.ptTitle}>{p.title}</Text>}
+          {p.bullets ? lines.map((ln, j) => <Text key={j} style={[st.ptLine, line === j && st.sentOn]}>{ln}</Text>) : lines.length ? (
+            <Text style={st.ptLine}>{splitSentences(lines.join(' ')).map((c, j) => <Text key={j} style={j === sent ? st.sentOn : undefined}>{c + ' '}</Text>)}</Text>
+          ) : null}
+          {!!p.hint && <Text style={st.hint}>Banglish: {p.hint}</Text>}
+        </View>
+      </View>
     </TouchableOpacity>);
 });
 
@@ -1510,6 +1615,7 @@ const st = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 10, paddingBottom: 6 },
   hBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
+  hSide: { width: 84, flexDirection: 'row', alignItems: 'center' },
   title: { fontSize: 18, fontWeight: '600', color: C.tx },
   brand: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   logo: { width: 34, height: 24 },
@@ -1519,16 +1625,20 @@ const st = StyleSheet.create({
   reply: { color: C.tx, fontSize: 14, lineHeight: 20, alignSelf: 'flex-start', maxWidth: '92%', paddingHorizontal: 2 },
   you: { backgroundColor: C.acc, alignSelf: 'flex-end', borderRadius: 18, borderBottomRightRadius: 6, paddingHorizontal: 14, paddingVertical: 9, maxWidth: '80%' },
   status: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6, paddingHorizontal: 2 },
-  statusT: { color: C.sec, fontSize: 14 },
-  statusCol: { gap: 10, paddingVertical: 8, paddingHorizontal: 2 },
+  statusT: { color: C.sec, fontSize: 14, textAlign: 'center' },
+  statusCol: { alignItems: 'center', gap: 2, paddingVertical: 8, paddingHorizontal: 2 },
+  writeAnim: { width: 120, height: 120 },
   empty: { borderWidth: 1, borderColor: C.bd, borderRadius: 14, padding: 18, alignItems: 'center', marginTop: 40, flexDirection: 'row', justifyContent: 'center', gap: 8 },
   emptyT: { color: C.tx, fontSize: 16 },
 
   card: { backgroundColor: 'transparent', borderRadius: 1, paddingVertical: 4 },
   topicT: { fontWeight: '700', fontSize: 18, lineHeight: 26, color: C.tx, marginBottom: 6 },
-  ptBlock: { paddingVertical: 8 },
-  ptTitle: { fontWeight: '700', fontSize: 16, lineHeight: 24, color: C.tx, marginBottom: 2 },
-  ptLine: { color: C.tx, fontSize: 16, lineHeight: 25, marginBottom: 6 },
+  ptBlock: { paddingVertical: 10 },
+  ptItem: { flexDirection: 'row', alignItems: 'flex-start' },
+  ptNum: { width: 30, fontWeight: '700', fontSize: 16, lineHeight: 24, color: C.sec },
+  ptBody: { flex: 1 },
+  ptTitle: { fontWeight: '700', fontSize: 16, lineHeight: 24, color: C.tx, marginBottom: 3 },
+  ptLine: { color: C.tx, fontSize: 15.5, lineHeight: 24, marginBottom: 4 },
   cardHead: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2 },
   cardT: { flex: 1, fontWeight: '700', fontSize: 16, color: C.tx },
   ptRow: { flexDirection: 'row', gap: 10, paddingVertical: 7, paddingHorizontal: 8, borderRadius: 10 },
@@ -1608,6 +1718,12 @@ const st = StyleSheet.create({
   optT: { flex: 1, fontSize: 15, fontWeight: '600', color: C.tx },
   barBg: { height: 6, borderRadius: 3, backgroundColor: C.bd, overflow: 'hidden', marginBottom: 12 },
   barFg: { height: 6, borderRadius: 3, backgroundColor: C.acc },
+  mHead: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 14 },
+  mTile: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
+  badge: { paddingHorizontal: 10, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
+  badgeT: { fontSize: 12, fontWeight: '700' },
+  keyRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  keyInput: { flex: 1, height: 46, borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.bg },
   miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
   dlgBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'center', paddingHorizontal: 24 },
   dlg: { backgroundColor: C.bg, borderRadius: 20, padding: 18, gap: 14, elevation: 16 },
