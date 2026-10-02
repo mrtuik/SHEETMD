@@ -190,7 +190,9 @@ class SheetSttModule : Module() {
             tokens = tokens.absolutePath,
             numThreads = threads.coerceIn(1, 4),
             provider = "cpu",
-            modelType = "zipformer",
+            // left empty on purpose: sherpa-onnx reads the real type (zipformer2) from the model file itself.
+            // Forcing "zipformer" on this zipformer2 model made the native code abort (app crash) right after loading.
+            modelType = "",
           ),
           // ends an utterance after ~0.9 s of silence (a command), or after 15 s of talking
           endpointConfig = EndpointConfig(EndpointRule(false, 1.6f, 0.0f), EndpointRule(true, 0.9f, 0.0f), EndpointRule(false, 0.0f, 15.0f)),
