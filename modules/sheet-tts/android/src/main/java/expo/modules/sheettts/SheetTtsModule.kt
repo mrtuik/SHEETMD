@@ -8,10 +8,11 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
 import com.k2fsa.sherpa.onnx.GeneratedAudio
+import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
-import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsPocketModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -22,14 +23,22 @@ import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 
 class SheetTtsModule : Module() {
+  private val POCKET_STEPS = 2          // flow steps per frame: 2 = fast (the sherpa-onnx example value); higher = a bit cleaner but slower
   private var tts: OfflineTts? = null
   private var currentModelDir: String = ""
-  @Volatile private var currentKind: String = "vits"      // "vits" (Piper) or "kokoro"
+  @Volatile private var currentKind: String = "vits"      // "vits" (Piper) or "pocket" (Pocket TTS, voice cloning)
+
+  // Pocket TTS clones the voice from a short reference recording (set from JS with setReference)
+  @Volatile private var refAudio: FloatArray? = null
+  @Volatile private var refRate: Int = 0
+  @Volatile private var refKey: String = ""
 
   private val playExecutor = Executors.newSingleThreadExecutor()
   private val prepareExecutor = Executors.newSingleThreadExecutor { r ->
@@ -131,6 +140,74 @@ class SheetTtsModule : Module() {
     return null
   }
 
+  private fun findAny(baseDir: File, vararg names: String): File? {
+    for (n in names) { val f = findNamed(baseDir, n); if (f != null) return f }
+    return null
+  }
+
+  private fun isPocketDir(dir: File): Boolean =
+    findNamed(dir, "vocab.json") != null && findAny(dir, "lm_main.int8.onnx", "lm_main.onnx") != null
+
+  // 16-bit / 8 / 24 / 32-bit PCM or 32-bit float WAV, any channel count -> mono floats in [-1, 1]
+  private fun readWavMono(f: File): Pair<FloatArray, Int>? {
+    val b = f.readBytes()
+    if (b.size < 44) return null
+    if (String(b, 0, 4, Charsets.US_ASCII) != "RIFF" || String(b, 8, 4, Charsets.US_ASCII) != "WAVE") return null
+    val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
+    var pos = 12
+    var fmtTag = 0; var ch = 0; var rate = 0; var bits = 0
+    var dataOff = -1; var dataLen = 0
+    while (pos + 8 <= b.size) {
+      val id = String(b, pos, 4, Charsets.US_ASCII)
+      var len = bb.getInt(pos + 4)
+      val body = pos + 8
+      if (len < 0 || body + len > b.size) len = b.size - body
+      if (id == "fmt " && len >= 16) {
+        fmtTag = bb.getShort(body).toInt() and 0xFFFF
+        ch = bb.getShort(body + 2).toInt()
+        rate = bb.getInt(body + 4)
+        bits = bb.getShort(body + 14).toInt()
+        if (fmtTag == 0xFFFE && len >= 26) fmtTag = bb.getShort(body + 24).toInt() and 0xFFFF
+      } else if (id == "data") {
+        dataOff = body; dataLen = len
+        break
+      }
+      pos = body + len + (len and 1)
+    }
+    if (dataOff < 0 || ch < 1 || rate <= 0 || bits < 8) return null
+    val bytesPer = bits / 8
+    val frames = dataLen / (bytesPer * ch)
+    if (frames <= 0) return null
+    val out = FloatArray(frames)
+    for (i in 0 until frames) {
+      var acc = 0f
+      for (c in 0 until ch) {
+        val o = dataOff + (i * ch + c) * bytesPer
+        acc += when {
+          fmtTag == 1 && bits == 16 -> bb.getShort(o) / 32768f
+          fmtTag == 1 && bits == 8 -> ((b[o].toInt() and 0xFF) - 128) / 128f
+          fmtTag == 1 && bits == 24 -> ((b[o + 2].toInt() shl 16) or ((b[o + 1].toInt() and 0xFF) shl 8) or (b[o].toInt() and 0xFF)) / 8388608f
+          fmtTag == 1 && bits == 32 -> bb.getInt(o) / 2147483648f
+          fmtTag == 3 && bits == 32 -> bb.getFloat(o)
+          else -> return null
+        }
+      }
+      out[i] = acc / ch
+    }
+    return Pair(out, rate)
+  }
+
+  // One entry point for both engines: Piper uses the speaker id, Pocket uses the reference recording.
+  private fun generate(t: OfflineTts, text: String, sid: Int, speed: Float, cb: (FloatArray) -> Int) {
+    if (currentKind == "pocket") {
+      val ref = refAudio ?: throw IllegalStateException("No reference voice set")
+      val g = GenerationConfig(speed = speed, sid = 0, referenceAudio = ref, referenceSampleRate = refRate, numSteps = POCKET_STEPS)
+      t.generateWithConfigAndCallback(text, g, cb)
+    } else {
+      t.generateWithCallback(text, sid = sid, speed = speed, callback = cb)
+    }
+  }
+
   private fun releaseModel() {
     synchronized(this) {
       try {
@@ -153,7 +230,7 @@ class SheetTtsModule : Module() {
       prepareExecutor.shutdownNow()
     }
 
-    AsyncFunction("init") { modelDir: String, kind: String, accent: String ->
+    AsyncFunction("init") { modelDir: String, kind: String ->
       try {
         stopPlayback()
         releaseModel()
@@ -161,29 +238,33 @@ class SheetTtsModule : Module() {
         val dir = File(modelDir)
         if (!dir.exists() || !dir.isDirectory) return@AsyncFunction false
 
-        val (modelFile, tokensFile, dataDir) = findFiles(dir)
-        if (modelFile == null || tokensFile == null || dataDir == null) {
-          return@AsyncFunction false
-        }
-
-        val modelConfig = if (kind == "kokoro") {
-          val voicesFile = findNamed(dir, "voices.bin") ?: return@AsyncFunction false
-          // lexicon: US or GB English (optional; without it espeak-ng pronounces everything)
-          val lex = findNamed(dir, if (accent == "gb") "lexicon-gb-en.txt" else "lexicon-us-en.txt")
+        val modelConfig = if (kind == "pocket") {
+          val lmFlow = findAny(dir, "lm_flow.int8.onnx", "lm_flow.onnx") ?: return@AsyncFunction false
+          val lmMain = findAny(dir, "lm_main.int8.onnx", "lm_main.onnx") ?: return@AsyncFunction false
+          val encoder = findAny(dir, "encoder.onnx", "encoder.int8.onnx") ?: return@AsyncFunction false
+          val decoder = findAny(dir, "decoder.int8.onnx", "decoder.onnx") ?: return@AsyncFunction false
+          val textCond = findAny(dir, "text_conditioner.onnx", "text_conditioner.int8.onnx") ?: return@AsyncFunction false
+          val vocab = findNamed(dir, "vocab.json") ?: return@AsyncFunction false
+          val scores = findNamed(dir, "token_scores.json") ?: return@AsyncFunction false
           OfflineTtsModelConfig(
-            kokoro = OfflineTtsKokoroModelConfig(
-              model = modelFile.absolutePath,
-              voices = voicesFile.absolutePath,
-              tokens = tokensFile.absolutePath,
-              dataDir = dataDir.absolutePath,
-              lexicon = lex?.absolutePath ?: "",
-              lengthScale = 1.0f
+            pocket = OfflineTtsPocketModelConfig(
+              lmFlow = lmFlow.absolutePath,
+              lmMain = lmMain.absolutePath,
+              encoder = encoder.absolutePath,
+              decoder = decoder.absolutePath,
+              textConditioner = textCond.absolutePath,
+              vocabJson = vocab.absolutePath,
+              tokenScoresJson = scores.absolutePath
             ),
             numThreads = 3,
             provider = "cpu",
             debug = false
           )
         } else {
+          val (modelFile, tokensFile, dataDir) = findFiles(dir)
+          if (modelFile == null || tokensFile == null || dataDir == null) {
+            return@AsyncFunction false
+          }
           val vits = OfflineTtsVitsModelConfig(
             model = modelFile.absolutePath,
             tokens = tokensFile.absolutePath,
@@ -212,6 +293,25 @@ class SheetTtsModule : Module() {
       }
     }
 
+    // Pocket TTS: load the reference recording (WAV) the voice is cloned from. At most 12 s are used.
+    AsyncFunction("setReference") { path: String ->
+      try {
+        val f = File(path)
+        if (!f.exists() || !f.isFile) return@AsyncFunction false
+        val (samples, rate) = readWavMono(f) ?: return@AsyncFunction false
+        if (samples.size < rate) return@AsyncFunction false          // shorter than 1 second
+        val maxN = rate * 12
+        val used = if (samples.size > maxN) samples.copyOf(maxN) else samples
+        refAudio = used
+        refRate = rate
+        refKey = "${f.absolutePath}@${f.lastModified()}"
+        preCache.clear()
+        true
+      } catch (e: Throwable) {
+        false
+      }
+    }
+
     Function("isReady") {
       tts != null
     }
@@ -228,7 +328,7 @@ class SheetTtsModule : Module() {
     Function("prepare") { text: String, speed: Float, sid: Int ->
       val currentTts = tts ?: return@Function
       val curDir = currentModelDir
-      val key = "$curDir:$sid:$speed:$text"
+      val key = "$curDir:$sid:$speed:$refKey:$text"
       if (preCache.containsKey(key)) return@Function
 
       val myEpoch = epoch
@@ -238,8 +338,8 @@ class SheetTtsModule : Module() {
             val parts = ArrayList<FloatArray>()
             var total = 0
             synchronized(genLock) {
-              currentTts.generateWithCallback(text, sid = sid, speed = speed) { samples ->
-                if (epoch != myEpoch || tts !== currentTts) return@generateWithCallback 0   // a command arrived: give the engine back immediately
+              generate(currentTts, text, sid, speed) { samples ->
+                if (epoch != myEpoch || tts !== currentTts) return@generate 0   // a command arrived: give the engine back immediately
                 parts.add(samples); total += samples.size
                 1
               }
@@ -259,6 +359,10 @@ class SheetTtsModule : Module() {
       val currentTts = tts
       if (currentTts == null) {
         sendEvent("onError", mapOf("id" to id, "message" to "TTS model not loaded"))
+        return@Function
+      }
+      if (currentKind == "pocket" && refAudio == null) {
+        sendEvent("onError", mapOf("id" to id, "message" to "No reference voice set"))
         return@Function
       }
 
@@ -332,7 +436,7 @@ class SheetTtsModule : Module() {
           currentAudioTrack = audioTrack
 
           val curDir = currentModelDir
-          val cacheKey = "$curDir:$sid:$speed:$text"
+          val cacheKey = "$curDir:$sid:$speed:$refKey:$text"
           val cached = preCache.remove(cacheKey)
 
           var totalWrittenFrames = 0
@@ -349,13 +453,13 @@ class SheetTtsModule : Module() {
               }
             }
           } else {
-            if (currentKind == "kokoro") {
-              // Kokoro is heavy: on a slow phone streaming would stutter (audio underrun). Generate the whole line first, then play it smoothly.
+            if (currentKind == "pocket") {
+              // Pocket is heavy: on a slow phone streaming would stutter (audio underrun). Generate the whole line first, then play it smoothly.
               val parts = ArrayList<FloatArray>()
               var total = 0
               synchronized(genLock) {
-                currentTts.generateWithCallback(text, sid = sid, speed = speed) { samples ->
-                  if (cancelled || activeId != id) return@generateWithCallback 0
+                generate(currentTts, text, sid, speed) { samples ->
+                  if (cancelled || activeId != id) return@generate 0
                   parts.add(samples); total += samples.size
                   1
                 }
@@ -372,9 +476,9 @@ class SheetTtsModule : Module() {
               }
             } else {
               synchronized(genLock) {
-                currentTts.generateWithCallback(text, sid = sid, speed = speed) { samples ->
+                generate(currentTts, text, sid, speed) { samples ->
                   if (cancelled || activeId != id) {
-                    return@generateWithCallback 0
+                    return@generate 0
                   }
                   if (samples.isNotEmpty()) {
                     if (!started) {
@@ -483,8 +587,12 @@ class SheetTtsModule : Module() {
           moved = true
         }
 
-        val (model, tokens, data) = findFiles(targetDir)
-        moved && model != null && tokens != null && data != null
+        if (isPocketDir(targetDir)) {
+          moved
+        } else {
+          val (model, tokens, data) = findFiles(targetDir)
+          moved && model != null && tokens != null && data != null
+        }
       } catch (e: Exception) {
         false
       }
