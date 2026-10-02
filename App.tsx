@@ -529,7 +529,10 @@ function Main() {
   const wakeGate = (alts: string[], partial: boolean): string[] | null => {
     const w = wakeRef.current;
     const cut = alts.map((a) => splitWake(a, R.getSpoken()));
-    const bg = R.state.wakeOn && AppState.currentState !== 'active';
+    // Word by word reading: the mic hears each lone word, and a lone short word is very often misheard as "stop" / "next" / "pause"
+    // (that stopped the reading by itself). So while the app reads word by word, a command needs "tuik" first, like in the background.
+    const wordMode = R.state.wordGap > 0 && R.state.status === 'reading';
+    const bg = (R.state.wakeOn && AppState.currentState !== 'active') || wordMode;
     const clearArm = () => { clearTimeout(w.timer); w.timer = null; w.paused = false; w.until = 0; setAwakeUI(false); };
     const withRest = cut.filter((c) => c.hit && c.rest).map((c) => c.rest);
     if (withRest.length) {                                           // "tuik pause" / "...reading tuik pause"
@@ -560,7 +563,8 @@ function Main() {
   };
   const onVoice = (alts0: string[]) => {
     if (!alts0.length) return;
-    const g = wakeGate(alts0, false); if (!g) return;
+    const g = wakeGate(alts0, false);
+    if (!g) { setHeard(alts0[0].slice(0, 40) + '  (ignored: say "tuik" first)'); return; }
     let alts = g;
     setHeard(alts[0].slice(0, 60));
     clearStable();
@@ -945,7 +949,7 @@ function Main() {
             <View style={st.sep} />
             <StepRow icon="timer" label="Pause between points" value={`${s.pauseSec}s`} onMinus={() => R.setPause(-1)} onPlus={() => R.setPause(1)} />
             <View style={st.sep} />
-            <StepRow icon="timer" label="Pause between words" value={s.wordGap > 0 ? `${s.wordGap}s` : 'off (normal speech)'} onMinus={() => R.setWordGap(-0.5)} onPlus={() => R.setWordGap(0.5)} />
+            <StepRow icon="timer" label="Pause between words" value={s.wordGap > 0 ? `${s.wordGap.toFixed(1)}s between words` : 'off (normal speech)'} onMinus={() => R.setWordGap(-0.1)} onPlus={() => R.setWordGap(0.1)} />
             <View style={st.sep} />
             <View style={st.line}>
               <Icon n="timer" size={20} />
