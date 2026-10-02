@@ -9,6 +9,7 @@ import * as Device from 'expo-device';
 import { getMeta, setMeta } from './db';
 import type { Point } from './notes';
 import { tidyPoint } from './notes';
+import { cloud, cloudReady, chatCall, PROVIDERS } from './cloud';
 
 export type ModelId = 'q15' | 'q05';
 export const MODELS: Record<ModelId, { label: string; file: string; url: string; bytes: number }> = {
@@ -626,9 +627,9 @@ async function geminiCall(model: string, key: string, prompt: string, signal: Ab
 }
 
 // ---- never pay for the same search twice: finished answers are kept on the phone and reused (works offline, uses no Google quota)
-export const searchInfo = { fromCache: false };
+export const searchInfo = { fromCache: false, via: '' };       // via = which provider answered (shown in the chat)
 const normQ = (q: string) => q.toLowerCase().replace(/[^a-z0-9\u0980-\u09ff ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
-const cacheKeyOf = (q: string, mode: SearchMode, marks: number) => `sc:${mode}${mode === 'long' ? marks : ''}:${normQ(q)}`;
+const cacheKeyOf = (q: string, mode: SearchMode, marks: number, tag = '') => `sc:${tag}${mode}${mode === 'long' ? marks : ''}:${normQ(q)}`;
 async function cacheGet(k: string): Promise<Point[] | null> {
   try {
     const v = await getMeta(k);
@@ -653,10 +654,35 @@ const keyInvalid = (status: number, err: string) => status === 401 || status ===
 // last-resort extra model: its free limit is separate from the two in Models, so it helps when those are used up (a retired/unknown id just returns 404 and is skipped)
 const EXTRA_MODELS = ['gemini-3.5-flash-lite'];
 
+
+// the model's text -> Point[] (shared by Gemini and the other cloud providers)
+async function textToPoints(text: string, long: boolean, ck: string): Promise<Point[]> {
+  const hi = 3;
+  const clean = stripCites(text);
+  if (long) {
+    const lp = parseLong(clean);
+    if (lp.length) { await cachePut(ck, lp); return lp; }                                       // no "## headings": fall through and read it as numbered points
+  }
+  const merged = mergeSub(clean);
+  let pts = parseAnswer(merged, '', long ? 12 : hi, false);
+  if (!pts.length) {                                                // the model ignored the numbering: take its lines as points anyway
+    const alt: Omit<Point, 'n'>[] = [];
+    for (const l of merged.split('\n')) {
+      const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, ''));
+      if (t.text.length > 8) alt.push(t);
+      if (alt.length >= (long ? 12 : hi)) break;
+    }
+    pts = alt.map((p, i) => ({ n: i + 1, ...p }));
+  }
+  if (!pts.length) throw new GeminiError('empty');
+  await cachePut(ck, pts);
+  return pts;
+}
+
 export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId, opts: SearchOpts = {}): Promise<Point[]> {
   const key = (apiKey || gem.key || ENV_KEY || '').trim();
   if (!key) throw new GeminiError('nokey');
-  searchInfo.fromCache = false;
+  searchInfo.fromCache = false; searchInfo.via = 'Google (Gemini)';
   const long = opts.mode === 'long';                                 // anything else (plain "search", "search short") = short answer
   const marks = Math.min(15, Math.max(2, opts.marks || 10));
   const ck = cacheKeyOf(query, long ? 'long' : 'short', marks);
@@ -701,24 +727,62 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
       } else break;                                                 // a daily limit: waiting here would not help
     }
     if (!text.trim()) throw new GeminiError(quotaHit ? 'quota' : lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
-    const clean = stripCites(text);
-    if (long) {
-      const lp = parseLong(clean);
-      if (lp.length) { await cachePut(ck, lp); return lp; }                                       // no "## headings": fall through and read it as numbered points
+    return await textToPoints(text, long, ck);
+  } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// "search ..." through the provider chosen in Models > Cloud API.
+//  - Google (Gemini): live Google search (above).
+//  - OpenRouter / OpenAI / Custom: the model answers from its own knowledge (no live Google). If it fails or its free limit is used up,
+//    the Gemini key (if there is one) is tried next, then the caller falls back to the offline model.
+const noLive = (p: string) => p
+  .replace('Use Google Search to find current, correct information, then write', 'Write')
+  .replace('Use only values the search confirms; never invent a number.', 'Use only values you are sure of; never invent a number.');
+
+export async function searchWithCloud(query: string, opts: SearchOpts = {}): Promise<Point[]> {
+  const prov = cloud.provider;
+  if (prov === 'gemini' || !cloudReady(prov)) return searchWithGoogle(query, undefined, undefined, opts);
+  const id = prov as 'openrouter' | 'openai' | 'custom';
+  const label = PROVIDERS.find((x) => x.id === id)?.label || id;
+  searchInfo.fromCache = false; searchInfo.via = label;
+  const long = opts.mode === 'long';
+  const marks = Math.min(15, Math.max(2, opts.marks || 10));
+  const ck = cacheKeyOf(query, long ? 'long' : 'short', marks, id + ':' + cloud.model[id].replace(/[^a-z0-9]+/gi, '') + ':');
+  const cached = await cacheGet(ck);
+  if (cached) { searchInfo.fromCache = true; return cached; }
+
+  let net: any = null;
+  try { net = await Network.getNetworkStateAsync(); } catch {}
+  if (id !== 'custom' && net && (!net.isConnected || net.isInternetReachable === false)) throw new GeminiError('offline');
+
+  const my = ++searchJob;
+  try { searchAbort?.abort(); } catch {}
+  const ctl = new AbortController();
+  searchAbort = ctl;
+  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, long ? 120000 : 60000);
+  const prompt = noLive(long ? longPrompt(query.trim(), marks) : shortPrompt(query.trim()));
+  const models = Array.from(new Set<string>([cloud.model[id], ...(id === 'openrouter' ? ['openrouter/free'] : [])].filter(Boolean)));
+  try {
+    let text = '', lastStatus = 0, quotaHit = false;
+    for (const m of models) {
+      let res: { status: number; text: string; err: string };
+      try { res = await chatCall(id, m, prompt, ctl.signal, long ? 6000 : 2500); }
+      catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
+      if (my !== searchJob) throw new GeminiError('cancelled');
+      lastStatus = res.status;
+      if (res.status === 200) { if (res.text.trim()) { text = res.text; break; } continue; }
+      if (res.status === 401 || res.status === 403) throw new GeminiError('badkey', `HTTP ${res.status}`);
+      if (res.status === 429 || res.status === 402) quotaHit = true;                // free limit / no credit: try the next model
     }
-    const merged = mergeSub(clean);
-    let pts = parseAnswer(merged, '', long ? 12 : hi, false);
-    if (!pts.length) {                                                // the model ignored the numbering: take its lines as points anyway
-      const alt: Omit<Point, 'n'>[] = [];
-      for (const l of merged.split('\n')) {
-        const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, ''));
-        if (t.text.length > 8) alt.push(t);
-        if (alt.length >= (long ? 12 : hi)) break;
-      }
-      pts = alt.map((p, i) => ({ n: i + 1, ...p }));
+    if (!text.trim()) throw new GeminiError(quotaHit ? 'quota' : lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
+    return await textToPoints(text, long, ck);
+  } catch (e: any) {
+    // this provider failed (not cancelled / not a bad key): the Gemini key, if saved, gets a try
+    if (e instanceof GeminiError && (e.kind === 'quota' || e.kind === 'http' || e.kind === 'empty') && (gem.key || ENV_KEY) && my === searchJob) {
+      clearTimeout(timer);
+      return await searchWithGoogle(query, undefined, undefined, opts);
     }
-    if (!pts.length) throw new GeminiError('empty');
-    await cachePut(ck, pts);
-    return pts;
+    throw e;
   } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
 }
