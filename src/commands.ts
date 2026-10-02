@@ -81,10 +81,20 @@ const ALIAS: Record<string, Cmd['t']> = {
   slower: 'slower', 'slow down': 'slower', slow: 'slower', 'go slower': 'slower', 'আস্তে': 'slower',
   faster: 'faster', 'speed up': 'faster', fast: 'faster', 'go faster': 'faster', 'জোরে': 'faster', 'দ্রুত': 'faster',
 };
+// Ordinary English words that are ALSO playback aliases. The mic hears the app's own voice, so a note line such as
+// "Start the ...", "Hold the slide ..." or "Back to ..." used to be taken as a command (pause / restart / previous)
+// and reading broke. While the app is reading, these only count when the app itself did not just say that word.
+export const WEAK = new Set(['hold', 'wait', 'hold on', 'back', 'go back', 'last', 'start', 'play', 'fast', 'slow', 'skip', 'go on', 'carry on', 'keep going', 'pose', 'stock', 'paws']);
 const LEAD = /^(?:(?:ok|okay|hey|hi|please|now|just|you can)\s+)+/;
 const TAIL = /(?:\s+(?:please|now|sir|ok|okay|thanks?|thank you))+$/;
 const GREET = /^(?:hi+|hii+|hello+|hey+|hola|namaste|thanks?|thank you|ok|okay|good (?:morning|evening|night)|হ্যালো|হাই)$/;
 export const isGreeting = (s: string) => GREET.test(s.trim().toLowerCase().replace(/[.!?।,\s]+$/, ''));
+
+export function isWeakCmd(s: string): boolean {
+  const x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
+  const y = x.replace(LEAD, '').replace(TAIL, '').trim();
+  return !!y && WEAK.has(y) && !!ALIAS[y];
+}
 
 export function parse(s: string): Cmd {
   let x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
