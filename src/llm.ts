@@ -257,7 +257,7 @@ const MAXSRC = () => (llm.model === 'q05' ? 3200 : 5200);
 let jobId = 0;
 let active: Promise<any> | null = null;          // the native completion that is running right now
 const cancelHooks = new Set<() => void>();
-export function cancelGen() { jobId++; try { ctx?.stopCompletion?.(); } catch {} cancelHooks.forEach((f) => f()); }   // waiting jobs return at once
+export function cancelGen() { jobId++; searchJob++; try { searchAbort?.abort(); } catch {} try { ctx?.stopCompletion?.(); } catch {} cancelHooks.forEach((f) => f()); }   // waiting jobs return at once
 
 async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number, onToken?: (t: string) => void): Promise<{ text: string; cancelled: boolean; cut?: boolean }> {
   if (job !== jobId) return { text: '', cancelled: true };
@@ -499,4 +499,131 @@ export async function llmAnswer(question: string, chunks: { name: string; body: 
   const hit = src ? pts.filter((p) => supported(`${p.title} ${p.text}`, srcN, srcWords)).length : 0;
   const basis: Basis = hit === 0 ? 'own' : hit >= pts.length * 0.8 ? 'source' : 'mixed';
   return { pts, basis };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Live Google search through the Gemini API (Grounding with Google Search). Online only: an alternative to the local Qwen model.
+// "search <anything>" -> Gemini searches Google, writes 2-8 numbered study points -> the same Point[] the rest of the app already reads.
+// NOTE: gemini-2.0-flash was shut down by Google on 1 June 2026, and gemini-2.5-flash is scheduled for 16 October 2026.
+// So the default is gemini-3.5-flash; the model can be changed in Models, and a retired model falls back to the other one by itself.
+export type GeminiModelId = 'gemini-3.5-flash' | 'gemini-3.1-flash-lite';
+export const GEMINI_MODELS: { id: GeminiModelId; label: string; note: string }[] = [
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', note: 'Best answers' },
+  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite', note: 'Fastest, lightest' },
+];
+// @ts-ignore  optional default key baked into the build (EXPO_PUBLIC_GEMINI_API_KEY); a key typed in Models always wins
+const ENV_KEY: string = (typeof process !== 'undefined' && process.env && process.env.EXPO_PUBLIC_GEMINI_API_KEY) || '';
+export const gem: { key: string; model: GeminiModelId } = { key: '', model: 'gemini-3.5-flash' };
+export const hasEnvKey = () => !!ENV_KEY;
+export const hasGeminiKey = () => !!(gem.key || ENV_KEY);
+export async function loadGemini() {
+  gem.key = ((await getMeta('gemini_key').catch(() => '')) || '').trim();
+  const m = (await getMeta('gemini_model').catch(() => '')) as GeminiModelId;
+  if (GEMINI_MODELS.some((x) => x.id === m)) gem.model = m;
+}
+export async function saveGeminiKey(k: string) { gem.key = k.trim(); await setMeta('gemini_key', gem.key).catch(() => {}); }
+export async function saveGeminiModel(m: GeminiModelId) { gem.model = m; await setMeta('gemini_model', m).catch(() => {}); }
+
+export type GeminiErrKind = 'nokey' | 'badkey' | 'offline' | 'quota' | 'empty' | 'http' | 'cancelled';
+export class GeminiError extends Error {
+  kind: GeminiErrKind;
+  constructor(kind: GeminiErrKind, msg = '') { super(msg || kind); this.kind = kind; }
+}
+
+let searchJob = 0;
+let searchAbort: AbortController | null = null;
+
+// short / fact question -> 2-3 points; long or "explain / compare" question -> 5-8 points
+export function searchDepth(q: string): { lo: number; hi: number; deep: boolean } {
+  const words = q.trim().split(/\s+/).filter(Boolean).length;
+  const deep = words >= 6 || /\b(explain|mechanism|compare|comparison|difference|differences|differentiate|distinguish|pathogenesis|versus|vs)\b/i.test(q) || /(ব্যাখ্যা|পার্থক্য)/.test(q);
+  return deep ? { lo: 5, hi: 8, deep } : { lo: 2, hi: 3, deep };
+}
+
+const searchPrompt = (q: string, lo: number, hi: number, deep: boolean) => `You are a medical laboratory technology teacher. Use Google Search to find current, correct information, then write exam-ready study notes for this question:
+"${q}"
+
+Write ${lo} to ${hi} numbered points.${deep ? ' Cover what applies: definition, mechanism or principle, clinical features, laboratory diagnosis, key facts and values.' : ' Only the most important, high-yield facts.'}
+Format: one point per line, EXACTLY like:
+1. **Key Concept**: 1-2 clear factual sentences.
+2. **Key Concept**: 1-2 clear factual sentences.
+Rules:
+- Key Concept = 2 to 5 words inside ** **. Explanation = 1 or 2 complete sentences, at most 30 words, never cut in the middle.
+- Never repeat the Key Concept inside its explanation.
+- No introduction, no conclusion, no headings, no links, no citation numbers like [1], no source names.
+- Keep numbers, units and names exact. Answer in the language of the question.`;
+
+const stripCites = (t: string) => t.replace(/\s*\[(?:\d+(?:\s*[,\u2013-]\s*\d+)*)\]/g, '').replace(/\s*\((?:source|sources)[^)]*\)/gi, '');
+// "1. **A**: text\n   * more" -> the indented sub-bullet becomes part of point 1 (not a new point without a title)
+function mergeSub(t: string): string {
+  const out: string[] = [];
+  for (const l of t.replace(/\r/g, '').split('\n')) {
+    if (/^\s{2,}[-*\u2022]\s+\S/.test(l) && out.length) { const a = out[out.length - 1].trimEnd(); out[out.length - 1] = (/[.!?\u0964:;]$/.test(a) ? a : a + '.') + ' ' + l.replace(/^\s*[-*\u2022]\s+/, '').replace(/\*+/g, '').trim(); }
+    else if (l.trim()) out.push(l);
+  }
+  return out.join('\n');
+}
+
+async function geminiCall(model: string, key: string, prompt: string, signal: AbortSignal): Promise<{ status: number; text: string }> {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+    }),
+    signal,
+  });
+  if (!r.ok) return { status: r.status, text: '' };
+  const data: any = await r.json().catch(() => null);
+  const parts: any[] = data?.candidates?.[0]?.content?.parts || [];
+  return { status: 200, text: parts.filter((p) => p?.text && !p.thought).map((p) => String(p.text)).join('') };
+}
+
+export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId): Promise<Point[]> {
+  const key = (apiKey || gem.key || ENV_KEY || '').trim();
+  if (!key) throw new GeminiError('nokey');
+  let net: any = null;
+  try { net = await Network.getNetworkStateAsync(); } catch {}
+  if (net && (!net.isConnected || net.isInternetReachable === false)) throw new GeminiError('offline');
+
+  const my = ++searchJob;
+  try { searchAbort?.abort(); } catch {}
+  const ctl = new AbortController();
+  searchAbort = ctl;
+  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, 30000);
+  const { lo, hi, deep } = searchDepth(query);
+  const prompt = searchPrompt(query.trim(), lo, hi, deep);
+  const first = model || gem.model;
+  const order: GeminiModelId[] = [first, ...GEMINI_MODELS.map((m) => m.id).filter((id) => id !== first)];
+  try {
+    let text = '';
+    let lastStatus = 0;
+    for (const m of order) {
+      let res: { status: number; text: string };
+      try { res = await geminiCall(m, key, prompt, ctl.signal); }
+      catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
+      if (my !== searchJob) throw new GeminiError('cancelled');
+      lastStatus = res.status;
+      if (res.status === 200) { text = res.text; break; }
+      if (res.status === 400 || res.status === 401 || res.status === 403) throw new GeminiError('badkey', `HTTP ${res.status}`);
+      if (res.status === 429) throw new GeminiError('quota', 'HTTP 429');
+      if (res.status !== 404) break;                                  // 404 = this model id was retired: try the next one; anything else: stop
+    }
+    if (!text.trim()) throw new GeminiError(lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
+    const clean = mergeSub(stripCites(text));
+    let pts = parseAnswer(clean, '', hi, false);
+    if (!pts.length) {                                                // the model ignored the numbering: take its lines as points anyway
+      const alt: Omit<Point, 'n'>[] = [];
+      for (const l of clean.split('\n')) {
+        const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, ''));
+        if (t.text.length > 8) alt.push(t);
+        if (alt.length >= hi) break;
+      }
+      pts = alt.map((p, i) => ({ n: i + 1, ...p }));
+    }
+    if (!pts.length) throw new GeminiError('empty');
+    return pts;
+  } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
 }
