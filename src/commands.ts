@@ -2,7 +2,7 @@ import { queryTokens, rankTopics } from './match';
 
 export type Cmd =
   | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'question'; q?: string }
-  | { t: 'repeat'; arg?: string } | { t: 'pick'; n: number }
+  | { t: 'repeat'; arg?: string; mode?: 'line' | 'prev' | 'point' } | { t: 'pick'; n: number }
   | { t: 'continue' | 'pause' | 'stop' | 'next' | 'prev' | 'slower' | 'faster' | 'unknown' };
 
 const NUM: Record<string, string> = {
@@ -104,7 +104,14 @@ export function parse(s: string): Cmd {
   // question [whole question] [okay]: say "question", then the full question, then "okay"
   m = x.match(/^(?:ask (?:a )?question|questions?|প্রশ্ন)(?:\s*:?\s+(.+))?$/);
   if (m) return { t: 'question', q: m[1] };
-  m = x.match(/^(?:repeat|again|আবার)(?:\s+(?:point\s+)?(.+))?$/);
-  if (m) return { t: 'repeat', arg: m[1] ? (NUM[m[1]] ?? m[1]) : undefined };
+  m = x.match(/^(?:repeat|again|আবার)(?:\s+(.+))?$/);
+  if (m) {
+    const a = (m[1] || '').trim();
+    if (!a || /^(?:line|this|it|this line|the line|current|current line|now)$/.test(a)) return { t: 'repeat', mode: 'line' };          // the line being read
+    if (/^(?:previous|prev|previous line|last|last line|back|before|the previous|one before)$/.test(a)) return { t: 'repeat', mode: 'prev' };   // the line before
+    const pm = a.match(/^point(?:\s+(.+))?$/);                                                                                          // the whole point
+    if (pm) return { t: 'repeat', mode: 'point', arg: pm[1] ? (NUM[pm[1]] ?? pm[1]) : undefined };
+    return { t: 'repeat', mode: 'point', arg: NUM[a] ?? a };                                                                           // "repeat 3" / "repeat <title>"
+  }
   return { t: 'unknown' };
 }
