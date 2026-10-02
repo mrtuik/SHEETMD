@@ -18,7 +18,7 @@ import {
   listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
 } from './src/db';
 import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis,
-  searchWithGoogle, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
+  searchWithGoogle, searchInfo, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
@@ -422,13 +422,15 @@ function Main() {
     if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
     if (!hasGeminiKey()) { push('app', 'Live Google search needs a Gemini API key. Add it in Models (top right).'); setShowModels(true); return; }
     const myReq = ++reqRef.current;
+    let offlineFallback = false;                                       // Gemini limit used up -> answer with the offline model after this block
     makingRef.current = true; setWorking(mode === 'long' ? 'Searching Google live… writing full notes' : 'Searching Google live…');
     try {
       const pts = await searchWithGoogle(q, undefined, undefined, { mode, marks });
       if (reqRef.current !== myReq) return;                            // a newer request took over
       rowY.current = {}; cardY.current = null;
       const nm = (mode === 'long' ? 'Search (long): ' : 'Search: ') + (q.length > 60 ? q.slice(0, 57) + '...' : q);
-      push('app', mode === 'long' ? `Live Google search (Gemini): full ${marks}-mark answer. Not from your sources` : 'Live Google search (Gemini): short answer. Not from your sources');
+      push('app', searchInfo.fromCache ? 'Saved answer from your earlier search (no Google call used). Not from your sources'
+        : mode === 'long' ? `Live Google search (Gemini): full ${marks}-mark answer. Not from your sources` : 'Live Google search (Gemini): short answer. Not from your sources');
       push('app', TOPIC + nm);
       R.startTopic(0, nm, pts, `Search. ${pts.length} points.`);       // shown 1, 2, 3... and read aloud at once
     } catch (e: any) {
@@ -437,13 +439,19 @@ function Main() {
       if (k === 'nokey' || k === 'badkey') {
         push('app', k === 'nokey' ? 'Live Google search needs a Gemini API key. Add it in Models (top right).' : 'Google did not accept the Gemini API key. Check it in Models.');
         setShowModels(true);
-      } else if (k === 'quota') push('app', 'The Gemini free limit is reached for now. Try again in a little while.');
+      } else if (k === 'quota') {
+        if (smart && llm.phase === 'ready') {
+          offlineFallback = true;
+          push('app', 'The Gemini free limit is used up for now. Answering with the offline model instead. This is NOT live Google search, so double-check important facts');
+        } else push('app', 'The Gemini free limit is used up for now (it resets daily). Try again later. Download the smart model in Models to get offline answers when this happens');
+      }
       else {
         const msg = 'Could not fetch live search results, please check internet.';
         push('app', msg);
         ToastAndroid.show(msg, ToastAndroid.LONG);
       }
     } finally { makingRef.current = false; setWorking(''); }
+    if (offlineFallback) await explainTopic(mode === 'long' ? qRaw : `${q} 3 marks`);
   };
 
   // spoken question: "question" -> say the whole question -> "okay"
@@ -1087,7 +1095,7 @@ function Main() {
                     <Text style={[st.segT, gemModel === m.id && { color: '#fff' }]} numberOfLines={1}>{m.label}</Text>
                   </TouchableOpacity>))}
               </View>
-              <Text style={st.val}>{GEMINI_MODELS.find((m) => m.id === gemModel)?.note}. If Google retires a model, the other one is used automatically.</Text>
+              <Text style={st.val}>{GEMINI_MODELS.find((m) => m.id === gemModel)?.note}. If a model's free limit is used up or Google retires it, the next model is used automatically. Finished searches are saved and reused without using any limit.</Text>
             </View>
             <View style={st.sep} />
             <View style={{ paddingVertical: 12 }}>
