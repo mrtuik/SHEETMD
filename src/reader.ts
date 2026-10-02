@@ -233,7 +233,7 @@ export function setRate(d: number) {
 export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); keep('pause', state.pauseSec); }
 let gapT: any = null;
 export function setWordGap(d: number) {
-  state.wordGap = Math.min(5, Math.max(0, +(state.wordGap + d).toFixed(1))); emit(); keep('wgap', state.wordGap);
+  state.wordGap = Math.min(2, Math.max(0, +(state.wordGap + d).toFixed(1))); emit(); keep('wgap', state.wordGap);
   // apply NOW (like speed): the line being read starts again in the new mode
   if (state.status === 'reading') {
     clearTimeout(gapT);
@@ -256,7 +256,7 @@ export async function loadSettings() {
     const lg = await g('lang'); if (lg === 'auto' || lg === 'en' || lg === 'bn') state.lang = lg;
     const ro = await g('repeat'); if (ro) state.repeatOn = ro === '1';
     const wk = await g('wake'); if (wk) state.wakeOn = wk === '1';
-    const wg = parseFloat(await g('wgap')); if (!isNaN(wg)) state.wordGap = Math.min(5, Math.max(0, wg));
+    const wg = parseFloat(await g('wgap')); if (!isNaN(wg)) state.wordGap = Math.min(2, Math.max(0, +wg.toFixed(1)));
     const rn = parseInt(await g('repeatn'), 10); if (!isNaN(rn)) state.repeatN = Math.min(3, Math.max(2, rn));
   } catch {}
   emit();
