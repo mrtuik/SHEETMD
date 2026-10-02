@@ -3,6 +3,9 @@ package expo.modules.sheetservice
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -57,5 +60,26 @@ class SheetServiceModule : Module() {
     }
 
     Function("muteBeep") { on: Boolean -> setBeepMuted(on) }
+
+    // true = the phone does not put this app to sleep in the background
+    Function("batteryUnrestricted") {
+      val ctx = appContext.reactContext?.applicationContext
+      val pm = ctx?.getSystemService(Context.POWER_SERVICE) as? PowerManager
+      if (ctx == null || pm == null) true else pm.isIgnoringBatteryOptimizations(ctx.packageName)
+    }
+    Function("requestBatteryUnrestricted") {
+      val ctx = appContext.reactContext?.applicationContext
+      if (ctx != null) {
+        try {
+          ctx.startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+              .setData(Uri.parse("package:" + ctx.packageName))
+              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+          try { ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+          catch (e2: Exception) { }
+        }
+      }
+    }
   }
 }
