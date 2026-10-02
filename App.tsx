@@ -804,7 +804,7 @@ function Main() {
             <Icon n="plus" size={22} /><Text style={st.emptyT}>Add a source to begin</Text>
           </TouchableOpacity>) : null}
         {msgs.map(renderMsg)}
-        {(working || indexing) ? <View style={st.status}><Dots /><Text style={st.statusT}>{working || 'Indexing…'}</Text></View> : null}
+        {(working || indexing) ? <View style={st.statusCol}><Text style={st.statusT}>{working || 'Indexing…'}</Text><SkeletonShimmer /></View> : null}
       </ScrollView>
 
       <View style={[st.dock, { paddingBottom: kbPad > 0 ? 8 : ins.bottom + 14 }]}>
@@ -1395,6 +1395,37 @@ function Wave({ active, mic, color, height = 28 }: { active: boolean; mic?: bool
   );
 }
 
+// Skeleton lines with a soft light band sweeping left to right (shown while notes are being written).
+// No gradient library: the band is a few narrow strips with rising/falling opacity. Native driver only, so it never touches JS.
+const SK_LINES = ['92%', '78%', '56%'];
+const SK_BAND = 120;
+const SK_STRIPS = [0.08, 0.2, 0.38, 0.55, 0.38, 0.2, 0.08];
+function SkeletonShimmer() {
+  const { width } = useWindowDimensions();
+  const x = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(x, { toValue: 1, duration: 1300, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+      Animated.delay(250),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, []);
+  const travel = width;                                              // enough to cross any line
+  const tx = x.interpolate({ inputRange: [0, 1], outputRange: [-SK_BAND, travel] });
+  return (
+    <View style={{ gap: 9 }}>
+      {SK_LINES.map((w, i) => (
+        <View key={i} style={{ width: w as any, height: 12, borderRadius: 6, backgroundColor: C.dis, overflow: 'hidden' }}>
+          <Animated.View style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: SK_BAND, flexDirection: 'row', transform: [{ translateX: tx }] }}>
+            {SK_STRIPS.map((o, k) => (
+              <View key={k} style={{ flex: 1, backgroundColor: `rgba(255,255,255,${o + 0.1})` }} />))}
+          </Animated.View>
+        </View>))}
+    </View>
+  );
+}
+
 // Three dots that rise one after the other (shown while notes are being written)
 function Dots() {
   const v = useRef([0, 1, 2].map(() => new Animated.Value(0))).current;
@@ -1489,6 +1520,7 @@ const st = StyleSheet.create({
   you: { backgroundColor: C.acc, alignSelf: 'flex-end', borderRadius: 18, borderBottomRightRadius: 6, paddingHorizontal: 14, paddingVertical: 9, maxWidth: '80%' },
   status: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6, paddingHorizontal: 2 },
   statusT: { color: C.sec, fontSize: 14 },
+  statusCol: { gap: 10, paddingVertical: 8, paddingHorizontal: 2 },
   empty: { borderWidth: 1, borderColor: C.bd, borderRadius: 14, padding: 18, alignItems: 'center', marginTop: 40, flexDirection: 'row', justifyContent: 'center', gap: 8 },
   emptyT: { color: C.tx, fontSize: 16 },
 
