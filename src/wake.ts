@@ -45,7 +45,10 @@ export function splitWake(text: string, spoken = ''): { hit: boolean; rest: stri
   // 1) wake word at the start ("tuik pause", "hey tuik pause")
   const skip = words.length > 1 && LEAD.has(norm(words[0])) ? 1 : 0;
   const n0 = at(words, skip, false);
-  if (n0) return { hit: true, rest: trimLead(words.slice(skip + n0).join(' ')) };
+  // a word of the notes the app itself is saying ("quick", "tick", "tweet" ...) is not the wake word
+  const sp0 = new Set(tokens(spoken));
+  const own = n0 > 0 && spoken !== '' && words.slice(skip, skip + n0).map(norm).every((t) => sp0.has(t));
+  if (n0 && !own) return { hit: true, rest: trimLead(words.slice(skip + n0).join(' ')) };
   // 2) glued behind the app's own voice: take the LAST clear "tuik" that the app did not say itself
   const sp = new Set(tokens(spoken));
   for (let i = words.length - 1; i >= 1; i--) {
