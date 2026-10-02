@@ -7,6 +7,7 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
+import * as Clipboard from 'expo-clipboard';
 import { parse, parsePick, isGreeting, stripChoiceEcho, setChoiceNames, pickByName, OK_END, CANCEL_Q, isWeakCmd } from './src/commands';
 import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
@@ -15,7 +16,7 @@ import { splitSentences } from './src/cleaner';
 import * as R from './src/reader';
 import {
   findTopic, findExact, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
-  listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, getMeta, setMeta, Source, Chat,
+  listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, setMsgData, getMeta, setMeta, Source, Chat,
 } from './src/db';
 import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis,
   searchWithGoogle, searchInfo, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
@@ -33,7 +34,14 @@ import {
   speak, stopSpeak, DEFAULT_VOICE_ID, pickCustomVoice,
 } from './src/tts';
 
-type Msg = { id: number; who: 'you' | 'app'; text: string };
+type CardData = { pts: Point[]; tid: number; liked?: boolean };       // the full reply of a topic card: saved with the message, so it is never hidden and survives a restart
+type Msg = { id: number; who: 'you' | 'app'; text: string; data?: CardData };
+const parseCard = (j: any): CardData | undefined => { try { const d = typeof j === 'string' ? JSON.parse(j) : j; return d && Array.isArray(d.pts) && d.pts.length ? d : undefined; } catch { return undefined; } };
+// plain text of a reply (for Copy)
+const cardText = (name: string, pts: Point[]) => [name, '', ...pts.map((p) => {
+  const body = p.bullets?.length ? p.bullets.map((b) => '- ' + b).join('\n') : p.text;
+  return `${p.n}. ${p.title}${body ? '\n' + body : ''}${p.hint ? '\nBanglish: ' + p.hint : ''}`;
+})].join('\n').trim();
 const TOPIC = '\u2063T\u2063';                  // hidden marker: this reply is a topic card
 const CHOICE = '\u2063C\u2063';                 // hidden marker: this reply is the "did you mean" list (top 3 topics)
 
@@ -142,16 +150,38 @@ function Main() {
   const refresh = useCallback(async () => { try { setSources(chatRef.current ? await listSources(chatRef.current) : []); } catch {} }, []);
   const refreshChats = useCallback(async () => { try { setChats(await listChats()); } catch {} }, []);
   // every message is saved to the current chat
-  const push = (who: Msg['who'], text: string) => {
-    setMsgs((m) => [...m, { id: idRef.current++, who, text }]);
-    if (chatRef.current) addMsg(chatRef.current, who, text).then(refreshChats).catch(() => {});
+  const dbIds = useRef<Record<number, number>>({});          // screen id -> database id of the same message
+  const waitSave = useRef<Record<number, string>>({});       // a card saved before its database id was known
+  const saveT = useRef<Record<number, any>>({});
+  const [liveId, setLiveId] = useState(0);                   // the topic card that is being read now (shows the highlight)
+  const push = (who: Msg['who'], text: string): number => {
+    const id = idRef.current++;
+    setMsgs((m) => [...m, { id, who, text }]);
+    if (text.startsWith(TOPIC)) setLiveId(id);
+    if (chatRef.current) addMsg(chatRef.current, who, text).then((dbId) => {
+      dbIds.current[id] = dbId;
+      const w = waitSave.current[id]; if (w) { delete waitSave.current[id]; setMsgData(dbId, w).catch(() => {}); }
+      refreshChats();
+    }).catch(() => {});
+    return id;
+  };
+  // keep the full points (and the like) inside the card message
+  const saveCard = (id: number, d: CardData) => {
+    setMsgs((m) => m.map((x) => (x.id === id ? { ...x, data: d } : x)));
+    clearTimeout(saveT.current[id]);
+    saveT.current[id] = setTimeout(() => {
+      const json = JSON.stringify(d); const db = dbIds.current[id];
+      if (db) setMsgData(db, json).catch(() => {}); else waitSave.current[id] = json;
+    }, 500);
   };
   const showChat = async (id: number) => {
-    chatRef.current = id; setChatId(id); rowY.current = {}; choicesRef.current = null;
+    chatRef.current = id; setChatId(id); rowY.current = {}; choicesRef.current = null; setLiveId(0);
     refresh();                                              // each chat shows only its own sources
     const m = await loadMsgs(id);
     idRef.current = (m.length ? Math.max(...m.map((x) => x.id)) : 0) + 1;
-    setMsgs(m);
+    dbIds.current = {}; waitSave.current = {};
+    m.forEach((x) => { dbIds.current[x.id] = x.id; });
+    setMsgs(m.map((x) => ({ id: x.id, who: x.who, text: x.text, data: x.text.startsWith(TOPIC) ? parseCard(x.data) : undefined })));
   };
   const resetReader = async () => { try { R.reset(); } catch {} await clearSession().catch(() => {}); };
   const startNew = async () => {
@@ -280,13 +310,13 @@ function Main() {
     return true;
   };
   // ---- chunk-by-chunk streaming: every point the model finishes is shown and read at once -------------------------------
-  // The first two points start the reading (so it does not stop after one line); then each new point is added while the voice goes on.
+  // The FIRST point starts the reading; each new point is added while the voice goes on (the reader waits for the next one if it catches up).
   type Sess = { id: number; name: string; intro: string; label: string; pts: Point[]; started: boolean };
   const newStream = (id: number, name: string, intro: string, label = ''): Sess => ({ id, name, intro, label, pts: [], started: false });
   const feedStream = (se: Sess, p: Point) => {
     se.pts.push(p);
     if (se.started) { R.appendPoints([p]); return; }
-    if (se.pts.length < 2) return;
+    // reading starts with the FIRST point the model finishes; the reader then waits (growing) for each next point
     se.started = true;
     rowY.current = {}; cardY.current = null; follow.current = true;
     if (se.label) push('app', se.label);
@@ -318,6 +348,7 @@ function Main() {
       if (r.cancelled) { if (reqRef.current === myReq) push('app', 'Stopped. Say or type the topic again.'); return; }   // never leave an empty reply
       if (r.notInSource) { notFound(f.alts); return; }                   // the model found nothing about it in the source
       if (r.pts) { await saveNotes(f.id, r.pts, 'llm', sm.marks); if (se.started) return; pts = r.pts; }   // already on screen and being read when it was streamed
+      else if (se.started) return;                                       // the reading started on the first point; never start a second reading on top of it
     }
     if (!pts || !pts.length) { pts = makeNotes(f.name, f.body); await saveNotes(f.id, pts, 'rule', 0); }
     if (!pts || !pts.length) { push('app', `Found “${f.name}” but there is no readable text in it.`); return; }
@@ -812,17 +843,75 @@ function Main() {
     return () => clearTimeout(tm);
   }, [!!working]);
 
-  const lastTopic = (() => { for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].text.startsWith(TOPIC)) return i; return -1; })();
+  // ---- topic replies: every reply keeps its FULL points on screen (older ones are not collapsed, not hidden) ----
+  const msgsRef = useRef<Msg[]>([]); msgsRef.current = msgs;
+  // the card that is being read now (highlight + follow). Others are shown complete from their saved points.
+  const liveMsgId = (() => {
+    if (liveId && msgs.some((x) => x.id === liveId)) return liveId;
+    for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].text.startsWith(TOPIC) && msgs[i].text.slice(TOPIC.length) === s.topic) return msgs[i].id;
+    return 0;
+  })();
+  const liveMsgRef = useRef(0); liveMsgRef.current = liveMsgId;
+  // save the points of the card being read into its message (also while the model is still streaming new points)
+  useEffect(() => {
+    if (!s.points.length) return;
+    const m = msgs.find((x) => x.id === liveMsgId);
+    if (!m || m.text.slice(TOPIC.length) !== s.topic) return;
+    const d = m.data;
+    if (d && (d.pts === s.points || (d.pts.length === s.points.length && d.tid === s.topicId))) return;
+    saveCard(m.id, { pts: s.points, tid: s.topicId, liked: d?.liked });
+  }, [s.points, s.topic, s.topicId, liveMsgId, msgs]);
   const goPoint = useCallback((k: number) => { follow.current = true; R.goto(k); }, []);
   const setRowY = useCallback((k: number, y: number) => { rowY.current[k] = y; }, []);
+  // read a saved reply (from the start, or from a tapped point)
+  const playCard = useCallback((id: number, from = 0) => {
+    const m = msgsRef.current.find((x) => x.id === id);
+    const pts = m?.data?.pts;
+    if (!m || !pts || !pts.length) return;
+    if (makingRef.current) cancelGen();                                 // a new reading never mixes with notes that are still being written
+    follow.current = true; rowY.current = {}; cardY.current = null;
+    stopSpeak(); setLiveId(id);
+    R.startTopic(m.data?.tid || 0, m.text.slice(TOPIC.length), pts, undefined, false, from);
+  }, []);
+  // play button under a reply: pause / resume the one being read, or start this one
+  const onPlayBtn = useCallback((id: number) => {
+    const m = msgsRef.current.find((x) => x.id === id); if (!m) return;
+    const name = m.text.slice(TOPIC.length);
+    if (liveMsgRef.current === id && R.state.topic === name && R.state.points.length) {
+      if (R.state.status === 'reading') R.pause(); else { follow.current = true; R.resume(); }
+    } else playCard(id, 0);
+  }, [playCard]);
+  const copyCard = useCallback(async (id: number) => {
+    const m = msgsRef.current.find((x) => x.id === id); if (!m) return;
+    const name = m.text.slice(TOPIC.length);
+    const pts = m.data?.pts?.length ? m.data.pts : R.state.topic === name ? R.state.points : [];
+    if (!pts.length) return;
+    try { await Clipboard.setStringAsync(cardText(name, pts)); ToastAndroid.show('Copied', ToastAndroid.SHORT); }
+    catch { ToastAndroid.show('Could not copy', ToastAndroid.SHORT); }
+  }, []);
+  const likeCard = useCallback((id: number) => {
+    const m = msgsRef.current.find((x) => x.id === id); if (!m) return;
+    const name = m.text.slice(TOPIC.length);
+    const base: CardData | undefined = m.data ?? (R.state.topic === name && R.state.points.length ? { pts: R.state.points, tid: R.state.topicId } : undefined);
+    if (base) saveCard(id, { ...base, liked: !base.liked });
+  }, []);
   const renderMsg = (m: Msg, i: number) => {
     if (m.text.startsWith(TOPIC)) {
       const name = m.text.slice(TOPIC.length);
-      const live = i === lastTopic && s.points.length > 0 && s.topic === name;
-      if (!live) {                                              // older topic replies stay as a small title row
+      const live = m.id === liveMsgId && s.points.length > 0 && s.topic === name;
+      const writing = !!working && m.id === liveId;                         // still being written: no buttons yet (they appear when the reply is complete, like Claude)
+      if (!live) {
+        const pts = m.data?.pts;
+        if (pts && pts.length) {
+          return <TopicCard key={m.id} id={m.id} name={name} pts={pts} liked={!!m.data?.liked} writing={writing} onPlay={onPlayBtn} onGo={playCard} onCopy={copyCard} onLike={likeCard} />;
+        }
+        // an older reply from before replies were saved: only its title is known
         return (
-          <TouchableOpacity key={m.id} style={st.card} activeOpacity={0.6} onPress={() => { follow.current = true; openTopic(name, true); }}>
-            <View style={st.cardHead}><Icon n="file" size={18} /><Text style={st.cardT} numberOfLines={1}>{name}</Text></View>
+          <TouchableOpacity key={m.id} style={st.card} activeOpacity={0.6} onPress={() => {
+            if (/^(Explain|Answer|Search)/.test(name)) ToastAndroid.show('This old reply was not saved. Ask it again.', ToastAndroid.SHORT);
+            else { follow.current = true; openTopic(name, true); }
+          }}>
+            <View style={st.cardHead}><Icon n="file" size={18} /><Text style={st.cardT}>{name}</Text></View>
           </TouchableOpacity>);
       }
       return (
@@ -832,6 +921,7 @@ function Main() {
             const act = k === s.idx && s.status !== 'idle';
             return <PointBlock key={p.n} p={p} k={k} line={act ? R.lineOf(p, s.chunk - 1) : -1} sent={act ? s.chunk - 1 : -1} onGo={goPoint} onY={setRowY} />;
           })}
+          {!writing && <CardActions id={m.id} playing={playing} liked={!!m.data?.liked} onPlay={onPlayBtn} onCopy={copyCard} onLike={likeCard} />}
         </View>);
     }
     if (m.text.startsWith(CHOICE)) {
@@ -1632,6 +1722,27 @@ const PointBlock = React.memo(function PointBlock({ p, k, line, sent, onGo, onY 
     </TouchableOpacity>);
 });
 
+const noY = () => {};
+// Play / Copy / Like under a finished reply (icons: assets/icons/ic_tuik_play.png, ic_tuik_copy.png, ic_tuik_like.png)
+const CardActions = React.memo(function CardActions({ id, playing, liked, onPlay, onCopy, onLike }: { id: number; playing: boolean; liked: boolean; onPlay: (id: number) => void; onCopy: (id: number) => void; onLike: (id: number) => void }) {
+  return (
+    <View style={st.actRow}>
+      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }} onPress={() => onPlay(id)}><Icon n={playing ? 'pause' : 'play'} size={20} color={C.sec} /></TouchableOpacity>
+      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }} onPress={() => onCopy(id)}><Icon n="copy" size={20} color={C.sec} /></TouchableOpacity>
+      <TouchableOpacity style={st.actBtn} activeOpacity={0.6} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }} onPress={() => onLike(id)}><Icon n="like" size={20} color={liked ? C.bad : C.sec} /></TouchableOpacity>
+    </View>);
+});
+
+// A saved reply that is not being read now: the complete text, nothing collapsed. Memoised, so the reading highlight on another card never re-renders it.
+const TopicCard = React.memo(function TopicCard({ id, name, pts, liked, writing, onPlay, onGo, onCopy, onLike }: { id: number; name: string; pts: Point[]; liked: boolean; writing: boolean; onPlay: (id: number) => void; onGo: (id: number, k: number) => void; onCopy: (id: number) => void; onLike: (id: number) => void }) {
+  return (
+    <View style={st.card}>
+      <Text style={st.topicT}>{name}</Text>
+      {pts.map((p, k) => <PointBlock key={p.n} p={p} k={k} line={-1} sent={-1} onGo={(kk) => onGo(id, kk)} onY={noY} />)}
+      {!writing && <CardActions id={id} playing={false} liked={liked} onPlay={onPlay} onCopy={onCopy} onLike={onLike} />}
+    </View>);
+});
+
 const st = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 10, paddingBottom: 6 },
@@ -1659,6 +1770,8 @@ const st = StyleSheet.create({
   ptBody: { flex: 1 },
   ptTitle: { fontWeight: '700', fontSize: 16, lineHeight: 24, color: C.tx, marginBottom: 3 },
   ptLine: { color: C.tx, fontSize: 15.5, lineHeight: 24, marginBottom: 4 },
+  actRow: { flexDirection: 'row', alignItems: 'center', gap: 14, paddingTop: 6, paddingLeft: 2 },
+  actBtn: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center' },
   cardHead: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2 },
   cardT: { flex: 1, fontWeight: '700', fontSize: 16, color: C.tx },
   ptRow: { flexDirection: 'row', gap: 10, paddingVertical: 7, paddingHorizontal: 8, borderRadius: 10 },
