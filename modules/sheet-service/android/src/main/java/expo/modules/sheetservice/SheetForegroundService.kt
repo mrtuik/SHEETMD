@@ -28,6 +28,7 @@ class SheetForegroundService : Service() {
     const val ACT_STOP = "expo.modules.sheetservice.STOP"
     @Volatile var onAction: ((String) -> Unit)? = null
     @Volatile var running = false
+    @Volatile var micOn = false          // our own speech recogniser is listening
   }
 
   private var wake: PowerManager.WakeLock? = null
@@ -47,7 +48,11 @@ class SheetForegroundService : Service() {
   // Pause for phone / VoIP calls only (the speech recognizer also grabs focus briefly; ignore that)
   private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
     val m = am?.mode
-    val inCall = m == AudioManager.MODE_IN_CALL || m == AudioManager.MODE_RINGTONE || m == AudioManager.MODE_IN_COMMUNICATION
+    // Only a REAL call pauses the reading. Many phones (ColorOS too) switch to MODE_IN_COMMUNICATION while the speech recogniser
+    // listens, and the old check then paused the reading by itself every time the app started to speak. While our own mic is on,
+    // MODE_IN_COMMUNICATION is therefore ignored.
+    val inCall = m == AudioManager.MODE_IN_CALL || m == AudioManager.MODE_RINGTONE ||
+      (m == AudioManager.MODE_IN_COMMUNICATION && !micOn)
     if (change < 0 && inCall) { pausedByCall = true; onAction?.invoke("pause") }
     else if (change == AudioManager.AUDIOFOCUS_GAIN && pausedByCall) { pausedByCall = false; onAction?.invoke("resume") }
   }
@@ -110,6 +115,7 @@ class SheetForegroundService : Service() {
       intent?.getStringExtra("text") ?: "",
       intent?.getBooleanExtra("playing", false) ?: false
     )
+    micOn = intent?.getBooleanExtra("mic", false) ?: false
     var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
     if ((intent?.getBooleanExtra("mic", false) ?: false) && Build.VERSION.SDK_INT >= 30) {
       type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -128,6 +134,7 @@ class SheetForegroundService : Service() {
 
   override fun onDestroy() {
     running = false
+    micOn = false
     try { unregisterReceiver(receiver) } catch (e: Exception) {}
     try { wake?.release() } catch (e: Exception) {}
     if (Build.VERSION.SDK_INT >= 26) focusReq?.let { am?.abandonAudioFocusRequest(it) }
