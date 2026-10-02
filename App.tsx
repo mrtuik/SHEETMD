@@ -6,7 +6,7 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
-import { parse, parsePick, isGreeting, stripChoiceEcho, setChoiceNames, pickByName, OK_END, CANCEL_Q } from './src/commands';
+import { parse, parsePick, isGreeting, stripChoiceEcho, setChoiceNames, pickByName, OK_END, CANCEL_Q, isWeakCmd } from './src/commands';
 import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
 import { exactPoints } from './src/exact';
@@ -426,7 +426,28 @@ function Main() {
   const execRef = useRef(exec);
   execRef.current = exec;
   // Mic stays on; only real commands are accepted, and anything the app is itself speaking is ignored
-  const heardSelf = (t: string) => t.trim().split(/\s+/).length >= 3 && R.state.status === 'reading' && R.getSpoken().toLowerCase().includes(t.toLowerCase().trim());
+  // ---- the mic hears the app's OWN voice: never let that become a command -------------------------------------------
+  const tok = (x: string) => x.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  const stem = (w: string) => w.slice(0, 5);
+  const heardSelf = (t: string) => {
+    if (R.state.status !== 'reading') return false;
+    const ht = tok(t);
+    if (ht.length < 3) return false;
+    if (R.getSpoken().toLowerCase().includes(t.toLowerCase().trim())) return true;
+    const sp = new Set(tok(R.getSpoken()).map(stem));
+    return ht.filter((w) => sp.has(stem(w))).length / ht.length >= 0.75;      // misheard by a word or two: still the app's voice
+  };
+  // "Topic X. 6 points." is spoken by the app itself; the mic hears "topic X" and used to open the topic AGAIN, over and over
+  // (so the lines were never reached). While that intro plays (and for 2.5 s after) a topic / exact / explain command made only of its words is ignored.
+  const introEcho = (q: string) => {
+    const intro = R.introActive();
+    if (!intro) return false;
+    const it = new Set(tok(intro).map(stem));
+    const qt = tok(q).filter((w) => !/^(?:point|points)$/.test(w));
+    return qt.length > 0 && qt.filter((w) => it.has(stem(w))).length / qt.length >= 0.7;
+  };
+  // ordinary words that are also playback aliases (hold / wait / back / last / start / play ...): while reading, only a command when the app did not say that word itself
+  const weakEcho = (a: string) => R.state.status === 'reading' && isWeakCmd(a) && (() => { const sp = new Set(tok(R.getSpoken())); const w = tok(a); return w.length > 0 && w.every((x) => sp.has(x)); })();
   // one-word playback commands run the moment they are heard (no waiting for the recognizer to finish)
   const FAST = new Set(['pause', 'stop', 'next', 'prev', 'continue', 'slower', 'faster']);
   // options waiting: any of the recogniser's guesses that sounds like one / two / three (also the usual mishearings)
@@ -472,11 +493,12 @@ function Main() {
         continue;
       }
       if (FAST.has(k.t) && words <= 3) {
+        if (weakEcho(a)) continue;                                       // the app's own word, not a command
         if (dupCmd(k.t)) return true;
         if (k.t === 'stop') { silence(); }
         execRef.current(a); return true;
       }
-      if (['topic', 'exact', 'explain'].includes(k.t) && (k as any).q?.trim() && !heardSelf(a)) {
+      if (['topic', 'exact', 'explain'].includes(k.t) && (k as any).q?.trim() && !heardSelf(a) && !introEcho((k as any).q)) {
         if (partial) continue;                                           // partial: the stable-words timer below decides when it is finished
         if (dupCmd(k.t + (k as any).q)) return true;
         silence(); execRef.current(a); return true;
@@ -502,23 +524,33 @@ function Main() {
     w.timer = setTimeout(() => disarm(true), 9000);                  // nothing said: carry on reading
   };
   // returns the text(s) to treat as a command, or null = not meant for the app
+  // "tuik" works in EVERY state now: alone it pauses the reading and listens 9 s for the command (so you see / hear it worked);
+  // in the background / locked it is also REQUIRED before a command. It is found even when glued behind the app's own voice.
   const wakeGate = (alts: string[], partial: boolean): string[] | null => {
-    const cut = alts.map(splitWake);
-    const need = R.state.wakeOn && AppState.currentState !== 'active';
-    if (!need) {                                                     // app open: no wake word needed, "tuik ..." works too
-      const out = alts.map((a, i) => (cut[i].hit ? cut[i].rest : a)).filter(Boolean);
-      return out.length ? out : null;
-    }
+    const w = wakeRef.current;
+    const cut = alts.map((a) => splitWake(a, R.getSpoken()));
+    const bg = R.state.wakeOn && AppState.currentState !== 'active';
+    const clearArm = () => { clearTimeout(w.timer); w.timer = null; w.paused = false; w.until = 0; setAwakeUI(false); };
     const withRest = cut.filter((c) => c.hit && c.rest).map((c) => c.rest);
-    if (withRest.length) { if (!partial) disarm(false); else { clearTimeout(wakeRef.current.timer); wakeRef.current.paused = false; wakeRef.current.until = 0; setAwakeUI(false); } return withRest; }
+    if (withRest.length) {                                           // "tuik pause" / "...reading tuik pause"
+      const slowFast = withRest.some((r) => ['slower', 'faster'].includes(parse(r).t));
+      const resumeAfter = slowFast && w.paused;
+      if (!partial) disarm(false); else clearArm();
+      if (resumeAfter) setTimeout(() => { if (R.state.status === 'paused') R.resume(); }, 400);
+      return withRest;
+    }
     if (cut.some((c) => c.hit)) { armWake(); return null; }          // just "tuik": listen for the command
+    if (!bg) {                                                       // app open: no wake word needed
+      if (w.until && alts.some((a) => parse(a).t !== 'unknown')) clearArm();       // the command after "tuik" arrived
+      return alts.filter(Boolean).length ? alts : null;
+    }
     const talking = !!choicesRef.current || !!qRef.current;          // options waiting / question being dictated: already in a conversation
-    if (Date.now() < wakeRef.current.until || talking) {
+    if (Date.now() < w.until || talking) {
       const known = alts.some((a) => parse(a).t !== 'unknown');
       if (known) {
         const slowFast = alts.some((a) => ['slower', 'faster'].includes(parse(a).t));
-        const resumeAfter = slowFast && wakeRef.current.paused;
-        if (!partial || known) { clearTimeout(wakeRef.current.timer); wakeRef.current.until = 0; wakeRef.current.paused = false; setAwakeUI(false); }
+        const resumeAfter = slowFast && w.paused;
+        clearArm();
         if (resumeAfter) setTimeout(() => { if (R.state.status === 'paused') R.resume(); }, 400);
       }
       return alts;
@@ -548,11 +580,13 @@ function Main() {
       // the recognizer's 2nd-5th guesses: a name command (topic / exact / explain / question), one / two / three while
       // options are waiting, or a short playback word (stop, pause ...) that the 1st guess got wrong
       const short = alts[0].trim().split(/\s+/).length <= 3;
-      const a = alts.slice(1).find((x) => { const k = parse(x); return ['topic', 'exact', 'explain', 'question'].includes(k.t) || (k.t === 'pick' && !!choicesRef.current) || (short && FAST.has(k.t)); });
+      const a = alts.slice(1).find((x) => { const k = parse(x); return (['topic', 'exact', 'explain'].includes(k.t) && !introEcho((k as any).q || '')) || k.t === 'question' || (k.t === 'pick' && !!choicesRef.current) || (short && FAST.has(k.t) && !weakEcho(x)); });
       if (!a) return;
       t = a; c = parse(a);
     }
     if (c.t === 'pick' && !choicesRef.current) return;             // "one / two" only means something while options are waiting
+    if (['topic', 'exact', 'explain'].includes(c.t) && introEcho((c as any).q || '')) return;
+    if (FAST.has(c.t) && weakEcho(t)) return;
     if (heardSelf(t)) return;
     execRef.current(t);
   };
@@ -569,11 +603,13 @@ function Main() {
     const k = parse(stripChoiceEcho(t));
     clearStable();
     if ((k.t === 'topic' || k.t === 'exact' || k.t === 'explain') && (k as any).q?.trim()) {
+      if (introEcho((k as any).q)) return false;                     // the app's own "Topic X" intro
       const snap = t;                                                // same words for 0.7 s = finished: go now instead of waiting for the end-of-speech silence
-      stableT.current = setTimeout(() => { stableT.current = null; if (qRef.current || dupCmd(k.t + (k as any).q)) return; markHandled(); silence(); execRef.current(snap); }, 600);
+      stableT.current = setTimeout(() => { stableT.current = null; if (qRef.current || introEcho((k as any).q) || dupCmd(k.t + (k as any).q)) return; markHandled(); silence(); execRef.current(snap); }, 600);
       return false;
     }
     if (!FAST.has(k.t) && !(k.t === 'pick' && !!choicesRef.current)) return false;      // "one / two / three" runs the moment it is heard, like stop / pause
+    if (FAST.has(k.t) && weakEcho(t)) return false;
     execRef.current(stripChoiceEcho(t));
     return true;
   };
@@ -722,7 +758,7 @@ function Main() {
           </View>
         </View>
       )}
-      <View style={st.chip}><Text style={st.sub}>{working ? working : asking ? 'Listening to your question · say okay when done' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? '  •  listening' : ''}</Text>{listening && !!heard && <Text style={[st.sub, { textAlign: 'center' }]}>heard: “{heard}”</Text>}</View>
+      <View style={st.chip}><Text style={st.sub}>{working ? working : asking ? 'Listening to your question · say okay when done' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? (awakeUI ? '  •  listening… say your command' : '  •  listening') : ''}</Text>{listening && !!heard && <Text style={[st.sub, { textAlign: 'center' }]}>heard: “{heard}”</Text>}</View>
 
       <ScrollView
         ref={list} style={{ flex: 1 }} contentContainerStyle={{ padding: 16, gap: 12 }}
