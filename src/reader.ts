@@ -25,6 +25,18 @@ let resumeAt = 0;
 let release: (() => void) | null = null;
 export const getSpoken = () => spoken;
 // true while the app says its own intro ("Topic X. 6 points."): the mic hears that and must not take it as a new command
+// words the app said on their own ("Pause between words"): the mic hears each lone word, and "next" / "stop" / "pause" / "tick" inside
+// the notes was taken as a command. Remembered for 4 s so App.tsx can tell the app's own word from your command.
+const recentWords: { w: string; at: number }[] = [];
+const wnorm = (x: string) => x.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+const noteWord = (w: string) => { const n = Date.now(); wnorm(w).forEach((x) => recentWords.push({ w: x, at: n })); while (recentWords.length > 8) recentWords.shift(); };
+export function wordEcho(heard: string): boolean {
+  if (state.wordGap <= 0 || state.status !== 'reading') return false;
+  const n = Date.now();
+  const live = recentWords.filter((r) => n - r.at < 4000).map((r) => r.w);
+  const h = wnorm(heard);
+  return h.length > 0 && h.every((x) => live.includes(x));
+}
 let inIntro = false;
 let introText = '';
 let introGrace = 0;                                  // the recogniser delivers the echo a little late: keep ignoring for 2.5 s
@@ -65,7 +77,8 @@ function halt() {
 
 // Queue every chunk at once (gapless, "streaming"); resolves when the last one finishes or is stopped.
 function say(parts: string[], from = 0, track = false): Promise<void> {
-  return new Promise((res) => {
+  return new Promise((res0) => {
+    let res = res0;
     const todo = parts.slice(from);
     if (!todo.length) { res(); return; }
     const rate = slow ? state.rate * 0.9 : state.rate;
@@ -89,13 +102,18 @@ function say(parts: string[], from = 0, track = false): Promise<void> {
           if (my !== sayId) break;
           spoken = track ? parts.join(' ') : text;
           if (track) { state.chunk = from + k; emit(); }
-          for (const w of text.split(/\s+/).filter(Boolean)) {
+          // a lone "-", "|" or "(" has nothing to say: Piper gave an error / long silence on it
+          for (const w of text.split(/\s+/).filter((x) => /[\p{L}\p{N}]/u.test(x))) {
             if (my !== sayId) break;
+            noteWord(w);
             await new Promise<void>((r) => {
               let d = false; const f = () => { if (!d) { d = true; r(); } };
-              speak(w, { ...vopts(w), onDone: f, onStopped: f, onError: f });
+              const guard = setTimeout(f, 8000);                    // a word that never reports back must not freeze the reading
+              const g = () => { clearTimeout(guard); f(); };
+              speak(w, { ...vopts(w), onDone: g, onStopped: g, onError: g });
             });
             if (my !== sayId) break;
+            noteWord(w);
             await sleep(state.wordGap * 1000);
           }
         }
@@ -104,6 +122,12 @@ function say(parts: string[], from = 0, track = false): Promise<void> {
       return;
     }
     let left = items.length;
+    // WATCHDOG: if a spoken line never reports back (lost onDone), the reading used to stay in "reading" for ever with no sound.
+    // Generous limit (slow phones, slow speed): when it passes, everything queued is stopped and the reader moves on.
+    const limit = 40000 + items.reduce((a, it) => a + 4000 + (it.text.length * 130) / Math.max(0.3, rate), 0);
+    const wd = setTimeout(() => { if (my === sayId && left > 0) { try { stopSpeak(); } catch {} release = null; res(); } }, limit);
+    const resOrig = res;
+    res = () => { clearTimeout(wd); resOrig(); };
     items.forEach(({ text, k }) => {
       let done = false;
       const fin = () => { if (done) return; done = true; if (--left <= 0) { release = null; res(); } };
@@ -207,7 +231,15 @@ export function setRate(d: number) {
   }
 }
 export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); keep('pause', state.pauseSec); }
-export function setWordGap(d: number) { state.wordGap = Math.min(5, Math.max(0, +(state.wordGap + d).toFixed(1))); emit(); keep('wgap', state.wordGap); }
+let gapT: any = null;
+export function setWordGap(d: number) {
+  state.wordGap = Math.min(5, Math.max(0, +(state.wordGap + d).toFixed(1))); emit(); keep('wgap', state.wordGap);
+  // apply NOW (like speed): the line being read starts again in the new mode
+  if (state.status === 'reading') {
+    clearTimeout(gapT);
+    gapT = setTimeout(() => { if (state.status === 'reading') { const c = state.chunk; resumeAt = 0; run(state.idx, undefined, c); } }, 600);
+  }
+}
 export function setWake(on: boolean) { state.wakeOn = on; emit(); keep('wake', on ? '1' : '0'); }
 export function setLang(l: RState['lang']) { state.lang = l; emit(); keep('lang', l); }
 export function setVoice(lang: 'en' | 'bn', id: string) { if (lang === 'bn') state.voiceBn = id; else state.voiceEn = id; emit(); }
