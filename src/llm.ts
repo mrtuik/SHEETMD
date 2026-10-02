@@ -533,17 +533,17 @@ export class GeminiError extends Error {
 let searchJob = 0;
 let searchAbort: AbortController | null = null;
 
-// short / fact question -> 2-3 points; long or "explain / compare" question -> 5-8 points
-export function searchDepth(q: string): { lo: number; hi: number; deep: boolean } {
-  const words = q.trim().split(/\s+/).filter(Boolean).length;
-  const deep = words >= 6 || /\b(explain|mechanism|compare|comparison|difference|differences|differentiate|distinguish|pathogenesis|versus|vs)\b/i.test(q) || /(ব্যাখ্যা|পার্থক্য)/.test(q);
-  return deep ? { lo: 5, hi: 8, deep } : { lo: 2, hi: 3, deep };
-}
+// "search X" / "search short X" -> 2-3 short points. "search long X" -> a full exam answer (sections with many bullets),
+// written like a topper's 5-10 mark copy. Marks can be said too: "search long anemia 10 marks" (default 10).
+export type SearchMode = 'short' | 'long';
+export type SearchOpts = { mode?: SearchMode; marks?: number };
+const longPlan = (marks: number) =>
+  marks <= 3 ? { secs: '3 to 4', bul: '3 to 5' } : marks <= 5 ? { secs: '4 to 5', bul: '4 to 6' } : marks <= 8 ? { secs: '6 to 7', bul: '5 to 8' } : marks <= 10 ? { secs: '7 to 9', bul: '5 to 10' } : { secs: '9 to 11', bul: '6 to 12' };
 
-const searchPrompt = (q: string, lo: number, hi: number, deep: boolean) => `You are a medical laboratory technology teacher. Use Google Search to find current, correct information, then write exam-ready study notes for this question:
+const shortPrompt = (q: string) => `You are a medical laboratory technology teacher. Use Google Search to find current, correct information, then write a SHORT exam-ready answer for:
 "${q}"
 
-Write ${lo} to ${hi} numbered points.${deep ? ' Cover what applies: definition, mechanism or principle, clinical features, laboratory diagnosis, key facts and values.' : ' Only the most important, high-yield facts.'}
+Write 2 to 3 numbered points. Only the most important, high-yield facts.
 Format: one point per line, EXACTLY like:
 1. **Key Concept**: 1-2 clear factual sentences.
 2. **Key Concept**: 1-2 clear factual sentences.
@@ -552,6 +552,30 @@ Rules:
 - Never repeat the Key Concept inside its explanation.
 - No introduction, no conclusion, no headings, no links, no citation numbers like [1], no source names.
 - Keep numbers, units and names exact. Answer in the language of the question.`;
+
+// Modelled on a real university answer script (Microbiology paper: causative agents / specimen collection / laboratory diagnosis with numbered steps).
+const longPrompt = (q: string, marks: number) => {
+  const pl = longPlan(marks);
+  return `You are a top-scoring student and teacher of medical laboratory technology. Use Google Search to find current, correct information, then write a COMPLETE exam answer worth ${marks} marks for:
+"${q}"
+
+Write like a topper's answer script. Use ${pl.secs} sections, each with ${pl.bul} bullet lines. Choose the sections that really fit this topic, in this order:
+- Infection or disease: Definition, Causative agents (one line per organism or group, with the age group or setting), Pathogenesis (numbered steps), Clinical features, Specimen collection (specimen, how it is collected, container, timing, transport, precautions), Laboratory diagnosis (numbered steps), Treatment, Prevention.
+- Culture medium, stain, test or technique: Definition, Types or examples, Principle, Requirements, Procedure (numbered steps with temperature, time, volume), Interpretation, Uses, Precautions.
+- Blood, haematology, biochemistry or other topic: Definition, Causes or classification, Mechanism, Clinical features, Laboratory findings, Normal values, Diagnosis, Treatment.
+For "Laboratory diagnosis" go in the order a lab works: Macroscopy, Microscopy (name the stain and what is seen), Culture (medium, temperature, atmosphere, time, colony look), Identification and biochemical tests (the key positive and negative results), Serology and rapid tests, Molecular tests, Sensitivity testing. Skip a step only if it truly does not apply.
+
+Format, EXACTLY:
+## Section title
+- Label: short fact line
+- Label: short fact line
+In numbered sections write "1. Label: short fact line" instead of "- ".
+Rules:
+- Every bullet starts with the key term, then a colon, then the fact (6 to 28 words). Complete sentences, never cut off.
+- Give exact values: temperature, time, pH, media names, stain colours, doses, normal ranges, organism names. Use only values the search confirms; never invent a number.
+- No introduction, no conclusion, no links, no citation numbers like [1], no source names, no tables.
+- Answer in the language of the question.`;
+};
 
 const stripCites = (t: string) => t.replace(/\s*\[(?:\d+(?:\s*[,\u2013-]\s*\d+)*)\]/g, '').replace(/\s*\((?:source|sources)[^)]*\)/gi, '');
 // "1. **A**: text\n   * more" -> the indented sub-bullet becomes part of point 1 (not a new point without a title)
@@ -564,14 +588,34 @@ function mergeSub(t: string): string {
   return out.join('\n');
 }
 
-async function geminiCall(model: string, key: string, prompt: string, signal: AbortSignal): Promise<{ status: number; text: string }> {
+// "## Section" + bullet lines -> Point[] (title = section, bullets = the lines; the screen shows and the voice reads one line at a time)
+function parseLong(text: string, maxSecs = 12): Point[] {
+  const out: Omit<Point, 'n'>[] = [];
+  let cur: { title: string; bullets: string[] } | null = null;
+  const fin = () => { if (cur && cur.bullets.length) out.push({ title: cur.title, text: cur.bullets.join(' '), bullets: cur.bullets.slice(0, 16) }); cur = null; };
+  for (const raw of text.replace(/\r/g, '').split('\n')) {
+    const t = raw.trim();
+    if (!t) continue;
+    const h = t.match(/^#{1,4}\s+(.+?)\s*#*$/) || t.match(/^\*\*([^*]{2,70})\*\*:?$/);
+    if (h) { fin(); cur = { title: h[1].replace(/\*+/g, '').replace(/[:：]+$/, '').replace(/^\d+[.)]\s+/, '').trim(), bullets: [] }; continue; }
+    if (/^[-=_*]{3,}$/.test(t)) continue;
+    let l = t.replace(/^[-*\u2022\u25AA\u25CF]\s+/, '').replace(/\*+/g, '').replace(/\s+/g, ' ').trim();       // keeps "1. " numbering
+    if (l.length < 6) continue;
+    if (!cur) cur = { title: 'Overview', bullets: [] };
+    cur.bullets.push(/[.!?\u0964:;)]$/.test(l) ? l : l + '.');
+  }
+  fin();
+  return out.slice(0, maxSecs).map((p, i) => ({ n: i + 1, ...p }));
+}
+
+async function geminiCall(model: string, key: string, prompt: string, signal: AbortSignal, maxTokens = 4096): Promise<{ status: number; text: string }> {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       tools: [{ google_search: {} }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+      generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
     }),
     signal,
   });
@@ -581,7 +625,7 @@ async function geminiCall(model: string, key: string, prompt: string, signal: Ab
   return { status: 200, text: parts.filter((p) => p?.text && !p.thought).map((p) => String(p.text)).join('') };
 }
 
-export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId): Promise<Point[]> {
+export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId, opts: SearchOpts = {}): Promise<Point[]> {
   const key = (apiKey || gem.key || ENV_KEY || '').trim();
   if (!key) throw new GeminiError('nokey');
   let net: any = null;
@@ -592,9 +636,11 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
   try { searchAbort?.abort(); } catch {}
   const ctl = new AbortController();
   searchAbort = ctl;
-  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, 30000);
-  const { lo, hi, deep } = searchDepth(query);
-  const prompt = searchPrompt(query.trim(), lo, hi, deep);
+  const long = opts.mode === 'long';                                 // anything else (plain "search", "search short") = short answer
+  const marks = Math.min(15, Math.max(2, opts.marks || 10));
+  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, long ? 90000 : 30000);
+  const hi = 3;
+  const prompt = long ? longPrompt(query.trim(), marks) : shortPrompt(query.trim());
   const first = model || gem.model;
   const order: GeminiModelId[] = [first, ...GEMINI_MODELS.map((m) => m.id).filter((id) => id !== first)];
   try {
@@ -602,7 +648,7 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
     let lastStatus = 0;
     for (const m of order) {
       let res: { status: number; text: string };
-      try { res = await geminiCall(m, key, prompt, ctl.signal); }
+      try { res = await geminiCall(m, key, prompt, ctl.signal, long ? 8192 : 4096); }
       catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
       if (my !== searchJob) throw new GeminiError('cancelled');
       lastStatus = res.status;
@@ -612,14 +658,19 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
       if (res.status !== 404) break;                                  // 404 = this model id was retired: try the next one; anything else: stop
     }
     if (!text.trim()) throw new GeminiError(lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
-    const clean = mergeSub(stripCites(text));
-    let pts = parseAnswer(clean, '', hi, false);
+    const clean = stripCites(text);
+    if (long) {
+      const lp = parseLong(clean);
+      if (lp.length) return lp;                                       // no "## headings": fall through and read it as numbered points
+    }
+    const merged = mergeSub(clean);
+    let pts = parseAnswer(merged, '', long ? 12 : hi, false);
     if (!pts.length) {                                                // the model ignored the numbering: take its lines as points anyway
       const alt: Omit<Point, 'n'>[] = [];
-      for (const l of clean.split('\n')) {
+      for (const l of merged.split('\n')) {
         const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, ''));
         if (t.text.length > 8) alt.push(t);
-        if (alt.length >= hi) break;
+        if (alt.length >= (long ? 12 : hi)) break;
       }
       pts = alt.map((p, i) => ({ n: i + 1, ...p }));
     }
