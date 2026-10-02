@@ -179,10 +179,11 @@ async function run(from: number, intro?: string, chunk = 0) {
 
 // Always says the topic name first, then reads point by point until you interrupt.
 // stream = true: the notes are still being written, more points arrive with appendPoints() and the end is marked with endStream()
-export function startTopic(id: number, name: string, points: Point[], intro?: string, stream = false) {
+export function startTopic(id: number, name: string, points: Point[], intro?: string, stream = false, from = 0) {
   growing = stream;
   state.topicId = id; state.topic = name; state.points = points; after = null; resumeAt = 0;
-  run(0, intro ?? `Topic ${name}. ${points.length} points.`);
+  const k = Math.min(Math.max(from, 0), Math.max(0, points.length - 1));
+  run(k, k > 0 ? undefined : (intro ?? `Topic ${name}. ${points.length} points.`));      // from > 0: a tapped point of an older reply starts at once, no intro
 }
 export function appendPoints(pts: Point[]) {
   if (!pts.length) return;
