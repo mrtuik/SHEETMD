@@ -536,11 +536,18 @@ class SheetTtsModule : Module() {
 
           // Drain playback buffer
           if (started && !cancelled && activeId == id) {
+            // stall guard: if the playback position stops moving for 4 s (audio focus stolen, track stuck), give up waiting,
+            // so onDone is still sent and the reader can never hang in "reading" with no sound
+            var lastHead = -1
+            var lastMove = System.currentTimeMillis()
             while (!cancelled && activeId == id) {
               val head = audioTrack.playbackHeadPosition
               if (head >= totalWrittenFrames) {
                 break
               }
+              val now = System.currentTimeMillis()
+              if (head != lastHead) { lastHead = head; lastMove = now }
+              else if (now - lastMove > 4000) break
               Thread.sleep(15)
             }
           }
