@@ -8,8 +8,9 @@ export type RState = {
   status: 'idle' | 'reading' | 'paused'; rate: number; pauseSec: number; lang: 'auto' | 'en' | 'bn';
   voiceEn: string; voiceBn: string;      // voice identifiers ('' = phone default)
   repeatOn: boolean; repeatN: number;    // say every line of a point 2-3 times (like a teacher)
+  wordGap: number;                       // seconds of silence between words (0 = natural speech, words not split)
 };
-export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto', voiceEn: '', voiceBn: '', repeatOn: true, repeatN: 2 };
+export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto', voiceEn: '', voiceBn: '', repeatOn: true, repeatN: 2, wordGap: 0 };
 
 const subs = new Set<() => void>();
 export const subscribe = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
@@ -47,7 +48,9 @@ export function lineOf(p: Point, chunk: number): number {
   return -1;
 }
 
+let sayId = 0;
 function halt() {
+  sayId++;
   stopSpeak();
   const r = release; release = null;
   r?.();                                   // never leave a reader loop waiting on a stopped utterance
@@ -66,8 +69,34 @@ function say(parts: string[], from = 0, track = false): Promise<void> {
       const times = track && state.repeatOn && from + k > 0 ? Math.max(1, state.repeatN) : 1;
       for (let r = 0; r < times; r++) items.push({ text, k });
     });
-    let left = items.length;
+    const my = ++sayId;
     release = () => res();
+    const vopts = (text: string) => {
+      const bn = state.lang === 'bn' || (state.lang === 'auto' && /[\u0980-\u09FF]/.test(text));
+      return { lang: (bn ? 'bn' : 'en') as 'bn' | 'en', voice: (bn ? state.voiceBn : state.voiceEn) || undefined, rate };
+    };
+    // "Pause between words" > 0: every word is spoken on its own, then silence (dictation style: time to write each word)
+    if (state.wordGap > 0) {
+      (async () => {
+        for (const { text, k } of items) {
+          if (my !== sayId) break;
+          spoken = track ? parts.join(' ') : text;
+          if (track) { state.chunk = from + k; emit(); }
+          for (const w of text.split(/\s+/).filter(Boolean)) {
+            if (my !== sayId) break;
+            await new Promise<void>((r) => {
+              let d = false; const f = () => { if (!d) { d = true; r(); } };
+              speak(w, { ...vopts(w), onDone: f, onStopped: f, onError: f });
+            });
+            if (my !== sayId) break;
+            await sleep(state.wordGap * 1000);
+          }
+        }
+        if (my === sayId) { release = null; res(); }
+      })();
+      return;
+    }
+    let left = items.length;
     items.forEach(({ text, k }) => {
       let done = false;
       const fin = () => { if (done) return; done = true; if (--left <= 0) { release = null; res(); } };
@@ -131,8 +160,20 @@ export function stop() { token++; halt(); resumeAt = 0; state.status = 'idle'; s
 export function goto(i: number) { if (!state.points.length) return; after = null; resumeAt = 0; run(Math.min(Math.max(i, 0), state.points.length - 1)); }
 export function next() { goto(Math.min(state.idx + 1, state.points.length - 1)); }
 export function prev() { goto(Math.max(state.idx - 1, 0)); }
-export function repeat(arg?: string) {
+export function repeat(arg?: string, mode?: 'line' | 'prev' | 'point') {
   if (!state.points.length) return;
+  if (mode === 'line' || mode === 'prev') {
+    // "repeat" = the line being read now; "repeat previous" = the line before it (last line of the previous point when on the first line)
+    let i = state.idx;
+    let c = state.status === 'paused' ? resumeAt : state.chunk;
+    if (mode === 'prev') {
+      if (c > 0) c -= 1;
+      else if (i > 0) { i -= 1; c = Math.max(0, pointChunks(state.points[i]).length - 1); }
+    }
+    after = null; resumeAt = 0;
+    run(i, undefined, c);                  // says that line again, then goes on reading
+    return;
+  }
   let i = state.idx;
   if (arg) {
     const n = parseInt(arg, 10);
@@ -155,6 +196,7 @@ export function setRate(d: number) {
   }
 }
 export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); keep('pause', state.pauseSec); }
+export function setWordGap(d: number) { state.wordGap = Math.min(5, Math.max(0, +(state.wordGap + d).toFixed(1))); emit(); keep('wgap', state.wordGap); }
 export function setLang(l: RState['lang']) { state.lang = l; emit(); keep('lang', l); }
 export function setVoice(lang: 'en' | 'bn', id: string) { if (lang === 'bn') state.voiceBn = id; else state.voiceEn = id; emit(); }
 
@@ -169,6 +211,7 @@ export async function loadSettings() {
     const pz = parseInt(await g('pause'), 10); if (!isNaN(pz)) state.pauseSec = Math.min(10, Math.max(0, pz));
     const lg = await g('lang'); if (lg === 'auto' || lg === 'en' || lg === 'bn') state.lang = lg;
     const ro = await g('repeat'); if (ro) state.repeatOn = ro === '1';
+    const wg = parseFloat(await g('wgap')); if (!isNaN(wg)) state.wordGap = Math.min(5, Math.max(0, wg));
     const rn = parseInt(await g('repeatn'), 10); if (!isNaN(rn)) state.repeatN = Math.min(3, Math.max(2, rn));
   } catch {}
   emit();
