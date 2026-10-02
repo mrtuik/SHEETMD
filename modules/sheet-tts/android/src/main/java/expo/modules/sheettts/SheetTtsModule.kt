@@ -6,6 +6,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.audiofx.LoudnessEnhancer
 import android.os.Build
 import com.k2fsa.sherpa.onnx.GeneratedAudio
 import com.k2fsa.sherpa.onnx.GenerationConfig
@@ -52,12 +53,35 @@ class SheetTtsModule : Module() {
   @Volatile private var cancelled: Boolean = false
   @Volatile private var currentAudioTrack: AudioTrack? = null
   @Volatile private var gain = 1.0f
-  // sound boost: soft-limited so a loud boost does not crackle
+  @Volatile private var liveEnhancer: LoudnessEnhancer? = null   // the enhancer of the track playing now
+  @Volatile private var enhancerOk = false                       // true = the phone's loudness effect is doing the boost
+
+  // sound boost 1x..4x -> 0..+15 dB. The phone's LoudnessEnhancer raises the AVERAGE loudness and limits the peaks,
+  // which is what makes a quiet voice louder (plain multiplication cannot: the voice already peaks near full scale).
+  private fun boostMb(): Int = (((gain - 1.0f) / 3.0f) * 1500f).toInt().coerceIn(0, 1500)
+  private fun attachEnhancer(track: AudioTrack): LoudnessEnhancer? {
+    enhancerOk = false
+    if (gain <= 1.0f) return null
+    return try {
+      val e = LoudnessEnhancer(track.audioSessionId)
+      e.setTargetGain(boostMb())
+      e.enabled = true
+      liveEnhancer = e
+      enhancerOk = true
+      e
+    } catch (ex: Exception) { null }          // phone without the effect: applyGain() below does the boost instead
+  }
+  // fallback only (no LoudnessEnhancer): clean linear gain, only the peaks above 0.8 are rounded off. Never changes the input array.
   private fun applyGain(s: FloatArray): FloatArray {
     val g = gain
-    if (g <= 1.0f) return s
-    for (i in s.indices) s[i] = Math.tanh((s[i] * g).toDouble()).toFloat()
-    return s
+    if (g <= 1.0f || enhancerOk) return s
+    val o = FloatArray(s.size)
+    for (i in s.indices) {
+      val y = s[i] * g
+      val a = Math.abs(y)
+      o[i] = if (a <= 0.8f) y else (if (y < 0f) -1f else 1f) * (0.8f + 0.2f * Math.tanh(((a - 0.8f) / 0.2f).toDouble()).toFloat())
+    }
+    return o
   }
 
   private var audioFocusRequest: Any? = null
@@ -331,6 +355,7 @@ class SheetTtsModule : Module() {
 
     Function("setGain") { g: Float ->
       gain = g.coerceIn(1.0f, 4.0f)
+      try { liveEnhancer?.setTargetGain(boostMb()) } catch (e: Exception) { }
     }
 
     Function("stop") {
@@ -398,6 +423,7 @@ class SheetTtsModule : Module() {
         activeId = id
         cancelled = false
         var audioTrack: AudioTrack? = null
+        var enh: LoudnessEnhancer? = null
         var started = false
 
         try {
@@ -446,6 +472,7 @@ class SheetTtsModule : Module() {
             )
           }
           currentAudioTrack = audioTrack
+          enh = attachEnhancer(audioTrack)
 
           val curDir = currentModelDir
           val cacheKey = "$curDir:$sid:$speed:$refKey:$text"
@@ -530,6 +557,8 @@ class SheetTtsModule : Module() {
             audioTrack?.stop()
             audioTrack?.release()
           } catch (e: Exception) { }
+          try { enh?.release() } catch (e: Exception) { }
+          if (liveEnhancer === enh) { liveEnhancer = null; enhancerOk = false }
           if (currentAudioTrack === audioTrack) {
             currentAudioTrack = null
           }
