@@ -202,6 +202,8 @@ export function isJunkHeading(name: string): boolean {
   const w = t.split(/\s+/);
   if (/^(fig(ure)?|table|plate|chart|image|photo(graph)?|diagram|graph|box|scheme|slide)\.?\s*[\divx]+/i.test(t)) return true;   // "Fig 3.2 ..."
   if (/^(fig|figure)\b\s*[.:]/i.test(t)) return true;
+  if (/^\(?[a-e][).]\s/i.test(t) || (t.match(/\(\s*[a-e]\s*\)/gi) || []).length >= 2) return true;   // MCQ options, not a title: "(b) Retina (d) Heart"
+  if (w.length >= 4 && /\s\d{1,2}\.\s+\p{Lu}/u.test(t)) return true;      // two OCR lines glued: "Proteoglycan molecule 5. Complex carbohydrate"
   if (w.length >= 11) return true;                                          // a sentence, not a title
   if (/[.,;]$/.test(t) && w.length >= 4) return true;
   if (/^[a-z]/.test(t) && w.length >= 5) return true;
