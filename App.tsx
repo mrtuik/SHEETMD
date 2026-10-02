@@ -42,7 +42,9 @@ const COMMANDS: [string, string][] = [
   ['question ... okay', 'Say "question", then your full question, then "okay": I think, use your sources, add my own knowledge'],
   ['pause  /  continue', 'Hold, or carry on from the same sentence'],
   ['next  /  previous', 'Jump to the next or earlier point'],
-  ['repeat  /  repeat 3', 'Read this point (or point 3) again'],
+  ['repeat', 'Say the line being read again'],
+  ['repeat previous', 'Say the previous line again'],
+  ['repeat point  /  repeat point 3', 'Read this point (or point 3) again'],
   ['slower  /  faster', 'Change the reading speed'],
   ['stop', 'Stop reading'],
 ];
@@ -381,7 +383,7 @@ function Main() {
     follow.current = true;
     // playback commands act FIRST (no waiting for the database); the chat history is written right after
     switch (c.t) {
-      case 'repeat': R.repeat(c.arg); break;
+      case 'repeat': R.repeat(c.arg, c.mode); break;
       case 'continue': R.resume(); break;
       case 'pause': R.pause(); break;
       case 'stop': R.stop(); cancelGen(); choicesRef.current = null; setWorking(''); break;
@@ -872,6 +874,8 @@ function Main() {
             <StepRow icon="speed" label="Speed" value={`${s.rate.toFixed(1)}x`} onMinus={() => R.setRate(-0.1)} onPlus={() => R.setRate(0.1)} />
             <View style={st.sep} />
             <StepRow icon="timer" label="Pause between points" value={`${s.pauseSec}s`} onMinus={() => R.setPause(-1)} onPlus={() => R.setPause(1)} />
+            <View style={st.sep} />
+            <StepRow icon="timer" label="Pause between words" value={s.wordGap > 0 ? `${s.wordGap}s` : 'off (normal speech)'} onMinus={() => R.setWordGap(-0.5)} onPlus={() => R.setWordGap(0.5)} />
             <View style={st.sep} />
             <View style={st.line}>
               <Icon n="timer" size={20} />
