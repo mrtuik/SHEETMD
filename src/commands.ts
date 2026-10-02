@@ -1,7 +1,7 @@
 import { queryTokens, rankTopics } from './match';
 
 export type Cmd =
-  | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'question'; q?: string }
+  | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'search'; q: string } | { t: 'question'; q?: string }
   | { t: 'repeat'; arg?: string; mode?: 'line' | 'prev' | 'point' } | { t: 'pick'; n: number }
   | { t: 'continue' | 'pause' | 'stop' | 'next' | 'prev' | 'slower' | 'faster' | 'unknown' };
 
@@ -115,7 +115,7 @@ export function parse(s: string): Cmd {
   let x = s.trim().toLowerCase().replace(/[.!?।,]+$/, '').replace(/\s+/g, ' ');
   const y = x.replace(LEAD, '').replace(TAIL, '').trim();
   if (y && ALIAS[y]) return { t: ALIAS[y] } as Cmd;             // "okay stop please" == "stop"
-  if (y && y !== x && /^(?:topics?|টপিক|exact|exactly|explain|question|questions)\b/.test(y)) x = y;
+  if (y && y !== x && /^(?:topics?|টপিক|exact|exactly|explain|search|google|web search|খোঁজো|সার্চ|question|questions)(?:\s|:|$)/.test(y)) x = y;
   const pn = parsePick(y || x);
   if (pn) return { t: 'pick', n: pn };
   let m = x.match(/^(?:topics?|টপিক)\s*:?\s+(.+)$/);
@@ -126,6 +126,10 @@ export function parse(s: string): Cmd {
   // explain <topic>: answered from the model's own knowledge (+ a web lookup), NOT from your sources
   m = x.match(/^(?:explain|এক্সপ্লেন|ব্যাখ্যা)\s*:?\s+(?:about\s+)?(.+)$/);
   if (m) return { t: 'explain', q: m[1] };
+  // search <anything>: live Google search through Gemini (needs internet + a Gemini key in Models). "search what is the difference between ..." works too.
+  m = x.match(/^(?:web search|search|google|খোঁজো|সার্চ)(?:\s*:\s*|\s+)(.+)$/);
+  if (m) return { t: 'search', q: m[1].trim() };
+  if (/^(?:web search|search|google|খোঁজো|সার্চ)$/.test(x)) return { t: 'search', q: '' };           // only the word: the app asks what to search
   // question [whole question] [okay]: say "question", then the full question, then "okay"
   m = x.match(/^(?:ask (?:a )?question|questions?|প্রশ্ন)(?:\s*:?\s+(.+))?$/);
   if (m) return { t: 'question', q: m[1] };
