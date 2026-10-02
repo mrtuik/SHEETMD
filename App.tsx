@@ -447,7 +447,7 @@ function Main() {
     return qt.length > 0 && qt.filter((w) => it.has(stem(w))).length / qt.length >= 0.7;
   };
   // ordinary words that are also playback aliases (hold / wait / back / last / start / play ...): while reading, only a command when the app did not say that word itself
-  const weakEcho = (a: string) => R.state.status === 'reading' && isWeakCmd(a) && (() => { const sp = new Set(tok(R.getSpoken())); const w = tok(a); return w.length > 0 && w.every((x) => sp.has(x)); })();
+  const weakEcho = (a: string) => R.state.status === 'reading' && Date.now() - wakeRef.current.fresh > 3000 && (R.wordEcho(a) || isWeakCmd(a)) && (R.wordEcho(a) || (() => { const sp = new Set(tok(R.getSpoken())); const w = tok(a); return w.length > 0 && w.every((x) => sp.has(x)); })());
   // one-word playback commands run the moment they are heard (no waiting for the recognizer to finish)
   const FAST = new Set(['pause', 'stop', 'next', 'prev', 'continue', 'slower', 'faster']);
   // options waiting: any of the recogniser's guesses that sounds like one / two / three (also the usual mishearings)
@@ -510,7 +510,7 @@ function Main() {
   };
   // ---- WAKE WORD "tuik": app in background / phone locked -> a command only counts after "tuik" -------------------------
   const [awakeUI, setAwakeUI] = useState(false);
-  const wakeRef = useRef<{ until: number; paused: boolean; timer: any }>({ until: 0, paused: false, timer: null });
+  const wakeRef = useRef<{ until: number; paused: boolean; timer: any; fresh: number }>({ until: 0, paused: false, timer: null, fresh: 0 });
   const disarm = (resumeReading: boolean) => {
     const w = wakeRef.current; clearTimeout(w.timer); w.timer = null;
     const was = w.paused; w.until = 0; w.paused = false; setAwakeUI(false);
@@ -535,6 +535,7 @@ function Main() {
     if (withRest.length) {                                           // "tuik pause" / "...reading tuik pause"
       const slowFast = withRest.some((r) => ['slower', 'faster'].includes(parse(r).t));
       const resumeAfter = slowFast && w.paused;
+      w.fresh = Date.now();                                          // said after "tuik": never mistaken for the app's own word
       if (!partial) disarm(false); else clearArm();
       if (resumeAfter) setTimeout(() => { if (R.state.status === 'paused') R.resume(); }, 400);
       return withRest;
@@ -666,6 +667,8 @@ function Main() {
   }, [msgs.length]);
 
   const lastTopic = (() => { for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].text.startsWith(TOPIC)) return i; return -1; })();
+  const goPoint = useCallback((k: number) => { follow.current = true; R.goto(k); }, []);
+  const setRowY = useCallback((k: number, y: number) => { rowY.current[k] = y; }, []);
   const renderMsg = (m: Msg, i: number) => {
     if (m.text.startsWith(TOPIC)) {
       const name = m.text.slice(TOPIC.length);
@@ -681,21 +684,7 @@ function Main() {
           <Text style={st.topicT}>{s.topic}</Text>
           {s.points.map((p, k) => {
             const act = k === s.idx && s.status !== 'idle';
-            const parts = act ? R.pointChunks(p).slice(1) : [];
-            const lines = p.bullets?.length ? p.bullets : [p.text];
-            return (
-              <TouchableOpacity key={p.n} activeOpacity={0.8} style={st.ptBlock}
-                onLayout={(e) => { rowY.current[k] = e.nativeEvent.layout.y; }}
-                onPress={() => { follow.current = true; R.goto(k); }}>
-                <Text style={st.ptTitle}>{p.title}</Text>
-                {p.bullets ? lines.map((ln, j) => {
-                  const on = act && R.lineOf(p, s.chunk - 1) === j;       // the line being read now (light highlight)
-                  return <Text key={j} style={[st.ptLine, on && st.sentOn]}>{ln}</Text>;
-                }) : (
-                  <Text style={st.ptLine}>{splitSentences(lines.join(' ')).map((c, j) => <Text key={j} style={act && j === s.chunk - 1 ? st.sentOn : undefined}>{c + ' '}</Text>)}</Text>
-                )}
-                {!!p.hint && <Text style={st.hint}>Banglish: {p.hint}</Text>}
-              </TouchableOpacity>);
+            return <PointBlock key={p.n} p={p} k={k} line={act ? R.lineOf(p, s.chunk - 1) : -1} sent={act ? s.chunk - 1 : -1} onGo={goPoint} onY={setRowY} />;
           })}
         </View>);
     }
@@ -1274,6 +1263,19 @@ const StepRow = ({ icon, label, value, onMinus, onPlus }:
     <TouchableOpacity style={st.step} onPress={onPlus}><Icon n="plus" size={18} /></TouchableOpacity>
   </View>
 );
+
+// One point of the open topic. Memoised: while reading, only the point that changed re-renders (the whole screen used to re-render on every spoken line -> lag, heat, battery).
+const PointBlock = React.memo(function PointBlock({ p, k, line, sent, onGo, onY }: { p: Point; k: number; line: number; sent: number; onGo: (k: number) => void; onY: (k: number, y: number) => void }) {
+  const lines = p.bullets?.length ? p.bullets : [p.text];
+  return (
+    <TouchableOpacity activeOpacity={0.8} style={st.ptBlock} onLayout={(e) => onY(k, e.nativeEvent.layout.y)} onPress={() => onGo(k)}>
+      <Text style={st.ptTitle}>{p.title}</Text>
+      {p.bullets ? lines.map((ln, j) => <Text key={j} style={[st.ptLine, line === j && st.sentOn]}>{ln}</Text>) : (
+        <Text style={st.ptLine}>{splitSentences(lines.join(' ')).map((c, j) => <Text key={j} style={j === sent ? st.sentOn : undefined}>{c + ' '}</Text>)}</Text>
+      )}
+      {!!p.hint && <Text style={st.hint}>Banglish: {p.hint}</Text>}
+    </TouchableOpacity>);
+});
 
 const st = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
