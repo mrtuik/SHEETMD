@@ -1,7 +1,7 @@
 import { queryTokens, rankTopics } from './match';
 
 export type Cmd =
-  | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'search'; q: string } | { t: 'question'; q?: string }
+  | { t: 'topic'; q: string } | { t: 'exact'; q: string } | { t: 'explain'; q: string } | { t: 'search'; q: string; mode?: 'short' | 'long' } | { t: 'question'; q?: string }
   | { t: 'repeat'; arg?: string; mode?: 'line' | 'prev' | 'point' } | { t: 'pick'; n: number }
   | { t: 'continue' | 'pause' | 'stop' | 'next' | 'prev' | 'slower' | 'faster' | 'unknown' };
 
@@ -128,7 +128,12 @@ export function parse(s: string): Cmd {
   if (m) return { t: 'explain', q: m[1] };
   // search <anything>: live Google search through Gemini (needs internet + a Gemini key in Models). "search what is the difference between ..." works too.
   m = x.match(/^(?:web search|search|google|খোঁজো|সার্চ)(?:\s*:\s*|\s+)(.+)$/);
-  if (m) return { t: 'search', q: m[1].trim() };
+  if (m) {
+    // "search long anemia" = a full exam answer; "search anemia" / "search short anemia" = a short answer. ("long term ..." is just part of the question.)
+    const lm = m[1].trim().match(/^(short|brief|long|detailed|details?|full|শর্ট|লং|বিস্তারিত)(?=\s|:|$)(?!\s*-?\s*term\b)\s*:?\s*(.*)$/i);
+    if (lm) return { t: 'search', q: lm[2].trim(), mode: /^(?:short|brief|শর্ট)$/i.test(lm[1]) ? 'short' : 'long' };
+    return { t: 'search', q: m[1].trim(), mode: 'short' };
+  }
   if (/^(?:web search|search|google|খোঁজো|সার্চ)$/.test(x)) return { t: 'search', q: '' };           // only the word: the app asks what to search
   // question [whole question] [okay]: say "question", then the full question, then "okay"
   m = x.match(/^(?:ask (?:a )?question|questions?|প্রশ্ন)(?:\s*:?\s+(.+))?$/);
