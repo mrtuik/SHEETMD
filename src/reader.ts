@@ -1,4 +1,4 @@
-import { speak, stopSpeak } from './tts';
+import { speak, stopSpeak, prewarm } from './tts';
 import { cleanForSpeech, speechChunks } from './cleaner';
 import { saveSession, getMeta, setMeta } from './db';
 import type { Point } from './notes';
@@ -44,11 +44,14 @@ let introGrace = 0;                                  // the recogniser delivers 
 export const introActive = () => (inIntro || Date.now() < introGrace ? introText : '');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// short spoken chunks: the first sound starts sooner and a slow phone never runs dry between two lines
+const LINE_MAX = 150;
+
 // chunk 0 = "Point 2. Principle." ; chunk 1.. = the sentences (the screen highlights the same chunks)
 export function pointChunks(p: Point): string[] {
   // rich notes: ONE spoken line per bullet (the screen shows the same lines, the active one highlighted)
   const body = p.bullets?.length
-    ? p.bullets.flatMap((b) => { const t = cleanForSpeech(b); return t.length <= 240 ? [t] : speechChunks(b); }).filter(Boolean)
+    ? p.bullets.flatMap((b) => { const t = cleanForSpeech(b); return t.length <= LINE_MAX ? [t] : speechChunks(b, LINE_MAX); }).filter(Boolean)
     : speechChunks(p.text);
   const t = cleanForSpeech(p.title).replace(/[.]+$/, '').toLowerCase();
   const dup = !!t && !!body[0] && body[0].toLowerCase().startsWith(t);
@@ -61,7 +64,7 @@ export function lineOf(p: Point, chunk: number): number {
   let n = 0;
   for (let j = 0; j < p.bullets.length; j++) {
     const t = cleanForSpeech(p.bullets[j]);
-    n += !t ? 0 : t.length <= 240 ? 1 : speechChunks(p.bullets[j]).length;
+    n += !t ? 0 : t.length <= LINE_MAX ? 1 : speechChunks(p.bullets[j], LINE_MAX).length;
     if (chunk < n) return j;
   }
   return -1;
@@ -148,6 +151,8 @@ async function run(from: number, intro?: string, chunk = 0) {
   halt();
   state.idx = from; state.chunk = chunk; state.status = 'reading'; emit();
   if (intro) {
+    // generate the first line of the point while the intro is being spoken (before, it started only after the intro ended = the silent gap)
+    try { const c0 = state.points[from] ? pointChunks(state.points[from])[chunk] : ''; if (c0) prewarm(c0, slow ? state.rate * 0.9 : state.rate); } catch {}
     inIntro = true; introText = intro;
     try { await say(speechChunks(intro)); } finally { if (my === token) { inIntro = false; introGrace = Date.now() + 2500; } }
     if (my !== token) return;
