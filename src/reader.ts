@@ -8,9 +8,10 @@ export type RState = {
   status: 'idle' | 'reading' | 'paused'; rate: number; pauseSec: number; lang: 'auto' | 'en' | 'bn';
   voiceEn: string; voiceBn: string;      // voice identifiers ('' = phone default)
   repeatOn: boolean; repeatN: number;    // say every line of a point 2-3 times (like a teacher)
+  wakeOn: boolean;                       // background / lock screen: commands need "tuik" first
   wordGap: number;                       // seconds of silence between words (0 = natural speech, words not split)
 };
-export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto', voiceEn: '', voiceBn: '', repeatOn: true, repeatN: 2, wordGap: 0 };
+export const state: RState = { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle', rate: 0.7, pauseSec: 4, lang: 'auto', voiceEn: '', voiceBn: '', repeatOn: true, repeatN: 2, wordGap: 0, wakeOn: true };
 
 const subs = new Set<() => void>();
 export const subscribe = (f: () => void) => { subs.add(f); return () => { subs.delete(f); }; };
@@ -197,6 +198,7 @@ export function setRate(d: number) {
 }
 export function setPause(d: number) { state.pauseSec = Math.min(10, Math.max(0, state.pauseSec + d)); emit(); keep('pause', state.pauseSec); }
 export function setWordGap(d: number) { state.wordGap = Math.min(5, Math.max(0, +(state.wordGap + d).toFixed(1))); emit(); keep('wgap', state.wordGap); }
+export function setWake(on: boolean) { state.wakeOn = on; emit(); keep('wake', on ? '1' : '0'); }
 export function setLang(l: RState['lang']) { state.lang = l; emit(); keep('lang', l); }
 export function setVoice(lang: 'en' | 'bn', id: string) { if (lang === 'bn') state.voiceBn = id; else state.voiceEn = id; emit(); }
 
@@ -211,6 +213,7 @@ export async function loadSettings() {
     const pz = parseInt(await g('pause'), 10); if (!isNaN(pz)) state.pauseSec = Math.min(10, Math.max(0, pz));
     const lg = await g('lang'); if (lg === 'auto' || lg === 'en' || lg === 'bn') state.lang = lg;
     const ro = await g('repeat'); if (ro) state.repeatOn = ro === '1';
+    const wk = await g('wake'); if (wk) state.wakeOn = wk === '1';
     const wg = parseFloat(await g('wgap')); if (!isNaN(wg)) state.wordGap = Math.min(5, Math.max(0, wg));
     const rn = parseInt(await g('repeatn'), 10); if (!isNaN(rn)) state.repeatN = Math.min(3, Math.max(2, rn));
   } catch {}
