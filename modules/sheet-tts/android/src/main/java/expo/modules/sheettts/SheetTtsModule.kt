@@ -47,6 +47,7 @@ class SheetTtsModule : Module() {
   }
   // sherpa's OfflineTts must not generate from two threads at once (prepare + speak did): one at a time
   private val genLock = Any()
+  @Volatile private var preparingKey: String = ""   // the line a background prepare is generating right now
   @Volatile private var epoch: Int = 0        // bumped on every stop / new speak: a background generation from an older epoch aborts at once
 
   @Volatile private var activeId: Int = -1
@@ -86,11 +87,11 @@ class SheetTtsModule : Module() {
 
   private var audioFocusRequest: Any? = null
 
-  // LRU cache for 2-3 prepared utterances
+  // LRU cache: prepared next line + lines that are repeated (each line is said 2-3 times) -> the repeat costs no CPU
   private val preCache = Collections.synchronizedMap(
     object : LinkedHashMap<String, GeneratedAudio>(4, 0.75f, true) {
       override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, GeneratedAudio>?): Boolean {
-        return size > 3
+        return size > 6
       }
     }
   )
@@ -369,6 +370,7 @@ class SheetTtsModule : Module() {
       if (preCache.containsKey(key)) return@Function
 
       val myEpoch = epoch
+      preparingKey = key
       prepareExecutor.submit {
         try {
           if (tts === currentTts && epoch == myEpoch) {
@@ -389,6 +391,7 @@ class SheetTtsModule : Module() {
             }
           }
         } catch (e: Exception) { }
+        finally { if (preparingKey == key) preparingKey = "" }
       }
     }
 
@@ -403,7 +406,6 @@ class SheetTtsModule : Module() {
         return@Function
       }
 
-      epoch++                                       // any background prepare for older text gives up now
       // If already playing another chunk, stop previous playback
       if (activeId != -1) {
         val prevId = activeId
@@ -476,7 +478,12 @@ class SheetTtsModule : Module() {
 
           val curDir = currentModelDir
           val cacheKey = "$curDir:$sid:$speed:$refKey:$text"
-          val cached = preCache.remove(cacheKey)
+          var cached = preCache[cacheKey]
+          if (cached == null && preparingKey == cacheKey) {
+            synchronized(genLock) { }                 // the same line is being prepared: wait for it instead of generating it a second time
+            cached = preCache[cacheKey]
+          }
+          val keep = ArrayList<FloatArray>()          // streamed audio is kept so the repeat of this line plays at once
 
           var totalWrittenFrames = 0
 
@@ -520,6 +527,7 @@ class SheetTtsModule : Module() {
                     return@generate 0
                   }
                   if (samples.isNotEmpty()) {
+                    keep.add(samples.copyOf())
                     if (!started) {
                       started = true
                       sendEvent("onStart", mapOf("id" to id))
@@ -530,6 +538,14 @@ class SheetTtsModule : Module() {
                   }
                   1
                 }
+              }
+              if (!cancelled && activeId == id && keep.isNotEmpty()) {
+                var n = 0
+                for (a in keep) n += a.size
+                val all = FloatArray(n)
+                var o = 0
+                for (a in keep) { System.arraycopy(a, 0, all, o, a.size); o += a.size }
+                preCache[cacheKey] = GeneratedAudio(all, currentTts.sampleRate())
               }
             }
           }
