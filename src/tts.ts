@@ -807,7 +807,8 @@ if (NativeTts?.addListener) {
     if (activeJob && activeJob.id === id && !activeJob.fell) {
       activeJob.started = true;
       // pre-generate the NEXT chunk only after this one is already playing (generating both at once froze weak phones)
-      const nx = speakQueue[0];
+      const curText = activeJob.text;
+      const nx = speakQueue.find((j) => j.text !== curText);       // a repeat of the same line is already cached: prepare the next DIFFERENT line
       if (nx && NativeTts?.prepare && !/[\u0980-\u09FF]/.test(nx.text) && nx.opts.engine !== 'phone') {
         try { NativeTts.prepare(nx.text, rateToSpeed(nx.opts.rate ?? 0.7), curSid); } catch {}
       }
@@ -945,6 +946,14 @@ function processNextJob() {
       fallbackToPhone(job);
     }
   }
+}
+
+// start generating a line in the background (e.g. the first line of a point while the topic intro is still being spoken)
+export function prewarm(text: string, rate = 0.7) {
+  try {
+    if (!NativeTts?.prepare || !text || ttsState.engine === 'phone' || !ttsState.isPiperReady || /[\u0980-\u09FF]/.test(text)) return;
+    NativeTts.prepare(text, rateToSpeed(rate), curSid);
+  } catch {}
 }
 
 export function speak(text: string, opts: SpeakOptions = {}) {
