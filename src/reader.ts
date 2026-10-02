@@ -22,6 +22,7 @@ let after: number | null = null;
 let slow = false;
 let spoken = '';
 let resumeAt = 0;
+let growing = false;                                 // notes are still being written (streamed in): at the last written point, wait for the next one
 let release: (() => void) | null = null;
 export const getSpoken = () => spoken;
 // true while the app says its own intro ("Topic X. 6 points."): the mic hears that and must not take it as a new command
@@ -152,7 +153,12 @@ async function run(from: number, intro?: string, chunk = 0) {
     if (my !== token) return;
   }
   let start = chunk;
-  while (my === token && state.idx < state.points.length) {
+  while (my === token) {
+    if (state.idx >= state.points.length) {
+      if (!growing) break;                              // everything is written and read: finished
+      await sleep(200);                                 // the next point is still being written
+      continue;
+    }
     const p = state.points[state.idx];
     state.chunk = start; emit();
     saveSession(state.topicId, p.n, state.rate).catch(() => {});
@@ -167,10 +173,18 @@ async function run(from: number, intro?: string, chunk = 0) {
 }
 
 // Always says the topic name first, then reads point by point until you interrupt.
-export function startTopic(id: number, name: string, points: Point[], intro?: string) {
+// stream = true: the notes are still being written, more points arrive with appendPoints() and the end is marked with endStream()
+export function startTopic(id: number, name: string, points: Point[], intro?: string, stream = false) {
+  growing = stream;
   state.topicId = id; state.topic = name; state.points = points; after = null; resumeAt = 0;
   run(0, intro ?? `Topic ${name}. ${points.length} points.`);
 }
+export function appendPoints(pts: Point[]) {
+  if (!pts.length) return;
+  state.points = [...state.points, ...pts];
+  emit();
+}
+export function endStream() { if (!growing) return; growing = false; emit(); }
 export function restore(id: number, name: string, points: Point[], n: number, rate: number) {
   Object.assign(state, { topicId: id, topic: name, points, idx: Math.max(0, n - 1), chunk: 0, status: 'paused' });   // speed = the saved setting, not the old session's
   resumeAt = 0;
@@ -190,8 +204,8 @@ export function resume() {
   resumeAt = 0;
   run(state.idx, undefined, c);                                        // continue from the sentence where it paused
 }
-export function reset() { token++; halt(); resumeAt = 0; after = null; Object.assign(state, { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle' }); emit(); }
-export function stop() { token++; halt(); resumeAt = 0; state.status = 'idle'; state.idx = 0; state.chunk = 0; emit(); }
+export function reset() { token++; halt(); growing = false; resumeAt = 0; after = null; Object.assign(state, { topicId: 0, topic: '', points: [], idx: 0, chunk: 0, status: 'idle' }); emit(); }
+export function stop() { token++; halt(); growing = false; resumeAt = 0; state.status = 'idle'; state.idx = 0; state.chunk = 0; emit(); }
 export function goto(i: number) { if (!state.points.length) return; after = null; resumeAt = 0; run(Math.min(Math.max(i, 0), state.points.length - 1)); }
 export function next() { goto(Math.min(state.idx + 1, state.points.length - 1)); }
 export function prev() { goto(Math.max(state.idx - 1, 0)); }
