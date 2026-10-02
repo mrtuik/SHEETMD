@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Modal, StyleSheet, ScrollView, Pressable, Switch,
   Platform, PermissionsAndroid, AppState, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
+  Animated, Easing, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
@@ -20,7 +21,7 @@ import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownloa
 import { wikiLookup } from './src/web';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
-import { startListening, stopListening, restartListening, markHandled } from './src/listener';
+import { startListening, stopListening, restartListening, markHandled, subscribeLevel, subscribeLive } from './src/listener';
 import { updateService, stopService, onServiceAction, batteryUnrestricted, askBatteryUnrestricted } from './src/service';
 import { splitWake } from './src/wake';
 import { ICONS, IconName } from './src/icons';
@@ -64,15 +65,25 @@ function Main() {
   const { height: winH } = useWindowDimensions();
   const sheetMax = Math.max(220, Math.round(winH * 0.88) - 150 - ins.bottom);   // scroll area of a bottom sheet: real pixels, so it always scrolls to the end
   const rootRef = useRef<View>(null);
+  const inputRef = useRef<TextInput>(null);
+  const kbOpen = useRef(false);
+  const kbTop = useRef(0);
   const [kbPad, setKbPad] = useState(0);
   useEffect(() => {
-    // bottom padding = exactly how much of the screen the keyboard covers, so the input sits right on top of it
+    // bottom padding = exactly how much of the screen the keyboard still covers, so the input box always sits right on top of it.
+    // Measured again after the window has settled: Android resizes the window a moment AFTER the keyboard event (one early
+    // measurement left the box under the keyboard, or floating too high).
+    let timers: any[] = [];
+    const measure = () => rootRef.current?.measureInWindow((_x, y, _w, h) => { if (kbOpen.current) setKbPad(Math.max(0, Math.round(y + h - kbTop.current))); });
     const a = Keyboard.addListener('keyboardDidShow', (e) => {
-      rootRef.current?.measureInWindow((_x, y, _w, h) => setKbPad(Math.max(0, Math.round(y + h - e.endCoordinates.screenY))));
+      kbOpen.current = true; kbTop.current = e.endCoordinates.screenY;
+      timers.forEach(clearTimeout);
+      measure(); timers = [setTimeout(measure, 120), setTimeout(measure, 350)];
     });
-    const b = Keyboard.addListener('keyboardDidHide', () => setKbPad(0));
-    return () => { a.remove(); b.remove(); };
+    const b = Keyboard.addListener('keyboardDidHide', () => { kbOpen.current = false; timers.forEach(clearTimeout); setKbPad(0); });
+    return () => { a.remove(); b.remove(); timers.forEach(clearTimeout); };
   }, []);
+  const keepFocus = () => { if (kbOpen.current) setTimeout(() => inputRef.current?.focus(), 30); };        // buttons never take the keyboard away
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState('');
   const [sources, setSources] = useState<Source[]>([]);
@@ -95,6 +106,7 @@ function Main() {
   const choiceExact = useRef(false);            // the 3 options belong to an "exact" request
   const choiceSpeaking = useRef(false);
   const [heard, setHeard] = useState('');                  // last thing the mic heard (so a mis-heard command is visible)
+  useEffect(() => { if (!heard) return; const t = setTimeout(() => setHeard(''), 9000); return () => clearTimeout(t); }, [heard]);
   const askedDl = useRef(false);
   const [showTtsPrompt, setShowTtsPrompt] = useState(false);
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
@@ -241,6 +253,20 @@ function Main() {
     if (makingRef.current) { makingRef.current = false; setWorking(''); }      // a stuck job must never block the app: the old one is cancelled, go on
     return true;
   };
+  // ---- chunk-by-chunk streaming: every point the model finishes is shown and read at once -------------------------------
+  // The first two points start the reading (so it does not stop after one line); then each new point is added while the voice goes on.
+  type Sess = { id: number; name: string; intro: string; label: string; pts: Point[]; started: boolean };
+  const newStream = (id: number, name: string, intro: string, label = ''): Sess => ({ id, name, intro, label, pts: [], started: false });
+  const feedStream = (se: Sess, p: Point) => {
+    se.pts.push(p);
+    if (se.started) { R.appendPoints([p]); return; }
+    if (se.pts.length < 2) return;
+    se.started = true;
+    rowY.current = {}; cardY.current = null; follow.current = true;
+    if (se.label) push('app', se.label);
+    push('app', TOPIC + se.name);
+    R.startTopic(se.id, se.name, [...se.pts], se.intro, true);
+  };
   const openTopic = async (qRaw: string, exact = false, marksIn = 5) => {
     if (!(await freeUp())) { push('app', 'Still busy, try again in a moment.'); return; }
     const sm = exact ? { q: qRaw, marks: marksIn } : splitMarks(qRaw);
@@ -254,11 +280,17 @@ function Main() {
     let pts = await getNotes(f.id, useLlm ? 'llm' : 'rule', sm.marks);   // id 0 (part of a big file) is never cached
     if (!pts && useLlm) {
       makingRef.current = true; setWorking('Writing notes…');
-      const r: any = await llmNotes(f.name, f.body, sm.marks, (i, n) => { if (n > 1) setWorking(`Writing notes… part ${i}/${n}`); }).catch(() => ({ pts: null, notInSource: false }));
-      makingRef.current = false; setWorking('');
+      const se = newStream(f.id, f.name, `Topic ${f.name}.`);
+      let r: any = { pts: null, notInSource: false };
+      try {
+        r = await llmNotes(f.name, f.body, sm.marks, (i, n) => { if (n > 1) setWorking(`Writing notes… part ${i}/${n}`); }, (p) => feedStream(se, p)).catch(() => ({ pts: null, notInSource: false }));
+      } finally {
+        if (se.started) R.endStream();                                    // nothing more is coming: the reading may finish
+        makingRef.current = false; setWorking('');
+      }
       if (r.cancelled) return;                                            // you said stop / asked something newer
       if (r.notInSource) { notFound(f.alts); return; }                   // the model found nothing about it in the source
-      if (r.pts) { pts = r.pts; await saveNotes(f.id, pts, 'llm', sm.marks); }
+      if (r.pts) { await saveNotes(f.id, r.pts, 'llm', sm.marks); if (se.started) return; pts = r.pts; }   // already on screen and being read when it was streamed
     }
     if (!pts) { pts = makeNotes(f.name, f.body); await saveNotes(f.id, pts, 'rule', 0); }
     rowY.current = {};
@@ -287,10 +319,13 @@ function Main() {
       let label = '';
       if (useLlm) {
         const explicitMarks = /\b(\d{1,2}|two|three|four|five|six|seven|eight|ten|twelve)\s*(?:marks?|m)\b/i.test(qRaw);   // no marks said = the full note
-        const r = await llmExplain(name, explicitMarks ? sm.marks : 0, web?.text || '', (i, n, t) => setWorking(`Writing ${i}/${n}: ${t}…`));
-        if (r.cancelled) return;
-        pts = r.pts;
         label = web ? 'Explained from my own knowledge + the web (not from your sources)' : 'Explained from my own knowledge (not from your sources)';
+        const se = newStream(0, 'Explain: ' + name, `Explaining ${name}.`, label);
+        const r = await llmExplain(name, explicitMarks ? sm.marks : 0, web?.text || '', (i, n, t) => setWorking(`Writing ${i}/${n}: ${t}…`), (p) => feedStream(se, p));
+        if (se.started) R.endStream();
+        if (r.cancelled) return;
+        if (se.started) return;                                           // sections were shown and read as they were written
+        pts = r.pts;
       }
       if (!pts && web) { pts = makeNotes(web.title, web.text); label = 'From the web (Wikipedia). The smart model is not ready yet'; }
       if (!pts) { push('app', 'I cannot explain this now: no internet, and the smart model is not downloaded (Settings > Smart notes).'); return; }
@@ -299,7 +334,7 @@ function Main() {
       const nm = 'Explain: ' + name;
       push('app', TOPIC + nm);
       R.startTopic(0, nm, pts, `Explaining ${name}. ${pts.length} points.`);
-    } finally { makingRef.current = false; setWorking(''); }
+    } finally { R.endStream(); makingRef.current = false; setWorking(''); }
   };
 
   // A question (spoken "question ... okay", or anything typed): think, use the sources where they fit, add own knowledge
@@ -312,10 +347,18 @@ function Main() {
       if (smart && llm.phase === 'none' && !askedDl.current) offerDownload();
       let pts: Point[] | null = null;
       let basis: Basis = 'own';
-      if (useLlm) { const r = await llmAnswer(q, chunks); if (r.cancelled) return; pts = r.pts; basis = r.basis; }
-      let label = basis === 'source' ? 'Answer from your sources'
-        : basis === 'mixed' ? 'Answer: your sources + my own knowledge'
+      const labelOf = (b: Basis) => b === 'source' ? 'Answer from your sources'
+        : b === 'mixed' ? 'Answer: your sources + my own knowledge'
         : 'Not in your sources. Answered from my own knowledge';
+      if (useLlm) {
+        const se = newStream(0, 'Answer: ' + (q.length > 60 ? q.slice(0, 57) + '...' : q), 'Answer.');
+        const r = await llmAnswer(q, chunks, (p) => feedStream(se, p));
+        if (se.started) R.endStream();
+        if (r.cancelled) return;
+        if (se.started) { push('app', labelOf(r.basis)); return; }       // the answer was shown and read while it was written; how much came from your sources is said at the end
+        pts = r.pts; basis = r.basis;
+      }
+      let label = labelOf(basis);
       if (!pts && chunks.length) { pts = makeNotes(chunks[0].name, chunks[0].body); label = 'The smart model is not ready. Closest part of your sources'; }
       if (!pts) {
         const w = await wikiLookup(q).catch(() => null);
@@ -327,7 +370,7 @@ function Main() {
       const nm = 'Answer: ' + (q.length > 60 ? q.slice(0, 57) + '...' : q);
       push('app', TOPIC + nm);
       R.startTopic(0, nm, pts, `Answer. ${pts.length} points.`);
-    } finally { makingRef.current = false; setWorking(''); }
+    } finally { R.endStream(); makingRef.current = false; setWorking(''); }
   };
 
   // spoken question: "question" -> say the whole question -> "okay"
@@ -415,7 +458,7 @@ function Main() {
       else push('app', 'Try: topic <name>, exact <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
     }
   };
-  const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t, 'text'); };
+  const send = () => { const t = input.trim(); if (!t) return; setInput(''); exec(t, 'text'); keepFocus(); };
 
   const addFiles = async () => {
     setBusy(true);
@@ -619,6 +662,7 @@ function Main() {
     return true;
   };
   const mic = async () => {
+    keepFocus();
     if (listening) { endQ(); await stopListening(); return; }
     const g = await PermissionsAndroid.request('android.permission.RECORD_AUDIO' as any);
     if (g !== 'granted') return;
@@ -670,6 +714,12 @@ function Main() {
     return () => clearTimeout(tm);
   }, [msgs.length]);
 
+  useEffect(() => {
+    if (!working || !follow.current) return;
+    const tm = setTimeout(() => list.current?.scrollToEnd({ animated: true }), 150);
+    return () => clearTimeout(tm);
+  }, [!!working]);
+
   const lastTopic = (() => { for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].text.startsWith(TOPIC)) return i; return -1; })();
   const goPoint = useCallback((k: number) => { follow.current = true; R.goto(k); }, []);
   const setRowY = useCallback((k: number, y: number) => { rowY.current[k] = y; }, []);
@@ -717,42 +767,6 @@ function Main() {
         <View style={st.brand}><Image source={require('./assets/logo.png')} style={st.logo} resizeMode="contain" /><Text style={st.title}>Sheet.md</Text></View>
         <TouchableOpacity style={st.hBtn} onPress={() => setShowSet(true)}><Icon n="settings" size={24} /></TouchableOpacity>
       </View>
-      {showTtsPrompt && (
-        <View style={[st.group, { marginHorizontal: 14, marginTop: 4, marginBottom: 6, paddingVertical: 10 }]}>
-          <Text style={[st.txt, { fontWeight: '700', fontSize: 14 }]}>Download clear offline voice (Lessac, ~67 MB, Wi-Fi)?</Text>
-          <Text style={[st.sub, { marginTop: 2, marginBottom: 8 }]}>High-quality neural speech that runs fully offline on your device.</Text>
-          <View style={{ flexDirection: 'row', gap: 8 }}>
-            <TouchableOpacity
-              style={[st.miniBtn, { height: 34, paddingHorizontal: 14, backgroundColor: C.acc }]}
-              onPress={async () => {
-                setShowTtsPrompt(false);
-                await setMeta('tts_prompted', '1').catch(() => {});
-                startVoiceDownload(DEFAULT_VOICE_ID);
-              }}>
-              <Text style={[st.txt, { color: '#fff', fontSize: 13, fontWeight: '600' }]}>Download</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[st.miniBtn, { height: 34, paddingHorizontal: 12 }]}
-              onPress={async () => {
-                setShowTtsPrompt(false);
-                await setMeta('tts_prompted', '1').catch(() => {});
-                setShowSet(true);
-              }}>
-              <Text style={[st.txt, { fontSize: 13 }]}>Choose another</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[st.miniBtn, { height: 34, paddingHorizontal: 12 }]}
-              onPress={async () => {
-                setShowTtsPrompt(false);
-                await setMeta('tts_prompted', '1').catch(() => {});
-              }}>
-              <Text style={[st.txt, { fontSize: 13, color: C.sec }]}>Later</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      )}
-      <View style={st.chip}><Text style={st.sub}>{working ? working : asking ? 'Listening to your question · say okay when done' : indexing ? 'Indexing…' : `${ready} sources ready`}{listening ? (awakeUI ? '  •  listening… say your command' : '  •  listening') : ''}</Text>{listening && !!heard && <Text style={[st.sub, { textAlign: 'center' }]}>heard: “{heard}”</Text>}</View>
-
       <ScrollView
         ref={list} style={{ flex: 1 }} contentContainerStyle={{ padding: 16, gap: 12 }}
         keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}
@@ -762,16 +776,59 @@ function Main() {
             <Icon n="plus" size={22} /><Text style={st.emptyT}>Add a source to begin</Text>
           </TouchableOpacity>) : null}
         {msgs.map(renderMsg)}
+        {(working || indexing) ? <View style={st.status}><ActivityIndicator size="small" color={C.sec} /><Text style={st.statusT}>{working || 'Indexing…'}</Text></View> : null}
       </ScrollView>
 
-      <View style={[st.dock, { paddingBottom: kbPad > 0 ? 10 : ins.bottom + 12 }]}>
+      <View style={[st.dock, { paddingBottom: kbPad > 0 ? 8 : ins.bottom + 14 }]}>
         <View style={st.box}>
-          <TextInput style={st.boxInput} value={input} onChangeText={setInput} multiline
+          {/* top card (like the "Start interview" card in Claude): what the mic hears, the player, or a prompt - always inside the input box */}
+          {(listening || s.points.length > 0) && (
+            <View style={st.tcard}>
+              {listening && (
+                <View style={st.liveRow}>
+                  <Wave mic active color={C.on} height={34} />
+                  <LiveText heard={heard} status={asking ? 'Listening to your question · say okay when done' : awakeUI ? 'Listening… say your command' : 'Listening'} />
+                </View>)}
+              {listening && s.points.length > 0 && <View style={st.tsep} />}
+              {s.points.length > 0 && (
+                <View style={st.playRow}>
+                  <View style={st.playInfo}>
+                    <Wave active={playing} color={C.tx} height={26} />
+                    <Text style={st.sub} numberOfLines={1}>{s.status === 'idle' ? 'Finished' : `Point ${Math.min(s.idx + 1, s.points.length)}/${s.points.length}`} · {s.rate.toFixed(1)}x</Text>
+                  </View>
+                  <View style={st.playBtns}>
+                    <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.prev(); keepFocus(); }}><Icon n="prev" size={20} /></TouchableOpacity>
+                    <TouchableOpacity style={[st.pBtn, st.pBtnMain]} onPress={() => { follow.current = true; playing ? R.pause() : R.resume(); keepFocus(); }}>
+                      <Icon n={playing ? 'pause' : 'play'} size={20} color="#fff" />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={st.pBtn} onPress={() => { follow.current = true; R.next(); keepFocus(); }}><Icon n="next" size={20} /></TouchableOpacity>
+                    <TouchableOpacity style={st.pBtn} onPress={() => { R.stop(); cancelGen(); choicesRef.current = null; setWorking(''); keepFocus(); }}><Icon n="close" size={18} /></TouchableOpacity>
+                  </View>
+                </View>)}
+            </View>)}
+          {showTtsPrompt && !listening && s.points.length === 0 && (
+            <View style={st.tcard}>
+              <View style={st.promoHead}>
+                <Icon n="speed" size={20} />
+                <Text style={st.promoT}>Download a clear offline voice</Text>
+                <TouchableOpacity style={st.promoX} onPress={async () => { setShowTtsPrompt(false); await setMeta('tts_prompted', '1').catch(() => {}); }}><Icon n="close" size={16} color={C.sec} /></TouchableOpacity>
+              </View>
+              <Text style={[st.sub, { marginTop: 2 }]}>Lessac, ~67 MB on Wi-Fi. Runs fully offline.</Text>
+              <View style={st.promoRow}>
+                <TouchableOpacity style={st.promoBtn} onPress={async () => { setShowTtsPrompt(false); await setMeta('tts_prompted', '1').catch(() => {}); startVoiceDownload(DEFAULT_VOICE_ID); }}>
+                  <Text style={st.promoBtnT}>Download</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={st.promoGhost} onPress={async () => { setShowTtsPrompt(false); await setMeta('tts_prompted', '1').catch(() => {}); setShowSet(true); }}>
+                  <Text style={[st.txt, { fontSize: 14 }]}>Choose another</Text>
+                </TouchableOpacity>
+              </View>
+            </View>)}
+          <TextInput ref={inputRef} style={st.boxInput} value={input} onChangeText={setInput} multiline blurOnSubmit={false}
             placeholder="Ask anything · or: topic anemia, exact anemia, explain anemia" placeholderTextColor="#8A8A8A" />
           <View style={st.boxRow}>
-            <TouchableOpacity style={st.boxPlus} onPress={() => setShowSrc(true)}><Icon n="plus" size={24} /></TouchableOpacity>
+            <TouchableOpacity style={st.boxPlus} onPress={() => { setShowSrc(true); }}><Icon n="plus" size={24} /></TouchableOpacity>
             <View style={{ flex: 1 }} />
-            <TouchableOpacity style={st.pill} onPress={cycleLang}>
+            <TouchableOpacity style={st.pill} onPress={() => { cycleLang(); keepFocus(); }}>
               <Text style={st.pillT}>{LANG_LABEL[s.lang]}</Text><Icon n="chevronDown" size={14} />
             </TouchableOpacity>
             <TouchableOpacity style={[st.circle, listening && { backgroundColor: C.on }]} onPress={mic}>
@@ -781,20 +838,6 @@ function Main() {
               <Icon n="send" size={20} color={hasText ? '#fff' : C.disI} />
             </TouchableOpacity>
           </View>
-          {s.points.length > 0 && (
-            <>
-              <View style={st.boxSep} />
-              <View style={st.ctrl}>
-                <TouchableOpacity style={st.ctrlSq} onPress={() => { follow.current = true; R.prev(); }}><Icon n="prev" size={22} /></TouchableOpacity>
-                <TouchableOpacity style={st.ctrlWide} onPress={() => { follow.current = true; playing ? R.pause() : R.resume(); }}>
-                  <Icon n={playing ? 'pause' : 'play'} size={20} />
-                  <Text style={st.ctrlT}>{playing ? 'Pause' : s.status === 'idle' ? 'Play again' : 'Play'}</Text>
-                  <Text style={st.sub}>{s.rate.toFixed(1)}x</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={st.ctrlSq} onPress={() => { R.stop(); cancelGen(); choicesRef.current = null; setWorking(''); }}><Icon n="close" size={20} /></TouchableOpacity>
-                <TouchableOpacity style={st.ctrlSq} onPress={() => { follow.current = true; R.next(); }}><Icon n="next" size={22} /></TouchableOpacity>
-              </View>
-            </>)}
         </View>
       </View>
 
@@ -1238,6 +1281,50 @@ function Main() {
   );
 }
 
+// Bars that move. mic = driven by the real loudness of your voice; otherwise a soft moving pattern while the app is reading.
+const BARS = 18;
+function Wave({ active, mic, color, height = 28 }: { active: boolean; mic?: boolean; color: string; height?: number }) {
+  const vals = useRef(Array.from({ length: BARS }, () => new Animated.Value(0.1))).current;
+  const level = useRef(0);
+  useEffect(() => {
+    if (!mic) return;
+    return subscribeLevel((v) => { level.current = Math.max(v, level.current * 0.55); });     // quick up, soft down
+  }, [mic]);
+  useEffect(() => {
+    if (!active) { vals.forEach((v) => v.setValue(0.1)); return; }
+    const id = setInterval(() => {
+      const base = mic ? level.current : 0.35 + Math.random() * 0.4;
+      if (mic) level.current *= 0.8;
+      const t = Date.now() / 220;
+      vals.forEach((v, i) => {
+        const shape = 0.55 + 0.45 * Math.sin(i * 0.8 + t);
+        const to = Math.min(1, 0.1 + base * shape * (0.6 + Math.random() * 0.5));
+        Animated.timing(v, { toValue: to, duration: 90, easing: Easing.linear, useNativeDriver: false }).start();
+      });
+    }, 100);
+    return () => clearInterval(id);
+  }, [active, mic]);
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', height, gap: 3 }}>
+      {vals.map((v, i) => (
+        <Animated.View key={i} style={{ width: 3, borderRadius: 2, backgroundColor: color, height: v.interpolate({ inputRange: [0, 1], outputRange: [3, height] }) }} />))}
+    </View>
+  );
+}
+
+// What the mic hears right now (updates while you speak); when you stop, the last heard command stays for a few seconds.
+function LiveText({ heard, status }: { heard: string; status: string }) {
+  const [live, setLive] = useState('');
+  useEffect(() => subscribeLive(setLive), []);
+  const text = live || heard;
+  return (
+    <View style={{ flex: 1, minWidth: 0 }}>
+      <Text style={st.liveS} numberOfLines={1}>{status}</Text>
+      <Text style={[st.liveT, !text && { color: C.disI }]} numberOfLines={2}>{text ? `“${text}”` : 'Say a command…'}</Text>
+    </View>
+  );
+}
+
 const Sheet = ({ visible, onClose, title, subtitle, bottom, children }:
   { visible: boolean; onClose: () => void; title: string; subtitle?: string; bottom: number; children: React.ReactNode }) => (
   <Modal visible={visible} transparent statusBarTranslucent navigationBarTranslucent animationType="slide" onRequestClose={onClose}>
@@ -1288,12 +1375,13 @@ const st = StyleSheet.create({
   title: { fontSize: 18, fontWeight: '600', color: C.tx },
   brand: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   logo: { width: 34, height: 24 },
-  chip: { alignSelf: 'center', paddingHorizontal: 12, paddingVertical: 4 },
   sub: { color: C.sec, fontSize: 12 },
   txt: { color: C.tx, fontSize: 15 },
   youT: { color: '#fff', fontSize: 14 },
   reply: { color: C.tx, fontSize: 14, lineHeight: 20, alignSelf: 'flex-start', maxWidth: '92%', paddingHorizontal: 2 },
-  you: { backgroundColor: C.acc, alignSelf: 'flex-end', borderRadius: 3, paddingHorizontal: 11, paddingVertical: 7, maxWidth: '80%' },
+  you: { backgroundColor: C.acc, alignSelf: 'flex-end', borderRadius: 18, borderBottomRightRadius: 6, paddingHorizontal: 14, paddingVertical: 9, maxWidth: '80%' },
+  status: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6, paddingHorizontal: 2 },
+  statusT: { color: C.sec, fontSize: 14 },
   empty: { borderWidth: 1, borderColor: C.bd, borderRadius: 14, padding: 18, alignItems: 'center', marginTop: 40, flexDirection: 'row', justifyContent: 'center', gap: 8 },
   emptyT: { color: C.tx, fontSize: 16 },
 
@@ -1304,7 +1392,7 @@ const st = StyleSheet.create({
   ptLine: { color: C.tx, fontSize: 16, lineHeight: 25, marginBottom: 6 },
   cardHead: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2 },
   cardT: { flex: 1, fontWeight: '700', fontSize: 16, color: C.tx },
-  ptRow: { flexDirection: 'row', gap: 10, paddingVertical: 7, paddingHorizontal: 8, borderRadius: 2 },
+  ptRow: { flexDirection: 'row', gap: 10, paddingVertical: 7, paddingHorizontal: 8, borderRadius: 10 },
   ptRowOn: { backgroundColor: '#EEF0FF' },
   ptN: { width: 22, color: C.sec, fontSize: 14, textAlign: 'right', paddingTop: 1 },
   ptNOn: { color: C.tx, fontWeight: '700' },
@@ -1317,19 +1405,35 @@ const st = StyleSheet.create({
   hint: { color: C.sec, fontSize: 14, lineHeight: 20, fontStyle: 'italic', marginTop: 2 },
 
   dock: { paddingHorizontal: 12, paddingTop: 6 },
-  box: { borderWidth: 1.5, borderColor: '#D6D6D3', borderRadius: 3, backgroundColor: C.bg, paddingHorizontal: 10, paddingTop: 8, paddingBottom: 6 },
-  boxSep: { height: 1, backgroundColor: '#ECECEA', marginTop: 6, marginHorizontal: -10 },
-  boxInput: { minHeight: 44, maxHeight: 120, fontSize: 16, color: C.tx, paddingHorizontal: 4, paddingVertical: 6, textAlignVertical: 'top' },
-  boxRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 },
-  boxPlus: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
-  pill: { flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 3, paddingHorizontal: 10, height: 38 },
+  box: {
+    borderWidth: 1, borderColor: '#E1DFD9', borderRadius: 30, backgroundColor: C.bg, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 8,
+    elevation: 4, shadowColor: '#000', shadowOpacity: 0.07, shadowRadius: 14, shadowOffset: { width: 0, height: 3 },
+  },
+  boxInput: { minHeight: 46, maxHeight: 130, fontSize: 16, color: C.tx, paddingHorizontal: 8, paddingVertical: 8, textAlignVertical: 'top' },
+  boxRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 },
+  boxPlus: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
+  pill: { flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 20, paddingHorizontal: 12, height: 40 },
   pillT: { fontSize: 14, fontWeight: '600', color: C.tx },
-  circle: { width: 40, height: 40, borderRadius: 3, alignItems: 'center', justifyContent: 'center' },
+  circle: { width: 42, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F1EFEA' },
 
-  ctrl: { flexDirection: 'row', gap: 4, paddingTop: 4 },
-  ctrlSq: { width: 62, height: 46, borderRadius: 3, alignItems: 'center', justifyContent: 'center' },
-  ctrlWide: { flex: 1, height: 46, borderRadius: 3, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
-  ctrlT: { fontSize: 16, fontWeight: '600', color: C.tx },
+  // the card on top of the input (same place as Claude's "Start interview" card)
+  tcard: { backgroundColor: '#F1EFEA', borderRadius: 22, paddingHorizontal: 14, paddingVertical: 12, marginBottom: 8 },
+  tsep: { height: 1, backgroundColor: '#E1DFD9', marginVertical: 10 },
+  liveRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  liveS: { fontSize: 12, color: C.sec },
+  liveT: { fontSize: 16, fontWeight: '600', color: C.tx, marginTop: 1 },
+  playRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  playInfo: { flex: 1, minWidth: 0, gap: 4 },
+  playBtns: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  pBtn: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
+  pBtnMain: { width: 44, height: 44, borderRadius: 22, backgroundColor: C.acc },
+  promoHead: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  promoT: { flex: 1, fontSize: 16, fontWeight: '700', color: C.tx },
+  promoX: { width: 30, height: 30, alignItems: 'center', justifyContent: 'center' },
+  promoRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 },
+  promoBtn: { flex: 1, height: 44, borderRadius: 22, borderWidth: 1.5, borderColor: '#CFCDC6', backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
+  promoBtnT: { fontSize: 16, fontWeight: '600', color: C.tx },
+  promoGhost: { height: 44, paddingHorizontal: 12, alignItems: 'center', justifyContent: 'center' },
 
   drawerBg: { flex: 1, flexDirection: 'row', backgroundColor: 'rgba(0,0,0,0.35)' },
   drawer: { width: '80%', maxWidth: 340, backgroundColor: C.bg, paddingHorizontal: 14, gap: 8, elevation: 16 },
@@ -1357,20 +1461,20 @@ const st = StyleSheet.create({
   val: { fontSize: 13, color: C.sec, marginTop: 1 },
   step: { width: 40, height: 40, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
   seg: { flexDirection: 'row', backgroundColor: C.surf, borderRadius: 16, padding: 4 },
-  segI: { flex: 1, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  segI: { flex: 1, height: 40, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
   segOn: { backgroundColor: C.acc },
   segT: { fontSize: 14, fontWeight: '600', color: C.tx },
   voiceRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11 },
-  opt: { flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 8, borderRadius: 3, backgroundColor: C.surf, marginTop: 6 },
+  opt: { flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 12, borderRadius: 16, backgroundColor: C.surf, marginTop: 6 },
   optT: { flex: 1, fontSize: 15, fontWeight: '600', color: C.tx },
   barBg: { height: 6, borderRadius: 3, backgroundColor: C.bd, overflow: 'hidden', marginBottom: 12 },
   barFg: { height: 6, borderRadius: 3, backgroundColor: C.acc },
-  miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 12, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
+  miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
   dlgBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'center', paddingHorizontal: 24 },
   dlg: { backgroundColor: C.bg, borderRadius: 20, padding: 18, gap: 14, elevation: 16 },
   dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.tx },
   dlgRow: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
-  dlgBtn: { height: 42, paddingHorizontal: 20, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surf },
+  dlgBtn: { height: 42, paddingHorizontal: 20, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surf },
   cmdRow: { paddingVertical: 10 },
   cmd: { fontSize: 15, fontWeight: '600', color: C.tx },
   cmdD: { fontSize: 13, color: C.sec, marginTop: 1 },
