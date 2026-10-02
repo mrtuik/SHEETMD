@@ -6,7 +6,7 @@ import {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
-import { parse, parsePick, isGreeting, stripChoiceEcho, OK_END, CANCEL_Q } from './src/commands';
+import { parse, parsePick, isGreeting, stripChoiceEcho, setChoiceNames, pickByName, OK_END, CANCEL_Q } from './src/commands';
 import { queryTokens } from './src/match';
 import { makeNotes, Point } from './src/notes';
 import { exactPoints } from './src/exact';
@@ -25,7 +25,7 @@ import { updateService, stopService, onServiceAction } from './src/service';
 import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
-  pauseVoiceDownload, cancelVoiceDownload, deleteVoice, selectVoice, setTtsEngine,
+  pauseVoiceDownload, cancelVoiceDownload, deleteVoice, selectVoice, setTtsEngine, setBoost,
   speak, stopSpeak, DEFAULT_VOICE_ID, pickCustomVoice,
 } from './src/tts';
 
@@ -158,6 +158,7 @@ function Main() {
       await cleanupStuck().catch(() => {});
       initLlm().catch(() => {});
       initTts().catch(() => {});
+      await R.loadSettings();                         // speed, pause, language, repeat lines, sound boost: same in every chat
       const prompted = await getMeta('tts_prompted').catch(() => '');
       if (prompted !== '1') setShowTtsPrompt(true);
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
@@ -196,6 +197,7 @@ function Main() {
 
   // "did you mean": show the 3 names, read them out, then wait for a tap or "one / two / three"
   const showChoices = (names: string[], marks: number, exactMode = false) => {
+    setChoiceNames(names);
     choicesRef.current = names; choiceMarks.current = marks; choiceExact.current = exactMode; rowY.current = {};
     push('app', CHOICE + JSON.stringify(names));
     const line = 'Did you mean: ' + names.map((n) => n.replace(/\s*\(.*?\)\s*/g, ' ').trim()).join(', or ') + '?';   // no number words spoken: the mic cannot mistake the app's own voice for your "one / two / three", so you may answer at any moment
@@ -368,7 +370,7 @@ function Main() {
     R.startTopic(0, f.name, pts);
   };
   const pickName = async (nm: string) => {
-    choicesRef.current = null;
+    choicesRef.current = null; setChoiceNames(null);
     if (choiceExact.current) { choiceExact.current = false; await exactTopic(nm, true); return; }
     await openTopic(nm, true, choiceMarks.current);
   };
@@ -436,6 +438,7 @@ function Main() {
     if (!TAIL_WORDS.has(last) || R.getSpoken().toLowerCase().includes(last)) return null;
     return last;
   };
+  const nameFromAlts = (alts: string[]) => { for (const a of alts) { const n = pickByName(stripChoiceEcho(a)); if (n && n <= (choicesRef.current?.length || 3)) return n; } return 0; };   // you said the option's name
   const stableT = useRef<any>(null);                                 // topic / exact / explain: runs when the words stop changing, not after the long end-of-speech silence
   const clearStable = () => { clearTimeout(stableT.current); stableT.current = null; };
   const loosePick = (alts: string[]) => { for (const a of alts) { const n = parsePick(stripChoiceEcho(a), true); if (n && n <= (choicesRef.current?.length || 3)) return n; } return 0; };
@@ -488,7 +491,7 @@ function Main() {
     if (qRef.current) { feedQuestion(alts[0]); return; }
     for (const a of alts) { const tc = tailCmd(a); if (tc) { execRef.current(tc); restartListening(150); return; } }
     if (choicesRef.current) {
-      const n = loosePick(alts);
+      const n = loosePick(alts) || nameFromAlts(alts);
       if (n) { execRef.current(WORDS[n - 1]); return; }
       setHeard(alts[0].slice(0, 40) + '  (not one/two/three)');         // so you can see what the phone heard instead
     }          // dictating a question: everything is part of it until "okay"
@@ -869,6 +872,18 @@ function Main() {
             <StepRow icon="speed" label="Speed" value={`${s.rate.toFixed(1)}x`} onMinus={() => R.setRate(-0.1)} onPlus={() => R.setRate(0.1)} />
             <View style={st.sep} />
             <StepRow icon="timer" label="Pause between points" value={`${s.pauseSec}s`} onMinus={() => R.setPause(-1)} onPlus={() => R.setPause(1)} />
+            <View style={st.sep} />
+            <View style={st.line}>
+              <Icon n="timer" size={20} />
+              <View style={{ flex: 1 }}><Text style={st.txt}>Repeat lines</Text><Text style={st.val}>{s.repeatOn ? `each line ${s.repeatN} times` : 'off'}</Text></View>
+              {s.repeatOn && <>
+                <TouchableOpacity style={st.step} onPress={() => R.setRepeatN(-1)}><Icon n="minus" size={18} /></TouchableOpacity>
+                <TouchableOpacity style={st.step} onPress={() => R.setRepeatN(1)}><Icon n="plus" size={18} /></TouchableOpacity>
+              </>}
+              <Switch value={s.repeatOn} onValueChange={R.setRepeat} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" style={{ marginLeft: 8 }} />
+            </View>
+            <View style={st.sep} />
+            <StepRow icon="speed" label="Sound boost (offline voice)" value={ttsState.boost <= 1 ? 'off' : `${ttsState.boost.toFixed(1)}x louder`} onMinus={() => setBoost(-0.5)} onPlus={() => setBoost(0.5)} />
           </View>
 
           {/* Language selector */}
