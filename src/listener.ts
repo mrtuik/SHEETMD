@@ -33,15 +33,18 @@ export const subscribeLive = (f: (t: string) => void) => { liveSubs.add(f); retu
 const emitLevel = (v: number) => levelSubs.forEach((f) => f(v));
 const emitLive = (t: string) => liveSubs.forEach((f) => f(t));
 
+// Voice.cancel can hang while the engine is busy: never wait for it more than 700 ms
+const safeCancel = () => Promise.race([Promise.resolve(Voice?.cancel?.()).catch(() => {}), new Promise((r) => setTimeout(r, 700))]);
+
 const schedule = (ms = 250) => { clearTimeout(timer); timer = setTimeout(begin, ms); };
 async function begin() {
   if (!on || !Voice || starting) return;
   starting = true; last = Date.now();
   try {
-    // Voice.start can hang for ever when the engine is busy (that froze listening: "starting" stayed true) -> give up after 5 s
+    // Voice.start can hang for ever when the engine is busy (that froze listening: "starting" stayed true) -> give up after 3 s
     await Promise.race([Voice.start(loc(), { EXTRA_PARTIAL_RESULTS: true, EXTRA_MAX_RESULTS: 5 }), new Promise((_, rej) => setTimeout(() => rej(new Error('start timeout')), 3000))]);
   }
-  catch { errs++; try { await Voice.cancel(); } catch {} schedule(Math.min(800 + errs * 500, 4000)); }
+  catch { errs++; await safeCancel(); schedule(Math.min(300 + errs * 300, 2500)); }
   finally { starting = false; }
 }
 
@@ -70,15 +73,16 @@ export async function startListening(onTexts: (t: string[]) => void, getLocale: 
     last = Date.now(); clearTimeout(guard); emitLive('');
     const code = Number(e?.error?.code ?? e?.error?.message?.match?.(/\d+/)?.[0]);
     const quiet = code === 6 || code === 7;          // timeout / nothing heard: normal while silent
-    if (!quiet) errs++;
-    try { await Voice.cancel(); } catch {}
-    schedule(quiet ? 30 : Math.min(400 + errs * 300, 2500));
+    const busy = code === 8 || code === 5;           // recogniser busy / client error: a quick fresh restart fixes it (long back-off was the mic "pausing")
+    if (!quiet && !busy) errs++;
+    await safeCancel();
+    schedule(quiet ? 30 : busy ? 250 : Math.min(400 + errs * 300, 2500));
   };
   clearInterval(dog);
   dog = setInterval(async () => {                    // no result / error / speech for 12 s = the recogniser is dead: restart it
     if (!on || Date.now() - last < 8000) return;
     last = Date.now(); starting = false;
-    try { await Voice.cancel(); } catch {}
+    await safeCancel();
     schedule(100);
   }, 4000);
   notify(true);
@@ -99,7 +103,7 @@ export async function restartListening(ms = 250) {
   if (nativeOn) { handled = false; try { Stt.reset?.(); } catch {} return; }     // offline engine: continuous, nothing to restart
   if (!on || !Voice) return;
   clearTimeout(guard); handled = false;
-  try { await Voice.cancel(); } catch {}
+  await safeCancel();
   schedule(ms);
 }
 
