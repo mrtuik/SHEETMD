@@ -307,6 +307,7 @@ export type TtsGlobalState = {
   isPiperReady: boolean;
   activeSpeaker: 'piper' | 'phone' | 'none';
   ramReason: string;
+  boost: number;          // sound boost for the offline voice (1 = normal)
   customVoice: boolean;   // a WAV for the Pocket "my own voice" exists
   voices: Record<string, VoiceState>;
 };
@@ -317,6 +318,7 @@ export const ttsState: TtsGlobalState = {
   isPiperReady: false,
   activeSpeaker: 'none',
   ramReason: '',
+  boost: 1,
   customVoice: false,
   voices: {},
 };
@@ -435,6 +437,9 @@ export async function initTts() {
   const savedVoice = (await getMeta('tts_voice').catch(() => '')) || DEFAULT_VOICE_ID;
   const targetVoice = VOICES.some((v) => v.id === savedVoice) ? savedVoice : DEFAULT_VOICE_ID;
   ttsState.selectedVoice = targetVoice;
+
+  const bst = parseFloat(await getMeta('tts_boost').catch(() => ''));
+  if (!isNaN(bst)) ttsState.boost = Math.min(4, Math.max(1, bst));
 
   const savedEngine = (await getMeta('tts_engine').catch(() => '')) as TtsEngine;
 
@@ -699,6 +704,13 @@ export async function deleteVoice(wanted: string) {
   emit();
 }
 
+export async function setBoost(d: number) {
+  ttsState.boost = Math.min(4, Math.max(1, +(ttsState.boost + d).toFixed(1)));
+  try { NativeTts?.setGain?.(ttsState.boost); } catch {}
+  await setMeta('tts_boost', String(ttsState.boost)).catch(() => {});
+  emit();
+}
+
 export async function selectVoice(id: string) {
   const v = VOICES.find((x) => x.id === id);
   if (!v) return;
@@ -857,6 +869,7 @@ function fallbackToPhone(job: SpeakJob) {
     language: isBn ? 'bn-BD' : 'en-US',
     voice: job.opts.voice || undefined,
     pitch: 1.0,
+    volume: 1.0,
     rate: job.opts.rate ?? 0.7,
     onStart: () => { try { job.opts.onStart?.(); } catch {} },
     onDone: () => {
@@ -904,6 +917,7 @@ function processNextJob() {
       language: isBn ? 'bn-BD' : 'en-US',
       voice: job.opts.voice || undefined,
       pitch: 1.0,
+      volume: 1.0,
       rate: job.opts.rate ?? 0.7,
       onStart: () => { try { job.opts.onStart?.(); } catch {} },
       onDone: () => { finishJob(job, 'done'); activeJob = null; processNextJob(); },
@@ -924,6 +938,7 @@ function processNextJob() {
     }, voiceOf(ttsState.selectedVoice)?.engine === 'pocket' ? Math.min(120000, 25000 + job.text.length * 500) : Math.min(40000, 12000 + job.text.length * 150));      // slow phone: first audio can take a while; cleared as soon as onStart arrives
 
     try {
+      try { NativeTts.setGain?.(ttsState.boost); } catch {}
       NativeTts.speak(job.id, job.text, rateToSpeed(job.opts.rate ?? 0.7), curSid);
     } catch {
       clearTimeout(safetyTimer);
