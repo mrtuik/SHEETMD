@@ -39,17 +39,32 @@ export function parsePick(s: string, loose = false): number {
 // it in front of your answer ("did you mean A or B or C one" / "... exact anemia"): that echo must be cut off first.
 let CHOICES: string[] = [];
 export const setChoiceNames = (n: string[] | null) => { CHOICES = n || []; };
+export const head6 = (n: string) => plain(n).split(' ').slice(0, 6).join(' ');
 const plain = (n: string) => n.replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 export function stripChoiceEcho(s: string): string {
   const m = s.toLowerCase().match(/(?:did you mean|say one)[\s\S]*?(?:two|to|too|2)\s*(?:or|and)\s*(?:three|tree|free|3)\s*[.!?।]*\s*(.*)$/);
   if (m) return m[1].trim();
   if (!CHOICES.length) return s;
   const low = s.toLowerCase();
-  const said = CHOICES.map(plain).filter((nm) => nm.length >= 3 && low.includes(nm));
+  // the app now speaks only the first words of every option (long OCR titles took ages): match both the full name and its head
+  let hits = 0, cut = -1;
+  for (const n of CHOICES) {
+    let best = -1;
+    for (const cand of [plain(n), head6(n)]) { if (cand.length >= 3) { const i = low.lastIndexOf(cand); if (i >= 0) best = Math.max(best, i + cand.length); } }
+    if (best >= 0) { hits++; cut = Math.max(cut, best); }
+  }
   const heardLine = /did you mean/.test(low);
-  if (!heardLine && said.length < 2) return s;                       // not the app's own voice
-  let cut = -1;
-  for (const nm of said) cut = Math.max(cut, low.lastIndexOf(nm) + nm.length);
+  if (!heardLine && hits < 2) {
+    // the mic heard a piece of the app's own voice and then your "one": the answer is the last word, even when the echo is cut or misheard
+    const tk = low.replace(/[.!?।,]+/g, ' ').trim().split(/\s+/);
+    const lastTk = tk[tk.length - 1];
+    if (tk.length > 3 && has(PICK, lastTk)) {
+      const names = new Set(CHOICES.flatMap((n) => plain(n).split(' ')));
+      const before = tk.slice(0, -1);
+      if (before.filter((w) => names.has(w)).length / before.length >= 0.5) return lastTk;
+    }
+    return s;                                                        // not the app's own voice
+  }
   if (cut >= 0) return s.slice(cut).replace(/^[\s.,!?।]+/, '').trim();
   const k = low.match(/\b(?:topic|exact|explain|question|stop|pause|next|previous|continue|slower|faster|repeat)\b[\s\S]*$/);
   if (k) return k[0].trim();
