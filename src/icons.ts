@@ -23,5 +23,6 @@ export const ICONS = {
   check: require('../assets/icons/ic_tuik_check.png'),
   copy: require('../assets/icons/ic_tuik_copy.png'),
   like: require('../assets/icons/ic_tuik_like.png'),
+  share: require('../assets/icons/share-32-filled.png'),
 } as const;
 export type IconName = keyof typeof ICONS;
