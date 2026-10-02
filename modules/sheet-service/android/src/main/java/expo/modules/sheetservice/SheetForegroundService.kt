@@ -19,6 +19,8 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import android.Manifest
+import android.content.pm.PackageManager
 
 class SheetForegroundService : Service() {
   companion object {
@@ -117,14 +119,16 @@ class SheetForegroundService : Service() {
     )
     micOn = intent?.getBooleanExtra("mic", false) ?: false
     var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-    if ((intent?.getBooleanExtra("mic", false) ?: false) && Build.VERSION.SDK_INT >= 30) {
+    // Android 14: the microphone service type throws a SecurityException without the RECORD_AUDIO permission -> only ask for it when granted
+    val micGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    if ((intent?.getBooleanExtra("mic", false) ?: false) && micGranted && Build.VERSION.SDK_INT >= 30) {
       type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
     }
     try {
       ServiceCompat.startForeground(this, NID, n, type)
     } catch (e: Exception) {
       try { ServiceCompat.startForeground(this, NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK) }
-      catch (e2: Exception) { stopSelf() }
+      catch (e2: Exception) { running = false; stopSelf() }
     }
     running = true
     return START_NOT_STICKY
