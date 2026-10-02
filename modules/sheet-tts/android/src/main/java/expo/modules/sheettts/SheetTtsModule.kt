@@ -51,6 +51,14 @@ class SheetTtsModule : Module() {
   @Volatile private var activeId: Int = -1
   @Volatile private var cancelled: Boolean = false
   @Volatile private var currentAudioTrack: AudioTrack? = null
+  @Volatile private var gain = 1.0f
+  // sound boost: soft-limited so a loud boost does not crackle
+  private fun applyGain(s: FloatArray): FloatArray {
+    val g = gain
+    if (g <= 1.0f) return s
+    for (i in s.indices) s[i] = Math.tanh((s[i] * g).toDouble()).toFloat()
+    return s
+  }
 
   private var audioFocusRequest: Any? = null
 
@@ -321,6 +329,10 @@ class SheetTtsModule : Module() {
       releaseModel()
     }
 
+    Function("setGain") { g: Float ->
+      gain = g.coerceIn(1.0f, 4.0f)
+    }
+
     Function("stop") {
       stopPlayback()
     }
@@ -448,7 +460,7 @@ class SheetTtsModule : Module() {
               audioTrack.play()
               val samples = cached.samples
               if (samples.isNotEmpty()) {
-                audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+                audioTrack.write(applyGain(samples), 0, samples.size, AudioTrack.WRITE_BLOCKING)
                 totalWrittenFrames = samples.size
               }
             }
@@ -470,7 +482,7 @@ class SheetTtsModule : Module() {
                 audioTrack.play()
                 for (a in parts) {
                   if (cancelled || activeId != id) break
-                  audioTrack.write(a, 0, a.size, AudioTrack.WRITE_BLOCKING)
+                  audioTrack.write(applyGain(a), 0, a.size, AudioTrack.WRITE_BLOCKING)
                   totalWrittenFrames += a.size
                 }
               }
@@ -486,7 +498,7 @@ class SheetTtsModule : Module() {
                       sendEvent("onStart", mapOf("id" to id))
                       audioTrack.play()
                     }
-                    audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+                    audioTrack.write(applyGain(samples), 0, samples.size, AudioTrack.WRITE_BLOCKING)
                     totalWrittenFrames += samples.size
                   }
                   1
