@@ -1,14 +1,15 @@
-// Offline neural English voices: Piper VITS via sherpa-onnx.
+// Offline neural English voices: Piper VITS + Pocket TTS (voice cloning) via sherpa-onnx.
 // Voices are downloaded on-demand, stored in app private storage, and run fully offline.
 import * as FS from 'expo-file-system/legacy';
 import * as Network from 'expo-network';
 import * as Device from 'expo-device';
 import * as Speech from 'expo-speech';
+import * as DocumentPicker from 'expo-document-picker';
 import { requireNativeModule } from 'expo';
 import { getMeta, setMeta } from './db';
 
-export type VoiceAccent = 'US' | 'GB' | 'KO';   // KO = Kokoro (one shared download, many speakers)
-export type VoiceGender = 'female' | 'male';
+export type VoiceAccent = 'US' | 'GB' | 'IN' | 'PK';   // IN = Indian-accent English speakers (one shared download per dataset), PK = Pocket TTS
+export type VoiceGender = 'female' | 'male' | 'clone';
 
 export type VoiceItem = {
   id: string;
@@ -20,10 +21,11 @@ export type VoiceItem = {
   bytes: number;
   license: string;
   note?: string;
-  engine?: 'kokoro';   // omitted = Piper (VITS)
-  sid?: number;        // Kokoro speaker id
+  engine?: 'pocket';   // omitted = Piper (VITS)
+  sid?: number;        // speaker id inside a multi-speaker Piper model (0 for single-speaker)
   pack?: string;       // voices that share ONE download point to the first voice's id
-  lex?: 'us' | 'gb';   // Kokoro English lexicon
+  ref?: 'bundled' | 'custom';   // Pocket: which reference WAV the voice is cloned from
+  approx?: boolean;    // download size is an estimate: skip the strict size check
 };
 
 // Official Piper VITS medium-quality single-speaker English models from sherpa-onnx
@@ -162,30 +164,125 @@ export const VOICES: VoiceItem[] = [
     license: 'CC-BY-SA 4.0',
     note: 'Distinctive northern accent',
   },
-  // Kokoro-82M int8 (sherpa-onnx multi-lang v1.0): ONE ~132 MB download, many speakers. Heavier than Piper: needs a stronger phone.
+  // More official Piper English models (sherpa-onnx tts-models release)
+  {
+    id: 'en_US-john-medium',
+    label: 'John - US male',
+    accent: 'US',
+    gender: 'male',
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-john-medium.tar.bz2',
+    bytes: 67_200_000,
+    approx: true,
+    license: 'See Piper voice model card',
+  },
+  {
+    id: 'en_US-kathleen-low',
+    label: 'Kathleen - US female (low quality, light)',
+    accent: 'US',
+    gender: 'female',
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-kathleen-low.tar.bz2',
+    bytes: 67_200_000,
+    approx: true,
+    license: 'See Piper voice model card',
+  },
+  {
+    id: 'en_US-danny-low',
+    label: 'Danny - US male (low quality, light)',
+    accent: 'US',
+    gender: 'male',
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-danny-low.tar.bz2',
+    bytes: 67_200_000,
+    approx: true,
+    license: 'See Piper voice model card',
+  },
+  {
+    id: 'en_GB-cori-medium',
+    label: 'Cori - UK female',
+    accent: 'GB',
+    gender: 'female',
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-cori-medium.tar.bz2',
+    bytes: 67_200_000,
+    approx: true,
+    license: 'See Piper voice model card',
+  },
+  // Indian-accent English: Piper's multi-speaker CMU Arctic model has Indian-English speakers (ksp, slp, aup, axb, gka).
+  // ONE download, 5 speakers (speaker ids from the model's own speaker_id_map: ksp 3, slp 12, aup 13, axb 15, gka 17).
   ...([
-    ['af_heart', 'Heart - US female', 'female', 3, 'us', 'Warm, very natural'],
-    ['af_bella', 'Bella - US female', 'female', 2, 'us', 'Clear and expressive'],
-    ['af_nicole', 'Nicole - US female', 'female', 6, 'us', 'Soft, calm'],
-    ['am_michael', 'Michael - US male', 'male', 16, 'us', 'Steady narration'],
-    ['am_adam', 'Adam - US male', 'male', 11, 'us', 'Deep, clear'],
-    ['bf_emma', 'Emma - UK female', 'female', 21, 'gb', 'British, clear'],
-    ['bm_george', 'George - UK male', 'male', 26, 'gb', 'British, formal'],
-  ] as [string, string, VoiceGender, number, 'us' | 'gb', string][]).map(([k, label, gender, sid, lex, note]): VoiceItem => ({
-    id: `kokoro-${k}`,
+    ['in-arctic-ksp', 'KSP - Indian English male', 'male', 3],
+    ['in-arctic-slp', 'SLP - Indian English female', 'female', 12],
+    ['in-arctic-aup', 'AUP - Indian English male', 'male', 13],
+    ['in-arctic-axb', 'AXB - Indian English female', 'female', 15],
+    ['in-arctic-gka', 'GKA - Indian English male', 'male', 17],
+  ] as [string, string, VoiceGender, number][]).map(([id, label, gender, sid]): VoiceItem => ({
+    id,
     label,
-    accent: 'KO',
+    accent: 'IN',
     gender,
     quality: 'medium',
-    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2',
-    bytes: 131_770_328,
-    license: 'Apache-2.0 (Kokoro-82M)',
-    note,
-    engine: 'kokoro',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-arctic-medium.tar.bz2',
+    bytes: 77_000_000,
+    approx: true,
+    license: 'CMU Arctic dataset (Piper en_US-arctic-medium)',
+    note: 'Indian-accent speaker. One shared download',
     sid,
-    pack: 'kokoro-af_heart',
-    lex,
+    pack: 'in-arctic-ksp',
   })),
+  // Hindi-first-language speakers reading English (L2-ARCTIC): ONE download, 4 speakers (ids from speaker_id_map: SVBI 2, TNI 9, ASI 10, RRBI 19).
+  ...([
+    ['in-l2-svbi', 'SVBI - Hindi-accent English', 'female', 2],
+    ['in-l2-tni', 'TNI - Hindi-accent English', 'female', 9],
+    ['in-l2-asi', 'ASI - Hindi-accent English', 'male', 10],
+    ['in-l2-rrbi', 'RRBI - Hindi-accent English', 'male', 19],
+  ] as [string, string, VoiceGender, number][]).map(([id, label, gender, sid]): VoiceItem => ({
+    id,
+    label,
+    accent: 'IN',
+    gender,
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-l2arctic-medium.tar.bz2',
+    bytes: 77_000_000,
+    approx: true,
+    license: 'L2-ARCTIC dataset (non-commercial: check before any release)',
+    note: 'Hindi-speaker accent. One shared download',
+    sid,
+    pack: 'in-l2-svbi',
+  })),
+  // Pocket TTS (Kyutai) int8 via sherpa-onnx: ONE download. The voice is CLONED from a short WAV, so any accent can be used.
+  // Heavier than Piper: needs a stronger phone (about 600 MB RAM while it speaks).
+  {
+    id: 'pocket-bria',
+    label: 'Pocket - Bria (sample voice in the download)',
+    accent: 'PK',
+    gender: 'female',
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-pocket-tts-int8-2026-01-26.tar.bz2',
+    bytes: 190_000_000,
+    approx: true,
+    license: 'Kyutai Pocket TTS (see model card)',
+    note: 'Natural, English only',
+    engine: 'pocket',
+    pack: 'pocket-bria',
+    ref: 'bundled',
+  },
+  {
+    id: 'pocket-custom',
+    label: 'Pocket - My own voice (clone from a WAV)',
+    accent: 'PK',
+    gender: 'clone',
+    quality: 'medium',
+    url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-pocket-tts-int8-2026-01-26.tar.bz2',
+    bytes: 190_000_000,
+    approx: true,
+    license: 'Use only voices you may clone',
+    note: 'Pick a clean 5-10 s WAV, e.g. an Indian-English speaker',
+    engine: 'pocket',
+    pack: 'pocket-bria',
+    ref: 'custom',
+  },
 ];
 
 export const DEFAULT_VOICE_ID = 'en_US-lessac-medium';
@@ -210,6 +307,7 @@ export type TtsGlobalState = {
   isPiperReady: boolean;
   activeSpeaker: 'piper' | 'phone' | 'none';
   ramReason: string;
+  customVoice: boolean;   // a WAV for the Pocket "my own voice" exists
   voices: Record<string, VoiceState>;
 };
 
@@ -219,6 +317,7 @@ export const ttsState: TtsGlobalState = {
   isPiperReady: false,
   activeSpeaker: 'none',
   ramReason: '',
+  customVoice: false,
   voices: {},
 };
 
@@ -227,11 +326,11 @@ VOICES.forEach((v) => {
   ttsState.voices[v.id] = { phase: 'none', got: 0, total: v.bytes, msg: '' };
 });
 
-// Voices that share one download (Kokoro) use the pack's first voice as the download / state holder.
+// Voices that share one download (multi-speaker Piper, Pocket) use the pack's first voice as the download / state holder.
 export const repOf = (id: string): string => VOICES.find((v) => v.id === id)?.pack ?? id;
 const voiceOf = (id: string) => VOICES.find((v) => v.id === id);
-let curSid = 0;                 // Kokoro speaker id of the loaded voice (0 for Piper)
-let loadedKey = '';             // which model file is in memory ("<pack>|<lexicon>"): switching speaker inside it needs no reload
+let curSid = 0;                 // speaker id of the loaded voice (0 for single-speaker models)
+let loadedKey = '';             // which model pack is in memory: switching speaker inside it needs no reload
 const wantAfter: Record<string, string> = {};   // pack -> the voice the user actually tapped Download on
 
 const subs = new Set<() => void>();
@@ -253,6 +352,8 @@ const DIR = () => `${FS.documentDirectory}tts/`;
 const voiceDir = (id: string) => `${DIR()}${id}/`;
 const partPath = (id: string) => `${DIR()}${id}.tar.bz2.part`;
 const archivePath = (id: string) => `${DIR()}${id}.tar.bz2`;
+const customRefPath = () => `${DIR()}custom-voice.wav`;
+const refPathOf = (v: VoiceItem) => (v.ref === 'custom' ? customRefPath() : `${voiceDir(repOf(v.id))}test_wavs/bria.wav`);
 // Kotlin java.io.File needs a plain path, not a file:// URI
 const np = (uri: string) => uri.replace(/^file:\/\//, '');
 
@@ -269,10 +370,16 @@ async function loadNative(id: string): Promise<boolean> {
   const v = voiceOf(id);
   if (!v || !NativeTts) return false;
   const rid = repOf(id);
-  const key = `${rid}|${v.lex || ''}`;
-  if (loadedKey === key && ttsState.isPiperReady) { curSid = v.sid ?? 0; return true; }      // same model file, only another speaker
+  const key = rid;
+  const pocket = v.engine === 'pocket';
+  if (loadedKey === key && ttsState.isPiperReady) {            // same model files, only another speaker / reference voice
+    if (pocket && !(await NativeTts.setReference(np(refPathOf(v))).catch(() => false))) return false;
+    curSid = v.sid ?? 0;
+    return true;
+  }
   loadedKey = '';
-  const ok = await NativeTts.init(np(voiceDir(rid)), v.engine === 'kokoro' ? 'kokoro' : 'vits', v.lex || 'us').catch(() => false);
+  const ok = await NativeTts.init(np(voiceDir(rid)), pocket ? 'pocket' : 'vits').catch(() => false);
+  if (ok && pocket && !(await NativeTts.setReference(np(refPathOf(v))).catch(() => false))) return false;
   if (ok) { loadedKey = key; curSid = v.sid ?? 0; }
   return !!ok;
 }
@@ -282,11 +389,13 @@ const checkVoiceReadyOnDisk = async (id: string): Promise<boolean> => {
     const dir = voiceDir(id);
     const info = await FS.getInfoAsync(dir);
     if (!info.exists || !info.isDirectory) return false;
+    const files = await FS.readDirectoryAsync(dir);
+    if (voiceOf(id)?.engine === 'pocket') {                      // Pocket: several .onnx files + vocab.json (no tokens.txt / espeak data)
+      return files.includes('vocab.json') && files.some((f) => f.startsWith('lm_main') && f.endsWith('.onnx'));
+    }
     const tokens = await FS.getInfoAsync(`${dir}tokens.txt`);
     const espeak = await FS.getInfoAsync(`${dir}espeak-ng-data`);
     if (!tokens.exists || !espeak.exists) return false;
-    // Check if .onnx file exists
-    const files = await FS.readDirectoryAsync(dir);
     return files.some((f) => f.endsWith('.onnx') && !f.endsWith('.json'));
   } catch {
     return false;
@@ -308,6 +417,7 @@ export async function initTts() {
 
   const ramCheck = checkRamLow();
   ttsState.ramReason = ramCheck.reason;
+  ttsState.customVoice = (await sizeOf(customRefPath())) > 0;
 
   // Check state of each voice on disk
   const diskReady: Record<string, boolean> = {};
@@ -347,7 +457,7 @@ export async function initTts() {
     }
   } else {
     // Check if any other voice is ready
-    const anyReady = VOICES.find((v) => ttsState.voices[v.id]?.phase === 'ready');
+    const anyReady = VOICES.find((v) => ttsState.voices[v.id]?.phase === 'ready' && !(v.ref === 'custom' && !ttsState.customVoice));
     if (anyReady && NativeTts) {
       const loaded = await loadNative(anyReady.id);
       if (loaded) {
@@ -455,7 +565,7 @@ async function runVoiceDownload(id: string) {
   try {
     for (let attempt = 0; attempt < 5 && !userAction && !ok; attempt++) {
       const have = await sizeOf(partPath(id));
-      if (have > v.bytes * 1.07) await FS.deleteAsync(partPath(id), { idempotent: true });
+      if (have > v.bytes * (v.approx ? 1.6 : 1.07)) await FS.deleteAsync(partPath(id), { idempotent: true });
       const resume = await sizeOf(partPath(id));
       currentResumable = FS.createDownloadResumable(v.url, partPath(id), {}, undefined, resume > 0 ? String(resume) : undefined);
       try {
@@ -487,7 +597,7 @@ async function runVoiceDownload(id: string) {
   }
 
   const finalSize = await sizeOf(partPath(id));
-  const sane = finalSize > v.bytes * 0.93 && finalSize < v.bytes * 1.07;
+  const sane = v.approx ? (finalSize > v.bytes * 0.5 && finalSize < v.bytes * 1.6) : (finalSize > v.bytes * 0.93 && finalSize < v.bytes * 1.07);   // approx size: the extraction check catches a truncated file
 
   if (!ok || !sane) {
     await FS.deleteAsync(partPath(id), { idempotent: true }).catch(() => {});
@@ -558,7 +668,7 @@ export function cancelVoiceDownload(wanted: string) {
 }
 
 export async function deleteVoice(wanted: string) {
-  const id = repOf(wanted);                       // Kokoro: deleting one voice removes the shared download (all Kokoro voices)
+  const id = repOf(wanted);                       // shared pack: deleting one voice removes the shared download (all voices of the pack)
   if (activeDownloadId === id) cancelVoiceDownload(id);
 
   const selWasThis = repOf(ttsState.selectedVoice) === id;
@@ -576,7 +686,7 @@ export async function deleteVoice(wanted: string) {
   });
 
   if (selWasThis) {
-    const nextReady = VOICES.find((x) => repOf(x.id) !== id && ttsState.voices[x.id]?.phase === 'ready');
+    const nextReady = VOICES.find((x) => repOf(x.id) !== id && ttsState.voices[x.id]?.phase === 'ready' && !(x.ref === 'custom' && !ttsState.customVoice));
     if (nextReady) {
       await selectVoice(nextReady.id);
     } else {
@@ -592,6 +702,7 @@ export async function deleteVoice(wanted: string) {
 export async function selectVoice(id: string) {
   const v = VOICES.find((x) => x.id === id);
   if (!v) return;
+  if (v.ref === 'custom' && !ttsState.customVoice) return;      // needs a WAV first
 
   ttsState.selectedVoice = id;
   await setMeta('tts_voice', id).catch(() => {});
@@ -623,6 +734,29 @@ export async function setTtsEngine(engine: TtsEngine) {
     }
   }
   emit();
+}
+
+// Pocket "my own voice": the user picks a short, clean WAV (e.g. an Indian-English speaker); Pocket clones it.
+export async function pickCustomVoice(): Promise<{ ok: boolean; msg: string }> {
+  try {
+    const res: any = await DocumentPicker.getDocumentAsync({ type: ['audio/wav', 'audio/x-wav', 'audio/*'], copyToCacheDirectory: true });
+    if (res.canceled || !res.assets?.length) return { ok: false, msg: '' };
+    await FS.makeDirectoryAsync(DIR(), { intermediates: true }).catch(() => {});
+    await FS.deleteAsync(customRefPath(), { idempotent: true }).catch(() => {});
+    await FS.copyAsync({ from: res.assets[0].uri, to: customRefPath() });
+    const ok = NativeTts?.setReference ? await NativeTts.setReference(np(customRefPath())).catch(() => false) : false;
+    if (!ok) {
+      await FS.deleteAsync(customRefPath(), { idempotent: true }).catch(() => {});
+      ttsState.customVoice = false;
+      emit();
+      return { ok: false, msg: 'Could not read that file. Use a .wav (PCM 16-bit), at least 1 second, ideally 5-10 seconds of one clean voice.' };
+    }
+    ttsState.customVoice = true;
+    emit();
+    return { ok: true, msg: '' };
+  } catch (e: any) {
+    return { ok: false, msg: String(e?.message || e) };
+  }
 }
 
 // -------------------------------------------------------------
@@ -787,7 +921,7 @@ function processNextJob() {
       if (activeJob && activeJob.id === job.id && !fallbackInFlight && !job.started) {
         fallbackToPhone(job);
       }
-    }, voiceOf(ttsState.selectedVoice)?.engine === 'kokoro' ? Math.min(120000, 25000 + job.text.length * 500) : Math.min(40000, 12000 + job.text.length * 150));      // slow phone: first audio can take a while; cleared as soon as onStart arrives
+    }, voiceOf(ttsState.selectedVoice)?.engine === 'pocket' ? Math.min(120000, 25000 + job.text.length * 500) : Math.min(40000, 12000 + job.text.length * 150));      // slow phone: first audio can take a while; cleared as soon as onStart arrives
 
     try {
       NativeTts.speak(job.id, job.text, rateToSpeed(job.opts.rate ?? 0.7), curSid);
