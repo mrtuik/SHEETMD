@@ -20,7 +20,7 @@ jobs:
             if [ "$code" != "200" ] && [ "$code" != "206" ]; then echo "::error::model link is broken: $u"; exit 1; fi
             if [ "$magic" != "GGUF" ]; then echo "::error::not a GGUF file: $u"; exit 1; fi
           done
-      - name: Verify Piper voice model links (official sherpa-onnx release repos)
+      - name: Verify Piper + Pocket voice model links (official sherpa-onnx release repos)
         run: |
           voices=(
             "en_US-lessac-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium.tar.bz2"
@@ -35,6 +35,13 @@ jobs:
             "en_GB-jenny_dioco-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-jenny_dioco-medium.tar.bz2"
             "en_GB-alba-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-alba-medium.tar.bz2"
             "en_GB-northern_english_male-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-northern_english_male-medium.tar.bz2"
+            "en_US-john-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-john-medium.tar.bz2"
+            "en_US-kathleen-low https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-kathleen-low.tar.bz2"
+            "en_US-danny-low https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-danny-low.tar.bz2"
+            "en_GB-cori-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_GB-cori-medium.tar.bz2"
+            "en_US-arctic-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-arctic-medium.tar.bz2"
+            "en_US-l2arctic-medium https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-l2arctic-medium.tar.bz2"
+            "pocket-tts-int8-2026-01-26 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-pocket-tts-int8-2026-01-26.tar.bz2"
           )
           for entry in "${voices[@]}"; do
             id=$(echo "$entry" | cut -d' ' -f1)
