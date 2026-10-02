@@ -440,7 +440,7 @@ class SheetTtsModule : Module() {
             AudioTrack.Builder()
               .setAudioAttributes(
                 AudioAttributes.Builder()
-                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                  .setUsage(if (VoiceRoute.comm) AudioAttributes.USAGE_VOICE_COMMUNICATION else AudioAttributes.USAGE_MEDIA)
                   .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                   .build()
               )
@@ -458,7 +458,7 @@ class SheetTtsModule : Module() {
             @Suppress("DEPRECATION")
             AudioTrack(
               AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setUsage(if (VoiceRoute.comm) AudioAttributes.USAGE_VOICE_COMMUNICATION else AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build(),
               AudioFormat.Builder()
