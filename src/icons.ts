@@ -21,5 +21,7 @@ export const ICONS = {
   file: require('../assets/icons/ic_tuik_file.png'),
   trash: require('../assets/icons/ic_tuik_trash.png'),
   check: require('../assets/icons/ic_tuik_check.png'),
+  copy: require('../assets/icons/ic_tuik_copy.png'),
+  like: require('../assets/icons/ic_tuik_like.png'),
 } as const;
 export type IconName = keyof typeof ICONS;
