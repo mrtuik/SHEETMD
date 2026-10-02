@@ -4,11 +4,11 @@ import * as FS from 'expo-file-system/legacy';
 import { requireNativeModule } from 'expo';
 import { getMeta, setMeta } from './db';
 
-const HF = 'https://huggingface.co/csukuangfanj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/';
+const HF = 'https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/';
 export const STT_FILES: { name: string; mb: number }[] = [
   { name: 'tokens.txt', mb: 0 },
   { name: 'encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 70 },
-  { name: 'decoder-epoch-99-avg-1-chunk-16-left-128.onnx', mb: 2 },
+  { name: 'decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 2 },
   { name: 'joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 1 },
 ];
 const DIR = () => `${FS.documentDirectory}stt/`;
