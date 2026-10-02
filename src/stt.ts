@@ -5,11 +5,13 @@ import { requireNativeModule } from 'expo';
 import { getMeta, setMeta } from './db';
 
 const HF = 'https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/';
-export const STT_FILES: { name: string; mb: number }[] = [
-  { name: 'tokens.txt', mb: 0 },
-  { name: 'encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 70 },
-  { name: 'decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 2 },
-  { name: 'joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 1 },
+// min = smallest believable size in bytes. A smaller file is a broken/partial download (error page, cut connection);
+// feeding such a file to sherpa-onnx makes the native code abort the whole app, so we reject it here first.
+export const STT_FILES: { name: string; mb: number; min: number }[] = [
+  { name: 'tokens.txt', mb: 0, min: 1000 },
+  { name: 'encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 70, min: 20_000_000 },
+  { name: 'decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 2, min: 100_000 },
+  { name: 'joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx', mb: 1, min: 50_000 },
 ];
 const DIR = () => `${FS.documentDirectory}stt/`;
 const np = (u: string) => u.replace(/^file:\/\//, '');
@@ -24,7 +26,7 @@ const emit = () => subs.forEach((f) => f());
 async function haveAll(): Promise<boolean> {
   for (const f of STT_FILES) {
     const i: any = await FS.getInfoAsync(DIR() + f.name).catch(() => null);
-    if (!i?.exists || !(i.size > 0)) return false;
+    if (!i?.exists || !(i.size >= f.min)) return false;
   }
   return true;
 }
@@ -54,18 +56,26 @@ export async function downloadStt(): Promise<boolean> {
     for (const f of STT_FILES) {
       const dest = DIR() + f.name;
       const i: any = await FS.getInfoAsync(dest).catch(() => null);
-      if (i?.exists && i.size > 0) { done += f.mb; continue; }
+      if (i?.exists && i.size >= f.min) { done += f.mb; continue; }
+      await FS.deleteAsync(dest, { idempotent: true }).catch(() => {});
       const part = dest + '.part';
+      await FS.deleteAsync(part, { idempotent: true }).catch(() => {});
       const dl = FS.createDownloadResumable(HF + f.name, part, {}, (p) => {
         const frac = p.totalBytesExpectedToWrite ? p.totalBytesWritten / p.totalBytesExpectedToWrite : 0;
         sttState.progress = Math.min(0.99, (done + f.mb * frac) / total); emit();
       });
       const r: any = await dl.downloadAsync();
       if (!r || (r.status && r.status >= 400)) throw new Error('Download failed (' + (r?.status ?? '?') + ')');
+      const got: any = await FS.getInfoAsync(part).catch(() => null);
+      if (!got?.exists || !(got.size >= f.min)) {
+        await FS.deleteAsync(part, { idempotent: true }).catch(() => {});
+        throw new Error('Download incomplete: ' + f.name + ' (' + (got?.size ?? 0) + ' bytes). Check internet and try again.');
+      }
       await FS.moveAsync({ from: part, to: dest });
       done += f.mb;
     }
     sttState.progress = 1; sttState.downloading = false; emit();
+    await new Promise((r) => setTimeout(r, 300));   // let the UI settle before the heavy native model load
     return await initStt();
   } catch (e: any) {
     sttState.downloading = false; sttState.error = String(e?.message || e || 'Download failed'); emit();
