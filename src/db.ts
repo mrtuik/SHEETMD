@@ -87,6 +87,19 @@ export const addTopics = (sourceId: number, topics: { name: string; body: string
     }
   });
 });
+// the topic names found in the sources of ONE chat (numbered main topics first), for the floating Topics list
+export const listTopics = (chatId: number) => run(async (d) => {
+  const rows = await d.getAllAsync<{ id: number; name: string; pri: number; sid: number }>(
+    'SELECT t.id AS id, t.name AS name, COALESCE(t.pri,1) AS pri, s.id AS sid FROM topics t JOIN sources s ON s.id=t.source_id WHERE s.chat_id=? AND s.status=? ORDER BY s.id DESC, t.id ASC', [chatId, 'ready']);
+  const seen = new Set<string>(); const out: { id: number; name: string; pri: number }[] = [];
+  for (const r of rows) {
+    const nm = String(r.name || '').replace(/\s+/g, ' ').trim();
+    const k = nm.toLowerCase();
+    if (nm.length < 2 || seen.has(k)) continue;
+    seen.add(k); out.push({ id: r.id, name: nm, pri: r.pri });
+  }
+  return out;
+});
 // only the sources of ONE chat
 export const listSources = (chatId: number) => run((d) => d.getAllAsync<Source>('SELECT * FROM sources WHERE chat_id=? ORDER BY id DESC', [chatId]));
 // sources that belong to no chat yet (added before chats owned sources) go to the OLDEST chat
