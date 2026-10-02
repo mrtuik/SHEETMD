@@ -1579,4 +1579,10 @@ const st = StyleSheet.create({
   miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
   dlgBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'center', paddingHorizontal: 24 },
   dlg: { backgroundColor: C.bg, borderRadius: 20, padding: 18, gap: 14, elevation: 16 },
-  dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.
+  dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.tx },
+  dlgRow: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
+  dlgBtn: { height: 42, paddingHorizontal: 20, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surf },
+  cmdRow: { paddingVertical: 10 },
+  cmd: { fontSize: 15, fontWeight: '600', color: C.tx },
+  cmdD: { fontSize: 13, color: C.sec, marginTop: 1 },
+});
