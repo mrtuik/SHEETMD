@@ -24,6 +24,7 @@ import { pickAndImport } from './src/importer';
 import { startListening, stopListening, restartListening, markHandled, subscribeLevel, subscribeLive } from './src/listener';
 import { updateService, stopService, onServiceAction, batteryUnrestricted, askBatteryUnrestricted } from './src/service';
 import { splitWake } from './src/wake';
+import { Stt, sttState, subscribeStt, initStt, downloadStt, deleteStt, setSttGoogle, setSttAec, setSttGain } from './src/stt';
 import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
@@ -181,10 +182,12 @@ function Main() {
     const un = R.subscribe(() => force((x) => x + 1));
     const un2 = subscribeLlm(() => force((x) => x + 1));
     const un3 = subscribeTts(() => force((x) => x + 1));
+    const un4 = subscribeStt(() => force((x) => x + 1));
     (async () => {
       await cleanupStuck().catch(() => {});
       initLlm().catch(() => {});
       initTts().catch(() => {});
+      initStt().catch(() => {});
       await R.loadSettings();                         // speed, pause, language, repeat lines, sound boost: same in every chat
       const prompted = await getMeta('tts_prompted').catch(() => '');
       if (prompted !== '1') setShowTtsPrompt(true);
@@ -209,7 +212,7 @@ function Main() {
         if (pts) R.restore(s.topic_id, await topicName(s.topic_id), pts, s.point_n, s.speed);
       }
     })().catch(() => {});
-    return () => { un(); un2(); un3(); };
+    return () => { un(); un2(); un3(); un4(); };
   }, []);
   useEffect(() => { awake ? activateKeepAwakeAsync() : deactivateKeepAwake(); }, [awake]);
   useEffect(() => {
@@ -692,7 +695,7 @@ function Main() {
     const g = await PermissionsAndroid.request('android.permission.RECORD_AUDIO' as any);
     if (g !== 'granted') return;
     const ok = await startListening(onVoice, () => (R.state.lang === 'bn' ? 'bn-BD' : 'en-US'), setListening, onPartial);
-    if (!ok) push('app', 'Voice module not available.');
+    if (!ok) push('app', sttState.google ? 'Google speech is not available on this phone.' : 'Offline model not ready. Download it in Settings, or turn Google speech on.');
   };
   useEffect(() => () => { stopListening(); }, []);
 
@@ -1300,6 +1303,52 @@ function Main() {
             </TouchableOpacity>
           </View>
 
+          <Text style={st.secT}>Listening</Text>
+          <View style={st.group}>
+            <View style={st.line}>
+              <View style={{ flex: 1 }}>
+                <Text style={st.txt}>Use Google speech</Text>
+                <Text style={st.sub}>{sttState.google ? 'ON: the phone\'s Google recognizer listens.' : 'OFF: the offline model listens (download it below first).'}</Text>
+              </View>
+              <Switch value={sttState.google} onValueChange={(v) => { if (listening) stopListening(); setSttGoogle(v); }} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+            <View style={st.sep} />
+            <View style={st.line}>
+              <View style={{ flex: 1 }}>
+                <Text style={st.txt}>Offline English model</Text>
+                <Text style={st.sub}>{!Stt ? 'Not in this build.' : sttState.ready ? 'Ready. Works with no internet.' : sttState.downloading ? 'Downloading… ' + Math.round(sttState.progress * 100) + '%' : sttState.downloaded ? 'Loading…' : 'About 75 MB, downloaded once.'}{sttState.error ? '\n' + sttState.error : ''}</Text>
+              </View>
+              {sttState.downloading ? <ActivityIndicator color={C.acc} />
+                : sttState.downloaded ? (
+                  <TouchableOpacity onPress={() => Alert.alert('Delete offline model?', 'Turn Google speech on to keep using voice commands.', [{ text: 'Cancel' }, { text: 'Delete', style: 'destructive', onPress: () => { if (listening) stopListening(); deleteStt(); } }])}>
+                    <Icon n="trash" size={20} />
+                  </TouchableOpacity>)
+                  : !!Stt && (
+                    <TouchableOpacity onPress={() => { downloadStt(); }}>
+                      <Text style={[st.txt, { color: C.acc, fontWeight: '700' }]}>Download</Text>
+                    </TouchableOpacity>)}
+            </View>
+            {sttState.ready && !sttState.google && (<>
+              <View style={st.sep} />
+              <View style={st.line}>
+                <View style={{ flex: 1 }}>
+                  <Text style={st.txt}>Ignore the app's own voice</Text>
+                  <Text style={st.sub}>Phone-call style echo cancel. If reading stops hearing you or sounds quiet, turn it off.</Text>
+                </View>
+                <Switch value={sttState.aec} onValueChange={(v) => { if (listening) stopListening(); setSttAec(v); }} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+              </View>
+              <View style={st.sep} />
+              <View style={st.line}>
+                <View style={{ flex: 1 }}>
+                  <Text style={st.txt}>Soft voice boost: {sttState.gain}x</Text>
+                  <Text style={st.sub}>Higher hears a quieter voice. Too high adds noise.</Text>
+                </View>
+                <TouchableOpacity onPress={() => { setSttGain(Math.max(1, sttState.gain - 1)); }} style={{ padding: 8 }}><Icon n="minus" size={20} /></TouchableOpacity>
+                <TouchableOpacity onPress={() => { setSttGain(Math.min(12, sttState.gain + 1)); }} style={{ padding: 8 }}><Icon n="plus" size={20} /></TouchableOpacity>
+              </View>
+            </>)}
+          </View>
+
           <Text style={st.secT}>Voice commands</Text>
           <View style={st.group}>
             {COMMANDS.map(([c, d], i) => (
@@ -1530,10 +1579,4 @@ const st = StyleSheet.create({
   miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
   dlgBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'center', paddingHorizontal: 24 },
   dlg: { backgroundColor: C.bg, borderRadius: 20, padding: 18, gap: 14, elevation: 16 },
-  dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.tx },
-  dlgRow: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
-  dlgBtn: { height: 42, paddingHorizontal: 20, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surf },
-  cmdRow: { paddingVertical: 10 },
-  cmd: { fontSize: 15, fontWeight: '600', color: C.tx },
-  cmdD: { fontSize: 13, color: C.sec, marginTop: 1 },
-});
+  dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.
