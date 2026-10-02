@@ -8,6 +8,7 @@ import * as Network from 'expo-network';
 import * as Device from 'expo-device';
 import { getMeta, setMeta } from './db';
 import type { Point } from './notes';
+import { tidyPoint } from './notes';
 
 export type ModelId = 'q15' | 'q05';
 export const MODELS: Record<ModelId, { label: string; file: string; url: string; bytes: number }> = {
@@ -204,9 +205,14 @@ Use ONLY the SOURCE text. Never add a fact, number or name that is not in the SO
 Cover EVERY part of the SOURCE that is about the topic - do not skip a section, a list, a table row or a value.
 The SOURCE may be several passages taken from different places of the books: merge them into ONE clean answer, remove repeats, and ignore any passage that is not about the topic.
 The topic name was typed by voice and may be slightly misspelled: write about the topic the SOURCE is really about.
-Format: numbered points, one per line, exactly like:
-1. **Keyword**: short line
-Rules: no introduction, no conclusion, no filler words. Each line at most 18 words. Bold only the keyword. Keep numbers, units and names exactly as in the SOURCE.
+Format: clean numbered points, one point per line, EXACTLY like:
+1. **Title**: Concise explanation here.
+2. **Title**: Concise explanation here.
+Rules: no introduction, no conclusion, no filler words.
+- Title: the real topic or concept name used in the SOURCE, 2 to 5 words, inside ** **.
+- Explanation: 1 or 2 short, complete sentences (at most 25 words). Never stop in the middle of a sentence.
+- Never repeat the title inside the explanation and never write the same word twice in a row. Do not start the explanation with the title.
+- Bold only the title. Keep numbers, units and names exactly as in the SOURCE.
 Suggested order for this kind of topic: ${ORDER[kind]}.
 ${RULES}
 Write ${lo} to ${hi} points (fewer if the SOURCE has less).
@@ -233,13 +239,12 @@ function parseAnswer(text: string, src: string, hi: number, check = true): Point
     let title = '', body = m[1].trim();
     const b = body.match(/^\*\*(.+?)\*\*\s*[:\-–—]?\s*(.*)$/);
     if (b) { title = b[1]; body = b[2]; }
-    else { const c = body.match(/^([^:]{2,40}):\s+(.+)$/); if (c) { title = c[1]; body = c[2]; } else { title = body.split(/\s+/).slice(0, 5).join(' ').replace(/(\s+(the|of|to|and|a|an|in|is|are|on|for|with|by|that|which))+$/i, ''); } }
-    title = title.replace(/\*+/g, '').replace(/[:.]+$/, '').trim();
-    body = body.replace(/\*+/g, '').trim();
-    if (!title) continue;
-    const line = `${title} ${body}`;
+    else { const c = body.match(/^([^:]{2,40}):\s+(.+)$/); if (c) { title = c[1]; body = c[2]; } else title = ''; }   // no label: tidyPoint() finds a natural split or leaves it untitled
+    const tp = tidyPoint(title, body);                    // title cleanly separated; a body that repeats the title is cleaned
+    if (!tp.title && !tp.text) continue;
+    const line = `${tp.title} ${tp.text}`;
     if (check && !supported(line, srcN, srcWords)) continue;
-    pts.push({ title, text: /[.!?।]$/.test(body || title) ? (body || title) : (body || title) + '.' });
+    pts.push({ title: tp.title, text: tp.text });
     if (pts.length >= hi) break;
   }
   return pts.map((p, i) => ({ n: i + 1, ...p }));
@@ -254,7 +259,7 @@ let active: Promise<any> | null = null;          // the native completion that i
 const cancelHooks = new Set<() => void>();
 export function cancelGen() { jobId++; try { ctx?.stopCompletion?.(); } catch {} cancelHooks.forEach((f) => f()); }   // waiting jobs return at once
 
-async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number, onToken?: (t: string) => void): Promise<{ text: string; cancelled: boolean }> {
+async function complete(c: any, job: number, messages: any[], nPredict: number, temperature: number, onToken?: (t: string) => void): Promise<{ text: string; cancelled: boolean; cut?: boolean }> {
   if (job !== jobId) return { text: '', cancelled: true };
   let timer: any;
   let hook: (() => void) | null = null;
@@ -271,11 +276,11 @@ async function complete(c: any, job: number, messages: any[], nPredict: number, 
       new Promise((res) => { hook = () => res(null); cancelHooks.add(hook); }),
     ]);
     touch();
-    return { text: job === jobId ? String(out?.text || '').trim() : '', cancelled: job !== jobId };
+    return { text: job === jobId ? String(out?.text || '').trim() : '', cancelled: job !== jobId, cut: !!out?.stopped_limit };   // cut = stopped because the token limit was reached (last line may be unfinished)
   } catch { return { text: '', cancelled: job !== jobId }; }
   finally { clearTimeout(timer); if (hook) cancelHooks.delete(hook); }
 }
-const tokens = (hi: number) => Math.min(800, hi * 45 + 80);     // no more tokens than the points need (faster on the phone)
+const tokens = (hi: number) => Math.min(900, hi * 55 + 80);     // no more tokens than the points need (faster on the phone)
 
 // Cuts a long source into pieces (at blank lines) so NO portion is left out; each piece is written separately.
 function pieces(body: string, max: number): string[] {
@@ -292,6 +297,10 @@ function pieces(body: string, max: number): string[] {
   return out;
 }
 
+// The model ran out of tokens in the middle of a line: keep only its whole sentences (or nothing).
+const trimCut = (l: string) => { const t = l.trim(); if (/[.!?।]["')\]]?$/.test(t)) return t; const m = t.match(/^(.*[.!?।])\s/); return m ? m[1] : ''; };
+const dropCutTail = (text: string) => { const ls = text.split('\n'); let i = ls.length - 1; while (i >= 0 && !ls[i].trim()) i--; if (i >= 0) ls[i] = trimCut(ls[i]); return ls.join('\n'); };
+
 // Cuts the model's output into finished lines while it is still being written.
 function lineStream(onLine: (line: string) => void) {
   let buf = '';
@@ -302,7 +311,7 @@ function lineStream(onLine: (line: string) => void) {
       let i: number;
       while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (l.trim()) onLine(l); }
     },
-    flush() { if (buf.trim()) onLine(buf); buf = ''; },
+    flush(cut = false) { const l = cut ? trimCut(buf) : buf; if (l.trim()) onLine(l); buf = ''; },
     got: () => tokens,
   };
 }
@@ -342,8 +351,9 @@ export async function llmNotes(name: string, body: string, marks: number, onProg
     if (r.cancelled) return { pts: null, notInSource: false, cancelled: true };
     if (!r.text) { missing++; continue; }
     if (/NOT_IN_SOURCE/.test(r.text)) { if (parts.length === 1) return { pts: null, notInSource: true }; continue; }
-    if (onPoint) { if (ls.got()) ls.flush(); else r.text.split('\n').forEach((l) => { if (l.trim()) take(l); }); }   // last line (no newline after it) / a model build that gives no live tokens
-    else for (const p of parseAnswer(r.text, src, hi0)) { const k = (p.title + p.text).toLowerCase(); if (!seen.has(k)) { seen.add(k); all.push({ title: p.title, text: p.text }); } }
+    const txt = r.cut ? dropCutTail(r.text) : r.text;
+    if (onPoint) { if (ls.got()) ls.flush(!!r.cut); else txt.split('\n').forEach((l) => { if (l.trim()) take(l); }); }   // last line (no newline after it) / a model build that gives no live tokens
+    else for (const p of parseAnswer(txt, src, hi0)) { const k = (p.title + p.text).toLowerCase(); if (!seen.has(k)) { seen.add(k); all.push({ title: p.title, text: p.text }); } }
   }
   // streaming: points were already shown and spoken, so a failed piece is skipped; without streaming a hole means "use the complete rule-based notes"
   if (missing && !onPoint) return { pts: null, notInSource: false };
@@ -446,9 +456,10 @@ const ANSWER_SYS = `You are a medical laboratory technology tutor answering a st
 You get SOURCE excerpts from the student's own notes. Think about the question, then answer it.
 Use the SOURCE facts whenever they are relevant. If the SOURCE is missing or incomplete, complete the answer with correct standard textbook knowledge.
 Never invent numbers, names or facts you are not sure about. Answer in the language of the question.
-Format: numbered points, one per line, exactly like:
-1. **Keyword**: short line
-Rules: no introduction, no conclusion. Each line at most 20 words. Bold only the keyword. Write 4 to 8 points.
+Format: clean numbered points, one point per line, EXACTLY like:
+1. **Title**: Concise explanation here.
+2. **Title**: Concise explanation here.
+Rules: no introduction, no conclusion. Title = 2 to 5 words inside ** **. Explanation = 1 or 2 short, complete sentences (at most 25 words), never cut in the middle, never repeating the title. Write 4 to 8 points.
 Only the points the question needs - no fixed template, no "Classification" unless the question is about types.`;
 
 export type Basis = 'source' | 'mixed' | 'own';
@@ -477,9 +488,10 @@ export async function llmAnswer(question: string, chunks: { name: string; body: 
     { role: 'user', content: `QUESTION: ${question}\n\nSOURCE:\n${src || '(nothing found in the sources)'}\n\nWrite the answer.` },
   ], 420, 0.2, onPoint ? (t) => lsA.push(t) : undefined);
   if (r.cancelled) return { pts: null, basis: 'own', cancelled: true };
-  if (onPoint) { if (lsA.got()) lsA.flush(); else r.text.split('\n').forEach((l) => { if (l.trim()) takeA(l); }); }
+  const txtA = r.cut ? dropCutTail(r.text) : r.text;
+  if (onPoint) { if (lsA.got()) lsA.flush(!!r.cut); else txtA.split('\n').forEach((l) => { if (l.trim()) takeA(l); }); }
   const seenF = new Set<string>();
-  const pts = parseAnswer(r.text, '', 10, false).filter((p) => { const k = (p.title + p.text).toLowerCase(); if (seenF.has(k)) return false; seenF.add(k); return true; }).map((p, i) => ({ ...p, n: i + 1 }));
+  const pts = parseAnswer(txtA, '', 10, false).filter((p) => { const k = (p.title + p.text).toLowerCase(); if (seenF.has(k)) return false; seenF.add(k); return true; }).map((p, i) => ({ ...p, n: i + 1 }));
   if (pts.length < 2) return { pts: null, basis: 'own' };
   // how much of the answer is really supported by the source excerpts (checked in code, not trusted from the model)
   const srcN = flat(src);
