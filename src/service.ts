@@ -11,3 +11,6 @@ export const onServiceAction = (cb: (a: string) => void) => {
   const sub = M?.addListener?.('onAction', (e: any) => cb(e.action));
   return () => { try { sub?.remove?.(); } catch {} };
 };
+// Android battery saver stops background listening on many phones: this opens the "allow background activity" prompt
+export const batteryUnrestricted = (): boolean => { try { return !!M?.batteryUnrestricted(); } catch { return true; } };
+export const askBatteryUnrestricted = () => { try { M?.requestBatteryUnrestricted(); } catch {} };
