@@ -23,7 +23,8 @@
         {
           "microphonePermission": "Sheet.md needs the mic for voice commands."
         }
-      ]
+      ],
+      "./plugins/withSpeechQueries"
     ],
     "icon": "./assets/icon.png"
   }
