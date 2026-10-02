@@ -9,6 +9,7 @@
   "dependencies": {
     "@react-native-voice/voice": "^3.2.4",
     "expo": "~54.0.0",
+    "expo-clipboard": "~8.0.7",
     "expo-device": "~8.0.0",
     "expo-document-picker": "~14.0.0",
     "expo-file-system": "~19.0.0",
