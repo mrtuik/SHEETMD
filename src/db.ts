@@ -25,6 +25,7 @@ function openDb(): Promise<DB> {
         CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, chat_id INTEGER, who TEXT, text TEXT);
         CREATE INDEX IF NOT EXISTS msgs_chat ON msgs(chat_id);
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS facts(id INTEGER PRIMARY KEY, text TEXT UNIQUE, created_at INTEGER);
         CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(name, body, topic_id UNINDEXED);
       `);
       // each chat owns its sources (old databases get the column added; old sources are adopted by adoptOldSources)
@@ -388,3 +389,25 @@ export const addMsg = (chatId: number, who: 'you' | 'app', text: string) => run(
 // Small key/value settings (e.g. the chosen voice)
 export const getMeta = (k: string) => run(async (d) => (await d.getFirstAsync<{ v: string }>('SELECT v FROM meta WHERE k=?', [k]))?.v ?? '');
 export const setMeta = (k: string, v: string) => run((d) => d.runAsync('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)', [k, v]));
+export const delMeta = (k: string) => run((d) => d.runAsync('DELETE FROM meta WHERE k=?', [k]));
+
+// ---- assistant memory: short facts the user asked to remember (max 50, oldest dropped) ----
+export const MAX_FACTS = 50;
+export type Fact = { id: number; text: string; created_at: number };
+export const listFacts = () => run((d) => d.getAllAsync<Fact>('SELECT id,text,created_at FROM facts ORDER BY id ASC'));
+export const addFact = (text: string) => run(async (d): Promise<boolean> => {
+  const t = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (!t) return false;
+  await d.runAsync('INSERT OR IGNORE INTO facts(text, created_at) VALUES(?,?)', [t, Date.now()]);
+  // the cap is kept by dropping the oldest, so "remember" never fails because the list is full
+  await d.runAsync('DELETE FROM facts WHERE id NOT IN (SELECT id FROM facts ORDER BY id DESC LIMIT ?)', [MAX_FACTS]);
+  return true;
+});
+export const removeFact = (id: number) => run((d) => d.runAsync('DELETE FROM facts WHERE id=?', [id]));
+// forget by words ("amar nam"): removes every fact that contains the text; returns how many were removed
+export const forgetFacts = (text: string) => run(async (d): Promise<number> => {
+  const t = text.trim().toLowerCase();
+  if (!t) return 0;
+  const r = await d.runAsync("DELETE FROM facts WHERE lower(text) LIKE ? ESCAPE '\\'", ['%' + t.replace(/[%_\\]/g, (c) => '\\' + c) + '%']);
+  return r.changes;
+});
