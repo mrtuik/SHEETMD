@@ -24,7 +24,7 @@ import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownloa
 import { cloud, cloudReady, loadCloud, saveProvider, saveCloudKey, saveCloudModel, saveCustomUrl, openRouterFreeModels, PROVIDERS, KEY_LINK, DEFAULT_MODEL, ProviderId, OrModel } from './src/cloud';
 import { wikiLookup } from './src/web';
 import { runAgent, agentReady, hasPending, dropPending, armPending, confirmVerdict, resolvePending, cancelAgent, looksLikeRequest, echoOfReply, checkProvider } from './src/agent/agent';
-import { bubbleListening, bubbleOverride, bubbleHeard, bubbleReply, onBubbleTap, assistantOn, setAssistantMode, overlayGranted, askOverlay } from './src/agent/bubble';
+import { bubbleListening, bubbleOverride, bubbleHeard, bubbleReply, onBubbleTap, assistantOn, setAssistantMode, overlayGranted, askOverlay, registerBubbleMenu, refreshBubbleMenu } from './src/agent/bubble';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
 import { startListening, stopListening, restartListening, markHandled, subscribeLevel, subscribeLive } from './src/listener';
@@ -910,6 +910,18 @@ function Main() {
   const listeningRef = useRef(false); listeningRef.current = listening;
   useEffect(() => onBubbleTap(() => { const was = listeningRef.current; micRef.current(); if (!was) armRef.current(14000); }), []);
   useEffect(() => { bubbleListening(listening); }, [listening]);
+  // bubble menu (chevron on the bubble): registered once; every action calls the same functions as the voice commands
+  useEffect(() => registerBubbleMenu({
+    talk: () => { const was = listeningRef.current; micRef.current(); if (!was) armRef.current(14000); },
+    exec: (t) => { execRef.current(t, 'text'); },
+    stopAll: () => { R.stop(); cancelGen(); cancelAgent(); stopSpeak(); dropPending(); bubbleOverride(null); choicesRef.current = null; setWorking(''); },
+    pause: () => R.pause(), resume: () => { follow.current = true; R.resume(); }, next: () => R.next(), prev: () => R.prev(),
+    playing: () => R.state.status === 'reading',
+    topics: async () => (await listTopics(chatRef.current)).map((x) => x.name),
+    last: () => msgsRef.current.filter((m) => !m.text.startsWith(TOPIC)).slice(-3).map((m) => (m.who === 'you' ? 'You: ' : 'AI: ') + m.text.slice(0, 140)),
+    hide: () => { setAssistantMode(false); setAssistOn(false); },
+  }), []);
+  useEffect(() => { refreshBubbleMenu(); }, [R.state.status]);        // the Play / Pause label follows the reader (debounced in bubble.ts)
   useEffect(() => {                                                    // back from the Android overlay-permission screen
     const sub = AppState.addEventListener('change', (st2) => { if (st2 === 'active') setOverlayOk(overlayGranted()); });
     return () => sub.remove();
