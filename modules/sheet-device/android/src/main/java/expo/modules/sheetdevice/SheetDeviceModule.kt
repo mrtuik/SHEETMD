@@ -190,8 +190,9 @@ class SheetDeviceModule : Module() {
 
     OnCreate {
       OverlayService.onTap = { sendEvent("onBubble", mapOf("type" to "tap")) }
+      OverlayService.onAction = { id, text -> sendEvent("onBubble", mapOf("type" to "action", "id" to id, "text" to text)) }
     }
-    OnDestroy { OverlayService.onTap = null }
+    OnDestroy { OverlayService.onTap = null; OverlayService.onAction = null }
     // the bubble hides itself while Sheet.md is in front, and shows again when it goes behind another app
     OnActivityEntersForeground { OverlayService.appFg = true; OverlayService.refresh() }
     OnActivityEntersBackground { OverlayService.appFg = false; OverlayService.refresh() }
@@ -234,5 +235,9 @@ class SheetDeviceModule : Module() {
     }
     Function("bubbleState") { s: String -> OverlayService.applyState(s) }
     Function("bubbleToast") { heard: String, reply: String -> OverlayService.showToast(heard, reply) }
+    // bubble menu: JS owns the content. setBubbleMenu = the main list; bubbleList = a sub-list (topics, quick, last messages)
+    // both take JSON [{id, label, glyph, open?}]
+    Function("setBubbleMenu") { json: String -> OverlayService.setMenu(json) }
+    Function("bubbleList") { title: String, json: String -> OverlayService.showList(title, json) }
   }
 }
