@@ -15,6 +15,7 @@
     "expo-file-system": "~19.0.0",
     "expo-keep-awake": "~15.0.0",
     "expo-network": "~8.0.0",
+    "expo-secure-store": "~15.0.7",
     "expo-speech": "~14.0.0",
     "expo-sqlite": "~16.0.0",
     "jszip": "^3.10.1",
