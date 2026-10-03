@@ -232,7 +232,7 @@ class SheetDeviceModule : Module() {
       val c = ctx
       if (!on && c != null) c.stopService(Intent().setClassName(c, "expo.modules.sheetdevice.OverlayService"))
     }
-    Function("bubbleState") { s: String -> OverlayService.setState(s) }
+    Function("bubbleState") { s: String -> OverlayService.applyState(s) }
     Function("bubbleToast") { heard: String, reply: String -> OverlayService.showToast(heard, reply) }
   }
 }
