@@ -9,7 +9,13 @@
       "package": "com.metuik.sheetmd",
       "permissions": [
         "RECORD_AUDIO",
-        "WAKE_LOCK"
+        "WAKE_LOCK",
+        "CALL_PHONE",
+        "READ_CONTACTS",
+        "SEND_SMS",
+        "ACCESS_COARSE_LOCATION",
+        "SYSTEM_ALERT_WINDOW",
+        "com.android.alarm.permission.SET_ALARM"
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
