@@ -17,12 +17,14 @@ import { splitSentences } from './src/cleaner';
 import * as R from './src/reader';
 import {
   findTopic, findExact, getNotes, saveNotes, listSources, removeSource, loadSession, clearSession, topicName, cleanupStuck, searchSources,
-  listTopics, listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, setMsgData, getMeta, setMeta, Source, Chat,
+  listTopics, listChats, newChat, deleteChat, renameChat, adoptOldSources, loadMsgs, addMsg, setMsgData, getMeta, setMeta, Source, Chat, listFacts, removeFact, Fact,
 } from './src/db';
 import { llm, initLlm, subscribeLlm, startDownload, pauseDownload, cancelDownload, llmNotes, llmExplain, llmAnswer, cancelGen, splitMarks, MODELS, Basis,
-  searchWithCloud, searchInfo, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, hasEnvKey } from './src/llm';
+  searchWithCloud, searchInfo, GeminiError, GEMINI_MODELS, GeminiModelId, gem, loadGemini, saveGeminiKey, saveGeminiModel, hasGeminiKey, providerLabel } from './src/llm';
 import { cloud, cloudReady, loadCloud, saveProvider, saveCloudKey, saveCloudModel, saveCustomUrl, openRouterFreeModels, PROVIDERS, KEY_LINK, DEFAULT_MODEL, ProviderId, OrModel } from './src/cloud';
 import { wikiLookup } from './src/web';
+import { runAgent, agentReady, hasPending, dropPending, armPending, confirmVerdict, resolvePending, cancelAgent, looksLikeRequest, echoOfReply, checkProvider } from './src/agent/agent';
+import { bubbleListening, bubbleOverride, bubbleHeard, bubbleReply, onBubbleTap, assistantOn, setAssistantMode, overlayGranted, askOverlay } from './src/agent/bubble';
 import { loadVoices, voicesFor, bestFor, Vc } from './src/voice';
 import { pickAndImport } from './src/importer';
 import { startListening, stopListening, restartListening, markHandled, subscribeLevel, subscribeLive } from './src/listener';
@@ -154,6 +156,10 @@ function Main() {
   const [showTtsPrompt, setShowTtsPrompt] = useState(false);
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [awake, setAwake] = useState(true);
+  const [assistOn, setAssistOn] = useState(false);          // Assistant mode: the floating bubble
+  const [overlayOk, setOverlayOk] = useState(false);        // "display over other apps" is allowed
+  const [facts, setFacts] = useState<Fact[]>([]);           // what the assistant was asked to remember
+  const [agentMsg, setAgentMsg] = useState('');             // result of the provider check
   const [voices, setVoices] = useState<Vc[]>([]);
   const [, force] = useState(0);
   const idRef = useRef(1);
@@ -246,6 +252,7 @@ function Main() {
       if (prompted !== '1') setShowTtsPrompt(true);
       await loadGemini(); setHasKey(hasGeminiKey()); setGemModel(gem.model);
       await loadCloud(); setProv(cloud.provider); syncDrafts(cloud.provider); setCloudTick((n) => n + 1);
+      setAssistOn(assistantOn()); setOverlayOk(overlayGranted()); listFacts().then(setFacts).catch(() => {});
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
       setFastTopic((await getMeta('fast_topic').catch(() => '1')) !== '0');
       try {                                           // clearest installed voice, unless one was chosen before
@@ -589,8 +596,33 @@ function Main() {
     await openTopic(nm, true, choiceMarks.current);
   };
 
+  // ---- assistant: its replies are shown in chat AND spoken; the bubble draws the same state ----
+  const sayAgent = (text: string) => {
+    follow.current = true; push('app', text); bubbleReply(text);
+    const bn = /[\u0980-\u09FF]/.test(text);
+    const end = () => { bubbleOverride(null); armPending(); setTimeout(() => restartListening(150), 200); };   // a fresh mic: it must not carry the app's own voice into the next sentence
+    speak(text, { lang: bn ? 'bn' : 'en', voice: (bn ? R.state.voiceBn : R.state.voiceEn) || undefined, rate: 0.95, onStart: () => bubbleOverride('speaking'), onDone: end, onStopped: end, onError: end });
+  };
+  const agentCtx = {
+    history: () => msgsRef.current.map((m) => ({ who: m.who, text: m.text })),
+    exec: (t: string) => { execRef.current(t, 'text'); },
+    askNotes: (q: string) => { answerQuestion(q); },
+    reply: sayAgent,
+    state: (x: 'thinking' | 'idle') => bubbleOverride(x === 'thinking' ? 'thinking' : null),
+  };
+  const runAgentFor = async (text: string) => {
+    try { R.pause(); } catch {}                                       // new request: nothing old keeps talking
+    stopSpeak();
+    await runAgent(text, agentCtx);
+    if (hasPending()) wakeRef.current.until = Date.now() + 18000;     // the "haan / na" may come with the screen off: no wake word needed for it
+  };
   const exec = async (text: string, via: 'voice' | 'text' = 'voice') => {
     if (!text.trim()) return;
+    bubbleHeard(text);
+    // a call / SMS is waiting for "haan" / "na": checked BEFORE any other routing; anything else said drops the old question
+    const verdict = confirmVerdict(text);
+    if (verdict) { follow.current = true; push('you', text); await resolvePending(verdict, agentCtx); return; }
+    if (hasPending()) dropPending();
     const c = parse(text);
     follow.current = true;
     // playback commands act FIRST (no waiting for the database); the chat history is written right after
@@ -598,7 +630,7 @@ function Main() {
       case 'repeat': R.repeat(c.arg, c.mode); break;
       case 'continue': R.resume(); break;
       case 'pause': R.pause(); break;
-      case 'stop': R.stop(); cancelGen(); choicesRef.current = null; setWorking(''); break;
+      case 'stop': R.stop(); cancelGen(); cancelAgent(); bubbleOverride(null); choicesRef.current = null; setWorking(''); break;
       case 'next': R.next(); break;
       case 'prev': R.prev(); break;
       case 'slower': R.setRate(-0.1); break;
@@ -617,12 +649,12 @@ function Main() {
       if (!names || !names[c.n - 1]) push('app', 'Nothing to choose.');
       else await pickName(names[c.n - 1]);
     } else if (c.t === 'unknown') {
-      // typed text is a normal chat: answered from your sources + the model's own knowledge.
-      // (Spoken words that are not a command are ignored, so talking nearby never triggers anything.)
-      if (via === 'text') {
-        if (isGreeting(text) || !queryTokens(text).length) push('app', 'Hi! Say or type: topic <name>, exact <name>, explain <name>, or ask a question.');
-        else await answerQuestion(text);
-      }
+      // anything that is not a study command goes to the assistant (agent) when a model is set up; otherwise the old behaviour:
+      // typed text is a normal chat answered from your sources + the model's own knowledge.
+      // (Spoken words only get here through agentVoice: talking nearby never triggers anything.)
+      if (via === 'text' && (isGreeting(text) || !queryTokens(text).length)) push('app', 'Hi! Say or type: topic <name>, exact <name>, explain <name>, or ask a question.');
+      else if (agentReady()) await runAgentFor(text);
+      else if (via === 'text') await answerQuestion(text);
       else push('app', 'Try: topic <name>, exact <name>, explain <name>, question ... okay, pause, next, repeat 2, continue.');
     }
   };
@@ -750,12 +782,12 @@ function Main() {
     const was = w.paused; w.until = 0; w.paused = false; setAwakeUI(false);
     if (was && resumeReading && R.state.status === 'paused') R.resume();
   };
-  const armWake = () => {
+  const armWake = (ms = 9000) => {
     const w = wakeRef.current;
     if (!w.until && R.state.status === 'reading') { w.paused = true; try { R.pause(); } catch {} }   // so your command is heard clearly
-    w.until = Date.now() + 9000; setAwakeUI(true);
+    w.until = Date.now() + ms; setAwakeUI(true);
     clearTimeout(w.timer);
-    w.timer = setTimeout(() => disarm(true), 9000);                  // nothing said: carry on reading
+    w.timer = setTimeout(() => disarm(true), ms);                  // nothing said: carry on reading
   };
   // returns the text(s) to treat as a command, or null = not meant for the app
   // "tuik" works in EVERY state now: alone it pauses the reading and listens 9 s for the command (so you see / hear it worked);
@@ -795,6 +827,16 @@ function Main() {
     }
     return null;                                                     // background speech without "tuik": ignore
   };
+  // A spoken sentence that is not a study command reaches the assistant ONLY when the user called it ("tuik ..." or the bubble was tapped),
+  // and never when it is the app's own voice (reading, a spoken reply) or a lone word: so room noise can never start a model call.
+  const agentVoice = (t: string) => {
+    const w = wakeRef.current;
+    const called = Date.now() < w.until || Date.now() - w.fresh < 4000;
+    if (!called || !agentReady() || choicesRef.current || qRef.current || choiceSpeaking.current) return;
+    if (ttsState.activeSpeaker !== 'none' || ownVoice(t) || heardSelf(t) || echoOfReply(t) || !looksLikeRequest(t)) return;
+    disarm(false);
+    execRef.current(t);
+  };
   const onVoice = (alts0: string[]) => {
     if (!alts0.length) return;
     const g = wakeGate(alts0, false);
@@ -802,6 +844,7 @@ function Main() {
     let alts = g;
     if (!ownVoice(alts[0])) setHeard(alts[0].slice(0, 60));          // the app's own reading is not shown as something you said
     clearStable();
+    if (hasPending() && ttsState.activeSpeaker === 'none') { const a = alts.find((x) => confirmVerdict(x)); if (a) { execRef.current(a); return; } }   // "haan" / "na" to a call or SMS question
     if (hardCmd(alts, false)) { restartListening(60); return; }     // commands first, in every state
     if (choiceSpeaking.current) return;                              // otherwise the app's own voice: ignore
     if (qRef.current) { feedQuestion(alts[0]); return; }
@@ -820,7 +863,7 @@ function Main() {
       // options are waiting, or a short playback word (stop, pause ...) that the 1st guess got wrong
       const short = alts[0].trim().split(/\s+/).length <= 3;
       const a = alts.slice(1).find((x) => { const k = parse(x); return (['topic', 'exact', 'explain'].includes(k.t) && !introEcho((k as any).q || '')) || k.t === 'question' || (k.t === 'pick' && !!choicesRef.current) || (short && FAST.has(k.t) && !weakEcho(x)); });
-      if (!a) return;
+      if (!a) { agentVoice(alts[0]); return; }
       t = a; c = parse(a);
     }
     if (c.t === 'pick' && !choicesRef.current) return;             // "one / two" only means something while options are waiting
@@ -861,6 +904,25 @@ function Main() {
     if (!ok) push('app', sttState.google ? 'Google speech is not available on this phone.' : 'Offline model not ready. Download it in Settings, or turn Google speech on.');
   };
   useEffect(() => () => { stopListening(); }, []);
+  // floating bubble: tap = the same as the mic button (plus a 14 s window in which the assistant listens, no wake word needed)
+  const micRef = useRef(mic); micRef.current = mic;
+  const armRef = useRef(armWake); armRef.current = armWake;
+  const listeningRef = useRef(false); listeningRef.current = listening;
+  useEffect(() => onBubbleTap(() => { const was = listeningRef.current; micRef.current(); if (!was) armRef.current(14000); }), []);
+  useEffect(() => { bubbleListening(listening); }, [listening]);
+  useEffect(() => {                                                    // back from the Android overlay-permission screen
+    const sub = AppState.addEventListener('change', (st2) => { if (st2 === 'active') setOverlayOk(overlayGranted()); });
+    return () => sub.remove();
+  }, []);
+  const toggleAssistant = (v: boolean) => {
+    if (v && !overlayGranted()) {
+      Alert.alert('Display over other apps', 'The floating bubble needs this permission. Turn it on for Sheet.md on the next screen, then come back and switch Assistant mode on.', [
+        { text: 'Cancel', style: 'cancel' }, { text: 'Open settings', onPress: askOverlay }]);
+      return;
+    }
+    setAssistantMode(v); setAssistOn(v);
+  };
+  useEffect(() => { if (showSet) { setOverlayOk(overlayGranted()); listFacts().then(setFacts).catch(() => {}); setAgentMsg(''); } }, [showSet]);
 
   const s = R.state;
   const ready = sources.filter((x) => x.status === 'ready').length;
@@ -883,12 +945,12 @@ function Main() {
 
   // Foreground service lives while reading/paused or while the mic is on
   useEffect(() => {
-    if (!listening && s.status === 'idle' && !working) { stopService(); return; }
+    if (!listening && s.status === 'idle' && !working && !assistOn) { stopService(); return; }      // Assistant mode keeps the service (and the bubble) alive
     const pt = s.points[s.idx];
-    const text = (s.status === 'idle' && working) ? working : s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
+    const text = (s.status === 'idle' && working) ? working : s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : assistOn && !listening ? 'Assistant ready: tap the bubble' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
       : `${s.topic} — point ${pt?.n ?? 0}/${s.points.length}${s.status === 'paused' ? ' (paused)' : ''}`;
     updateService('Sheet.md', text, s.status === 'reading', listening);
-  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn, !!working]);
+  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn, !!working, assistOn]);
 
   // keep the point being read in view (stops as soon as you scroll yourself)
   useEffect(() => {
@@ -1667,6 +1729,35 @@ function Main() {
             <View style={st.line}>
               <View style={{ flex: 1 }}><Text style={st.txt}>Fast topics</Text><Text style={st.val}>{fastTopic ? 'On: topic starts reading at once from your source' : 'Off: AI rewrites the notes first (slow on the phone)'}</Text></View>
               <Switch value={fastTopic} onValueChange={toggleFast} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+          </View>
+
+          <Text style={st.secT}>Assistant</Text>
+          <View style={st.group}>
+            <View style={st.line}>
+              <Icon n="mic" size={20} />
+              <View style={{ flex: 1 }}><Text style={st.txt}>Assistant mode</Text><Text style={st.val}>{assistOn ? 'bubble on: tap it to talk, hold it to open the app' : 'a floating bubble that does things on your phone'}</Text></View>
+              <Switch value={assistOn} onValueChange={toggleAssistant} trackColor={{ false: '#D4D4D4', true: C.acc }} thumbColor="#fff" />
+            </View>
+            <View style={st.sep} />
+            <View style={st.line}>
+              <View style={{ flex: 1 }}><Text style={st.txt}>Display over other apps</Text><Text style={st.val}>{overlayOk ? 'allowed' : 'needed for the bubble'}</Text></View>
+              {!overlayOk && <TouchableOpacity style={[st.step, { width: 'auto', paddingHorizontal: 14, borderRadius: 18 }]} onPress={askOverlay}><Text style={[st.txt, { fontSize: 13, fontWeight: '600' }]}>Allow</Text></TouchableOpacity>}
+            </View>
+            <View style={st.sep} />
+            <View style={st.line}>
+              <View style={{ flex: 1 }}><Text style={st.txt}>Assistant model</Text><Text style={st.val}>{agentMsg || (agentReady() ? `${providerLabel()} · tap Check to test tools` : 'add a key in Models first')}</Text></View>
+              <TouchableOpacity style={[st.step, { width: 'auto', paddingHorizontal: 14, borderRadius: 18 }]} onPress={() => { setAgentMsg('Checking…'); checkProvider().then(setAgentMsg).catch(() => setAgentMsg('Check failed.')); }}><Text style={[st.txt, { fontSize: 13, fontWeight: '600' }]}>Check</Text></TouchableOpacity>
+            </View>
+            <View style={st.sep} />
+            <View style={{ paddingVertical: 10, gap: 4 }}>
+              <Text style={st.txt}>Memory · {facts.length}/50</Text>
+              {facts.length === 0 && <Text style={st.val}>Nothing saved. Say “mone rakho …” or “remember …”.</Text>}
+              {facts.map((f) => (
+                <View key={f.id} style={[st.line, { minHeight: 36 }]}>
+                  <Text style={[st.val, { flex: 1 }]} numberOfLines={2}>{f.text}</Text>
+                  <TouchableOpacity style={st.hBtn} onPress={() => { removeFact(f.id).then(() => listFacts().then(setFacts)).catch(() => {}); }}><Icon n="trash" size={18} color={C.sec} /></TouchableOpacity>
+                </View>))}
             </View>
           </View>
 
