@@ -16,6 +16,7 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -131,7 +132,18 @@ class SheetForegroundService : Service() {
       catch (e2: Exception) { running = false; stopSelf() }
     }
     running = true
+    syncBubble()
     return START_NOT_STICKY
+  }
+
+  // Assistant mode: the floating bubble lives and dies with this foreground service (so it survives background / screen off).
+  // It is started by class name: the two modules do not depend on each other.
+  private fun bubbleIntent() = Intent().setClassName(this, "expo.modules.sheetdevice.OverlayService")
+  private fun syncBubble() {
+    try {
+      val on = getSharedPreferences("sheet_device", Context.MODE_PRIVATE).getBoolean("assistant_on", false)
+      if (on && Settings.canDrawOverlays(this)) startService(bubbleIntent()) else stopService(bubbleIntent())
+    } catch (e: Exception) { }
   }
 
   override fun onTaskRemoved(rootIntent: Intent?) { stopSelf() }
@@ -139,6 +151,7 @@ class SheetForegroundService : Service() {
   override fun onDestroy() {
     running = false
     micOn = false
+    try { stopService(bubbleIntent()) } catch (e: Exception) { }
     try { unregisterReceiver(receiver) } catch (e: Exception) {}
     try { wake?.release() } catch (e: Exception) {}
     if (Build.VERSION.SDK_INT >= 26) focusReq?.let { am?.abandonAudioFocusRequest(it) }
