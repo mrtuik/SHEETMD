@@ -7,6 +7,7 @@ import * as FS from 'expo-file-system/legacy';
 import * as Network from 'expo-network';
 import * as Device from 'expo-device';
 import { getMeta, setMeta } from './db';
+import { loadSecret, setSecret } from './secure';
 import type { Point } from './notes';
 import { tidyPoint } from './notes';
 
@@ -540,17 +541,15 @@ export const GEMINI_MODELS: { id: GeminiModelId; label: string; note: string }[]
   { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', note: 'Best answers' },
   { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite', note: 'Fastest, lightest' },
 ];
-// @ts-ignore  optional default key baked into the build (EXPO_PUBLIC_GEMINI_API_KEY); a key typed in Models always wins
-const ENV_KEY: string = (typeof process !== 'undefined' && process.env && process.env.EXPO_PUBLIC_GEMINI_API_KEY) || '';
+// Keys come ONLY from the user's own Settings (kept in SecureStore). No key is ever built into the APK: a baked-in key can be extracted from it.
 export const gem: { key: string; model: GeminiModelId } = { key: '', model: 'gemini-3.5-flash' };
-export const hasEnvKey = () => !!ENV_KEY;
-export const hasGeminiKey = () => !!(gem.key || ENV_KEY);
+export const hasGeminiKey = () => !!gem.key;
 export async function loadGemini() {
-  gem.key = ((await getMeta('gemini_key').catch(() => '')) || '').trim();
+  gem.key = await loadSecret('gemini_key');
   const m = (await getMeta('gemini_model').catch(() => '')) as GeminiModelId;
   if (GEMINI_MODELS.some((x) => x.id === m)) gem.model = m;
 }
-export async function saveGeminiKey(k: string) { gem.key = k.trim(); await setMeta('gemini_key', gem.key).catch(() => {}); }
+export async function saveGeminiKey(k: string) { gem.key = k.trim(); await setSecret('gemini_key', gem.key); }
 export async function saveGeminiModel(m: GeminiModelId) { gem.model = m; await setMeta('gemini_model', m).catch(() => {}); }
 
 export type GeminiErrKind = 'nokey' | 'badkey' | 'badmodel' | 'offline' | 'quota' | 'empty' | 'http' | 'cancelled';
@@ -574,23 +573,25 @@ export const cloud: { provider: ProviderId; keys: Record<string, string>; models
 export const providerLabel = (id: ProviderId = cloud.provider) => PROVIDERS.find((p) => p.id === id)?.label || id;
 export const providerBase = (id: ProviderId = cloud.provider) => (id === 'custom' ? cloud.customBase : PROVIDERS.find((p) => p.id === id)?.base || '').trim();
 export const providerModel = (id: ProviderId = cloud.provider) => (cloud.models[id] || PROVIDERS.find((p) => p.id === id)?.model || '').trim();
-export const providerKey = (id: ProviderId = cloud.provider) => (id === 'gemini' ? (gem.key || ENV_KEY).trim() : (cloud.keys[id] || '').trim());
+export const providerKey = (id: ProviderId = cloud.provider) => (id === 'gemini' ? gem.key.trim() : (cloud.keys[id] || '').trim());
 // the chosen provider can be used now
 export const cloudReady = () => (cloud.provider === 'gemini' ? hasGeminiKey() : cloud.provider === 'custom' ? !!providerBase() && !!providerModel() : !!providerKey() && !!providerModel());
 export async function loadCloud() {
-  const p = ((await getMeta('cloud_provider').catch(() => '')) || '') as ProviderId;
+  // cloud.ts (now a thin wrapper over this file) used to save under cl_* names: read those too, so nobody has to type a key again
+  const g = async (k: string, old: string) => ((await getMeta(k).catch(() => '')) || (await getMeta(old).catch(() => '')) || '').trim();
+  const p = (await g('cloud_provider', 'cl_provider')) as ProviderId;
   if (PROVIDERS.some((x) => x.id === p)) cloud.provider = p;
   for (const x of PROVIDERS) {
     if (x.id === 'gemini') continue;
-    cloud.keys[x.id] = ((await getMeta('cloud_key_' + x.id).catch(() => '')) || '').trim();
-    cloud.models[x.id] = ((await getMeta('cloud_model_' + x.id).catch(() => '')) || '').trim();
+    cloud.keys[x.id] = await loadSecret('cloud_key_' + x.id, ['cl_key_' + x.id]);
+    cloud.models[x.id] = await g('cloud_model_' + x.id, 'cl_model_' + x.id);
   }
-  cloud.customBase = ((await getMeta('cloud_custom_base').catch(() => '')) || '').trim();
+  cloud.customBase = await g('cloud_custom_base', 'cl_custom_url');
 }
 export async function setProvider(id: ProviderId) { cloud.provider = id; await setMeta('cloud_provider', id).catch(() => {}); }
 export async function saveProviderKey(id: ProviderId, k: string) {
   if (id === 'gemini') { await saveGeminiKey(k); return; }
-  cloud.keys[id] = k.trim(); await setMeta('cloud_key_' + id, cloud.keys[id]).catch(() => {});
+  cloud.keys[id] = k.trim(); await setSecret('cloud_key_' + id, cloud.keys[id]);
 }
 export async function saveProviderModel(id: ProviderId, m: string) { cloud.models[id] = m.trim(); await setMeta('cloud_model_' + id, cloud.models[id]).catch(() => {}); }
 export async function saveCustomBase(b: string) { cloud.customBase = b.trim(); await setMeta('cloud_custom_base', cloud.customBase).catch(() => {}); }
@@ -707,7 +708,7 @@ async function chatCall(base: string, key: string, model: string, prompt: string
 }
 
 // ---- never pay for the same search twice: finished answers are kept on the phone and reused (works offline, uses no Google quota)
-export const searchInfo: { fromCache: boolean; provider: ProviderId; live: boolean } = { fromCache: false, provider: 'gemini', live: true };
+export const searchInfo: { fromCache: boolean; provider: ProviderId; live: boolean; via: string } = { fromCache: false, provider: 'gemini', live: true, via: 'Google (Gemini)' };
 const normQ = (q: string) => q.toLowerCase().replace(/[^a-z0-9\u0980-\u09ff ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 const cacheKeyOf = (q: string, mode: SearchMode, marks: number, prov: ProviderId = 'gemini') => `sc:${prov === 'gemini' ? '' : prov + ':'}${mode}${mode === 'long' ? marks : ''}:${normQ(q)}`;
 async function cacheGet(k: string): Promise<Point[] | null> {
@@ -737,9 +738,9 @@ const EXTRA_MODELS = ['gemini-3.5-flash-lite'];
 export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId, opts: SearchOpts = {}): Promise<Point[]> {
   const prov = cloud.provider;
   const useChat = prov !== 'gemini';                                 // any other provider: OpenAI-compatible chat call
-  const key = (useChat ? providerKey(prov) : (apiKey || gem.key || ENV_KEY || '')).trim();
+  const key = (useChat ? providerKey(prov) : (apiKey || gem.key || '')).trim();
   if (useChat ? !cloudReady() : !key) throw new GeminiError('nokey');
-  searchInfo.fromCache = false; searchInfo.provider = prov; searchInfo.live = !useChat || (prov === 'openrouter' && /:online$/.test(providerModel(prov)));
+  searchInfo.fromCache = false; searchInfo.provider = prov; searchInfo.via = prov === 'gemini' ? 'Google (Gemini)' : providerLabel(prov); searchInfo.live = !useChat || (prov === 'openrouter' && /:online$/.test(providerModel(prov)));
   const long = opts.mode === 'long';                                 // anything else (plain "search", "search short") = short answer
   const marks = Math.min(15, Math.max(2, opts.marks || 10));
   const ck = cacheKeyOf(query, long ? 'long' : 'short', marks, prov);
@@ -821,4 +822,29 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
     await cachePut(ck, pts);
     return pts;
   } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
+}
+
+// App.tsx calls the search with (question, options)
+export const searchWithCloud = (q: string, opts: SearchOpts = {}) => searchWithGoogle(q, undefined, undefined, opts);
+
+// A plain short answer for the assistant's web_search tool (not the study-notes format): live Google through Gemini when a key exists,
+// otherwise the chosen cloud model's own knowledge. Returns '' when nothing can answer, so the caller can fall back to Wikipedia.
+export async function webAnswer(q: string, signal?: AbortSignal): Promise<string> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => { try { ctl.abort(); } catch {} }, 25000);
+  signal?.addEventListener?.('abort', () => { try { ctl.abort(); } catch {} });
+  const prompt = `Answer in at most 3 short sentences, plain text, no markdown, no links, no citation numbers. Question: ${q}`;
+  try {
+    if (cloud.provider !== 'gemini' && cloudReady()) {
+      const r = await chatCall(providerBase(), providerKey(), providerModel(), prompt, ctl.signal, 600, cloud.provider);
+      return r.status === 200 ? stripCites(r.text).trim() : '';
+    }
+    if (!gem.key) return '';
+    for (const m of Array.from(new Set<string>([gem.model, ...GEMINI_MODELS.map((x) => x.id)]))) {
+      const r = await geminiCall(m, gem.key, prompt, ctl.signal, 700);
+      if (r.status === 200 && r.text.trim()) return stripCites(r.text).trim();
+      if (r.status === 401 || r.status === 403) return '';
+    }
+    return '';
+  } catch { return ''; } finally { clearTimeout(t); }
 }
