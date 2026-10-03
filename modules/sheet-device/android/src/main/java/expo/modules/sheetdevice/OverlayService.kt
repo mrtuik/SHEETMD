@@ -39,7 +39,7 @@ class OverlayService : Service() {
     @Volatile var state = "idle"
     private val main = Handler(Looper.getMainLooper())
     fun refresh() { main.post { inst?.applyVisibility() } }
-    fun setState(s: String) { state = s; main.post { inst?.bubble?.setMode(s) } }
+    fun applyState(s: String) { state = s; main.post { inst?.bubble?.setMode(s) } }
     fun showToast(heard: String, reply: String) { main.post { inst?.toast(heard, reply) } }
   }
 
