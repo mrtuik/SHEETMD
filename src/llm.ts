@@ -9,7 +9,6 @@ import * as Device from 'expo-device';
 import { getMeta, setMeta } from './db';
 import type { Point } from './notes';
 import { tidyPoint } from './notes';
-import { cloud, cloudReady, chatCall, PROVIDERS } from './cloud';
 
 export type ModelId = 'q15' | 'q05';
 export const MODELS: Record<ModelId, { label: string; file: string; url: string; bytes: number }> = {
@@ -502,6 +501,35 @@ export async function llmAnswer(question: string, chunks: { name: string; body: 
   return { pts, basis };
 }
 
+// SHORT answer = one or two lines that answer the question directly (used when the cloud limit is used up, or no cloud is set)
+const SHORT_SYS = `You are a medical laboratory technology tutor. Answer the student's question in ONE or TWO short lines.
+Format EXACTLY: 1. **Title**: one short, complete sentence (at most 25 words).
+Add a second point in the same format ONLY if the question really needs it.
+Give the direct answer first: for "formula of X" write the formula, for "what is X" give the definition.
+No introduction, no conclusion. Never invent facts, numbers or names you are not sure about. Answer in the language of the question.`;
+export async function llmShort(question: string): Promise<{ pts: Point[] | null; cancelled?: boolean }> {
+  const c = await getCtx();
+  if (!c) return { pts: null };
+  const job = ++jobId;
+  const r = await complete(c, job, [
+    { role: 'system', content: SHORT_SYS },
+    { role: 'user', content: `QUESTION: ${question}\n\nWrite the short answer.` },
+  ], 160, 0.2);
+  if (r.cancelled) return { pts: null, cancelled: true };
+  const txt = r.cut ? dropCutTail(r.text) : r.text;
+  let pts: Point[] = parseAnswer(txt, '', 2, false).slice(0, 2).map((p, i) => ({ ...p, n: i + 1 }));
+  if (!pts.length) {                                                   // no numbering: take the first line or two as the answer
+    const alt: Point[] = [];
+    for (const l of txt.split('\n')) {
+      const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, '').replace(/\*+/g, ''));
+      if (t.text.length > 8) alt.push({ n: alt.length + 1, ...t });
+      if (alt.length >= 2) break;
+    }
+    pts = alt;
+  }
+  return { pts: pts.length ? pts : null };
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Live Google search through the Gemini API (Grounding with Google Search). Online only: an alternative to the local Qwen model.
 // "search <anything>" -> Gemini searches Google, writes 2-8 numbered study points -> the same Point[] the rest of the app already reads.
@@ -525,11 +553,47 @@ export async function loadGemini() {
 export async function saveGeminiKey(k: string) { gem.key = k.trim(); await setMeta('gemini_key', gem.key).catch(() => {}); }
 export async function saveGeminiModel(m: GeminiModelId) { gem.model = m; await setMeta('gemini_model', m).catch(() => {}); }
 
-export type GeminiErrKind = 'nokey' | 'badkey' | 'offline' | 'quota' | 'empty' | 'http' | 'cancelled';
+export type GeminiErrKind = 'nokey' | 'badkey' | 'badmodel' | 'offline' | 'quota' | 'empty' | 'http' | 'cancelled';
 export class GeminiError extends Error {
   kind: GeminiErrKind;
   constructor(kind: GeminiErrKind, msg = '') { super(msg || kind); this.kind = kind; }
 }
+
+// ---- Cloud API: Gemini (live Google search) or any OpenAI-compatible provider (OpenRouter, Groq, Mistral, OpenAI, or your own) ----
+// Only Gemini searches Google live. The other providers answer from the model's own knowledge (an OpenRouter model id ending in :online adds web search there).
+export type ProviderId = 'gemini' | 'openrouter' | 'groq' | 'mistral' | 'openai' | 'custom';
+export const PROVIDERS: { id: ProviderId; label: string; base: string; model: string; keyUrl: string; note: string }[] = [
+  { id: 'gemini', label: 'Google Gemini', base: '', model: '', keyUrl: 'https://aistudio.google.com/apikey', note: 'Live Google search. Free key.' },
+  { id: 'openrouter', label: 'OpenRouter', base: 'https://openrouter.ai/api/v1', model: 'openrouter/free', keyUrl: 'https://openrouter.ai/settings/keys', note: 'Many free models with one key. "openrouter/free" picks a free model for you. Add :online to a model id for web search (may cost credits).' },
+  { id: 'groq', label: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile', keyUrl: 'https://console.groq.com/keys', note: 'Free tier, very fast. Answers from the model\'s knowledge.' },
+  { id: 'mistral', label: 'Mistral', base: 'https://api.mistral.ai/v1', model: 'mistral-small-latest', keyUrl: 'https://console.mistral.ai/api-keys', note: 'Free experiment tier. Answers from the model\'s knowledge.' },
+  { id: 'openai', label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o-mini', keyUrl: 'https://platform.openai.com/api-keys', note: 'Paid key. Change the model name if you want a newer one.' },
+  { id: 'custom', label: 'Custom (OpenAI-compatible)', base: '', model: '', keyUrl: '', note: 'Any OpenAI-compatible server: base URL ends with /v1 (for example http://192.168.1.5:11434/v1). The key is optional for a local server.' },
+];
+export const cloud: { provider: ProviderId; keys: Record<string, string>; models: Record<string, string>; customBase: string } = { provider: 'gemini', keys: {}, models: {}, customBase: '' };
+export const providerLabel = (id: ProviderId = cloud.provider) => PROVIDERS.find((p) => p.id === id)?.label || id;
+export const providerBase = (id: ProviderId = cloud.provider) => (id === 'custom' ? cloud.customBase : PROVIDERS.find((p) => p.id === id)?.base || '').trim();
+export const providerModel = (id: ProviderId = cloud.provider) => (cloud.models[id] || PROVIDERS.find((p) => p.id === id)?.model || '').trim();
+export const providerKey = (id: ProviderId = cloud.provider) => (id === 'gemini' ? (gem.key || ENV_KEY).trim() : (cloud.keys[id] || '').trim());
+// the chosen provider can be used now
+export const cloudReady = () => (cloud.provider === 'gemini' ? hasGeminiKey() : cloud.provider === 'custom' ? !!providerBase() && !!providerModel() : !!providerKey() && !!providerModel());
+export async function loadCloud() {
+  const p = ((await getMeta('cloud_provider').catch(() => '')) || '') as ProviderId;
+  if (PROVIDERS.some((x) => x.id === p)) cloud.provider = p;
+  for (const x of PROVIDERS) {
+    if (x.id === 'gemini') continue;
+    cloud.keys[x.id] = ((await getMeta('cloud_key_' + x.id).catch(() => '')) || '').trim();
+    cloud.models[x.id] = ((await getMeta('cloud_model_' + x.id).catch(() => '')) || '').trim();
+  }
+  cloud.customBase = ((await getMeta('cloud_custom_base').catch(() => '')) || '').trim();
+}
+export async function setProvider(id: ProviderId) { cloud.provider = id; await setMeta('cloud_provider', id).catch(() => {}); }
+export async function saveProviderKey(id: ProviderId, k: string) {
+  if (id === 'gemini') { await saveGeminiKey(k); return; }
+  cloud.keys[id] = k.trim(); await setMeta('cloud_key_' + id, cloud.keys[id]).catch(() => {});
+}
+export async function saveProviderModel(id: ProviderId, m: string) { cloud.models[id] = m.trim(); await setMeta('cloud_model_' + id, cloud.models[id]).catch(() => {}); }
+export async function saveCustomBase(b: string) { cloud.customBase = b.trim(); await setMeta('cloud_custom_base', cloud.customBase).catch(() => {}); }
 
 let searchJob = 0;
 let searchAbort: AbortController | null = null;
@@ -541,23 +605,23 @@ export type SearchOpts = { mode?: SearchMode; marks?: number };
 const longPlan = (marks: number) =>
   marks <= 3 ? { secs: '3 to 4', bul: '3 to 5' } : marks <= 5 ? { secs: '4 to 5', bul: '4 to 6' } : marks <= 8 ? { secs: '6 to 7', bul: '5 to 8' } : marks <= 10 ? { secs: '7 to 9', bul: '5 to 10' } : { secs: '9 to 11', bul: '6 to 12' };
 
-const shortPrompt = (q: string) => `You are a medical laboratory technology teacher. Use Google Search to find current, correct information, then write a SHORT exam-ready answer for:
+const shortPrompt = (q: string, web = true) => `You are a medical laboratory technology teacher. ${web ? 'Use Google Search to find current, correct information, then answer' : 'From your own correct textbook knowledge, answer'} this question SHORTLY:
 "${q}"
 
-Write 2 to 3 numbered points. Only the most important, high-yield facts.
+Write ONE or TWO numbered points, 1 to 2 lines in total. Give the direct answer first (for "formula of X" give the formula, for "what is X" give the definition).
 Format: one point per line, EXACTLY like:
-1. **Key Concept**: 1-2 clear factual sentences.
-2. **Key Concept**: 1-2 clear factual sentences.
+1. **Key Concept**: one clear factual sentence.
+2. **Key Concept**: one clear factual sentence. (only if really needed)
 Rules:
-- Key Concept = 2 to 5 words inside ** **. Explanation = 1 or 2 complete sentences, at most 30 words, never cut in the middle.
+- Key Concept = 2 to 5 words inside ** **. Explanation = one complete sentence, at most 25 words, never cut in the middle.
 - Never repeat the Key Concept inside its explanation.
 - No introduction, no conclusion, no headings, no links, no citation numbers like [1], no source names.
-- Keep numbers, units and names exact. Answer in the language of the question.`;
+- Keep numbers, units, formulas and names exact. Answer in the language of the question.`;
 
 // Modelled on a real university answer script (Microbiology paper: causative agents / specimen collection / laboratory diagnosis with numbered steps).
-const longPrompt = (q: string, marks: number) => {
+const longPrompt = (q: string, marks: number, web = true) => {
   const pl = longPlan(marks);
-  return `You are a top-scoring student and teacher of medical laboratory technology. Use Google Search to find current, correct information, then write a COMPLETE exam answer worth ${marks} marks for:
+  return `You are a top-scoring student and teacher of medical laboratory technology. ${web ? 'Use Google Search to find current, correct information, then write' : 'From your own correct textbook knowledge, write'} a COMPLETE exam answer worth ${marks} marks for:
 "${q}"
 
 Write like a topper's answer script. Use ${pl.secs} sections, each with ${pl.bul} bullet lines. Choose the sections that really fit this topic, in this order:
@@ -573,7 +637,7 @@ Format, EXACTLY:
 In numbered sections write "1. Label: short fact line" instead of "- ".
 Rules:
 - Every bullet starts with the key term, then a colon, then the fact (6 to 28 words). Complete sentences, never cut off.
-- Give exact values: temperature, time, pH, media names, stain colours, doses, normal ranges, organism names. Use only values the search confirms; never invent a number.
+- Give exact values: temperature, time, pH, media names, stain colours, doses, normal ranges, organism names. Use only values you are sure of; never invent a number.
 - No introduction, no conclusion, no links, no citation numbers like [1], no source names, no tables.
 - Answer in the language of the question.`;
 };
@@ -626,10 +690,26 @@ async function geminiCall(model: string, key: string, prompt: string, signal: Ab
   return { status: 200, text: parts.filter((p) => p?.text && !p.thought).map((p) => String(p.text)).join(''), err: '' };
 }
 
+// One OpenAI-compatible chat call (OpenRouter, Groq, Mistral, OpenAI, or a custom server)
+async function chatCall(base: string, key: string, model: string, prompt: string, signal: AbortSignal, maxTokens: number, id: ProviderId): Promise<{ status: number; text: string; err: string }> {
+  const body: any = { model, messages: [{ role: 'user', content: prompt }] };
+  if (id === 'openai') body.max_completion_tokens = maxTokens;        // newer OpenAI models reject max_tokens and a custom temperature
+  else { body.max_tokens = maxTokens; body.temperature = 0.2; }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (key) headers.Authorization = 'Bearer ' + key;
+  if (id === 'openrouter') headers['X-Title'] = 'Sheet.md';
+  const r = await fetch(base.replace(/\/+$/, '') + '/chat/completions', { method: 'POST', headers, body: JSON.stringify(body), signal });
+  if (!r.ok) return { status: r.status, text: '', err: ((await r.text().catch(() => '')) || '').slice(0, 1500) };
+  const data: any = await r.json().catch(() => null);
+  const c = data?.choices?.[0]?.message?.content;
+  const txt = typeof c === 'string' ? c : Array.isArray(c) ? c.map((x: any) => x?.text || '').join('') : '';
+  return { status: 200, text: txt.replace(/<think>[\s\S]*?<\/think>/gi, ''), err: '' };
+}
+
 // ---- never pay for the same search twice: finished answers are kept on the phone and reused (works offline, uses no Google quota)
-export const searchInfo = { fromCache: false, via: '' };       // via = which provider answered (shown in the chat)
+export const searchInfo: { fromCache: boolean; provider: ProviderId; live: boolean } = { fromCache: false, provider: 'gemini', live: true };
 const normQ = (q: string) => q.toLowerCase().replace(/[^a-z0-9\u0980-\u09ff ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
-const cacheKeyOf = (q: string, mode: SearchMode, marks: number, tag = '') => `sc:${tag}${mode}${mode === 'long' ? marks : ''}:${normQ(q)}`;
+const cacheKeyOf = (q: string, mode: SearchMode, marks: number, prov: ProviderId = 'gemini') => `sc:${prov === 'gemini' ? '' : prov + ':'}${mode}${mode === 'long' ? marks : ''}:${normQ(q)}`;
 async function cacheGet(k: string): Promise<Point[] | null> {
   try {
     const v = await getMeta(k);
@@ -654,38 +734,15 @@ const keyInvalid = (status: number, err: string) => status === 401 || status ===
 // last-resort extra model: its free limit is separate from the two in Models, so it helps when those are used up (a retired/unknown id just returns 404 and is skipped)
 const EXTRA_MODELS = ['gemini-3.5-flash-lite'];
 
-
-// the model's text -> Point[] (shared by Gemini and the other cloud providers)
-async function textToPoints(text: string, long: boolean, ck: string): Promise<Point[]> {
-  const hi = 3;
-  const clean = stripCites(text);
-  if (long) {
-    const lp = parseLong(clean);
-    if (lp.length) { await cachePut(ck, lp); return lp; }                                       // no "## headings": fall through and read it as numbered points
-  }
-  const merged = mergeSub(clean);
-  let pts = parseAnswer(merged, '', long ? 12 : hi, false);
-  if (!pts.length) {                                                // the model ignored the numbering: take its lines as points anyway
-    const alt: Omit<Point, 'n'>[] = [];
-    for (const l of merged.split('\n')) {
-      const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, ''));
-      if (t.text.length > 8) alt.push(t);
-      if (alt.length >= (long ? 12 : hi)) break;
-    }
-    pts = alt.map((p, i) => ({ n: i + 1, ...p }));
-  }
-  if (!pts.length) throw new GeminiError('empty');
-  await cachePut(ck, pts);
-  return pts;
-}
-
 export async function searchWithGoogle(query: string, apiKey?: string, model?: GeminiModelId, opts: SearchOpts = {}): Promise<Point[]> {
-  const key = (apiKey || gem.key || ENV_KEY || '').trim();
-  if (!key) throw new GeminiError('nokey');
-  searchInfo.fromCache = false; searchInfo.via = 'Google (Gemini)';
+  const prov = cloud.provider;
+  const useChat = prov !== 'gemini';                                 // any other provider: OpenAI-compatible chat call
+  const key = (useChat ? providerKey(prov) : (apiKey || gem.key || ENV_KEY || '')).trim();
+  if (useChat ? !cloudReady() : !key) throw new GeminiError('nokey');
+  searchInfo.fromCache = false; searchInfo.provider = prov; searchInfo.live = !useChat || (prov === 'openrouter' && /:online$/.test(providerModel(prov)));
   const long = opts.mode === 'long';                                 // anything else (plain "search", "search short") = short answer
   const marks = Math.min(15, Math.max(2, opts.marks || 10));
-  const ck = cacheKeyOf(query, long ? 'long' : 'short', marks);
+  const ck = cacheKeyOf(query, long ? 'long' : 'short', marks, prov);
   const cached = await cacheGet(ck);
   if (cached) { searchInfo.fromCache = true; return cached; }       // same question asked before: instant, no internet, no quota
 
@@ -698,15 +755,32 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
   const ctl = new AbortController();
   searchAbort = ctl;
   const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, long ? 90000 : 40000);
-  const hi = 3;
-  const prompt = long ? longPrompt(query.trim(), marks) : shortPrompt(query.trim());
+  const hi = 2;                                                     // short answer = at most 2 points (1-2 lines)
+  const prompt = long ? longPrompt(query.trim(), marks, !useChat) : shortPrompt(query.trim(), !useChat);
   const first = model || gem.model;
   const order: string[] = Array.from(new Set<string>([first, ...GEMINI_MODELS.map((m) => m.id), ...EXTRA_MODELS]));
   try {
     let text = '';
     let lastStatus = 0;
     let quotaHit = false;
-    for (let round = 0; round < 2 && !text.trim(); round++) {
+    if (useChat) {
+      const base = providerBase(prov), model = providerModel(prov);
+      for (let attempt = 0; attempt < 2 && !text.trim(); attempt++) {                 // one retry: free routers sometimes pick a busy model
+        let res: { status: number; text: string; err: string };
+        try { res = await chatCall(base, key, model, prompt, ctl.signal, long ? 8192 : 4096, prov); }
+        catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
+        if (my !== searchJob) throw new GeminiError('cancelled');
+        lastStatus = res.status; quotaHit = false;
+        if (res.status === 200) { if (res.text.trim()) { text = res.text; break; } }
+        else {
+          if (res.status === 401 || res.status === 403) throw new GeminiError('badkey', `HTTP ${res.status}`);
+          if (res.status === 404 || (res.status === 400 && /model/i.test(res.err))) throw new GeminiError('badmodel', res.err.slice(0, 200));
+          if (res.status === 429 || res.status === 402) quotaHit = true;
+        }
+        if (attempt === 0) { await new Promise((r) => setTimeout(r, 1500)); if (my !== searchJob) throw new GeminiError('cancelled'); }
+      }
+    }
+    for (let round = 0; !useChat && round < 2 && !text.trim(); round++) {
       let minWait = Infinity;
       quotaHit = false;
       for (const m of order) {
@@ -727,62 +801,24 @@ export async function searchWithGoogle(query: string, apiKey?: string, model?: G
       } else break;                                                 // a daily limit: waiting here would not help
     }
     if (!text.trim()) throw new GeminiError(quotaHit ? 'quota' : lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
-    return await textToPoints(text, long, ck);
-  } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// "search ..." through the provider chosen in Models > Cloud API.
-//  - Google (Gemini): live Google search (above).
-//  - OpenRouter / OpenAI / Custom: the model answers from its own knowledge (no live Google). If it fails or its free limit is used up,
-//    the Gemini key (if there is one) is tried next, then the caller falls back to the offline model.
-const noLive = (p: string) => p
-  .replace('Use Google Search to find current, correct information, then write', 'Write')
-  .replace('Use only values the search confirms; never invent a number.', 'Use only values you are sure of; never invent a number.');
-
-export async function searchWithCloud(query: string, opts: SearchOpts = {}): Promise<Point[]> {
-  const prov = cloud.provider;
-  if (prov === 'gemini' || !cloudReady(prov)) return searchWithGoogle(query, undefined, undefined, opts);
-  const id = prov as 'openrouter' | 'openai' | 'custom';
-  const label = PROVIDERS.find((x) => x.id === id)?.label || id;
-  searchInfo.fromCache = false; searchInfo.via = label;
-  const long = opts.mode === 'long';
-  const marks = Math.min(15, Math.max(2, opts.marks || 10));
-  const ck = cacheKeyOf(query, long ? 'long' : 'short', marks, id + ':' + cloud.model[id].replace(/[^a-z0-9]+/gi, '') + ':');
-  const cached = await cacheGet(ck);
-  if (cached) { searchInfo.fromCache = true; return cached; }
-
-  let net: any = null;
-  try { net = await Network.getNetworkStateAsync(); } catch {}
-  if (id !== 'custom' && net && (!net.isConnected || net.isInternetReachable === false)) throw new GeminiError('offline');
-
-  const my = ++searchJob;
-  try { searchAbort?.abort(); } catch {}
-  const ctl = new AbortController();
-  searchAbort = ctl;
-  const timer = setTimeout(() => { try { ctl.abort(); } catch {} }, long ? 120000 : 60000);
-  const prompt = noLive(long ? longPrompt(query.trim(), marks) : shortPrompt(query.trim()));
-  const models = Array.from(new Set<string>([cloud.model[id], ...(id === 'openrouter' ? ['openrouter/free'] : [])].filter(Boolean)));
-  try {
-    let text = '', lastStatus = 0, quotaHit = false;
-    for (const m of models) {
-      let res: { status: number; text: string; err: string };
-      try { res = await chatCall(id, m, prompt, ctl.signal, long ? 6000 : 2500); }
-      catch (e: any) { if (my !== searchJob) throw new GeminiError('cancelled'); throw new GeminiError(ctl.signal.aborted ? 'http' : 'offline', String(e?.message || e)); }
-      if (my !== searchJob) throw new GeminiError('cancelled');
-      lastStatus = res.status;
-      if (res.status === 200) { if (res.text.trim()) { text = res.text; break; } continue; }
-      if (res.status === 401 || res.status === 403) throw new GeminiError('badkey', `HTTP ${res.status}`);
-      if (res.status === 429 || res.status === 402) quotaHit = true;                // free limit / no credit: try the next model
+    const clean = stripCites(text);
+    if (long) {
+      const lp = parseLong(clean);
+      if (lp.length) { await cachePut(ck, lp); return lp; }                                       // no "## headings": fall through and read it as numbered points
     }
-    if (!text.trim()) throw new GeminiError(quotaHit ? 'quota' : lastStatus && lastStatus !== 200 ? 'http' : 'empty', `HTTP ${lastStatus}`);
-    return await textToPoints(text, long, ck);
-  } catch (e: any) {
-    // this provider failed (not cancelled / not a bad key): the Gemini key, if saved, gets a try
-    if (e instanceof GeminiError && (e.kind === 'quota' || e.kind === 'http' || e.kind === 'empty') && (gem.key || ENV_KEY) && my === searchJob) {
-      clearTimeout(timer);
-      return await searchWithGoogle(query, undefined, undefined, opts);
+    const merged = mergeSub(clean);
+    let pts = parseAnswer(merged, '', long ? 12 : hi, false);
+    if (!pts.length) {                                                // the model ignored the numbering: take its lines as points anyway
+      const alt: Omit<Point, 'n'>[] = [];
+      for (const l of merged.split('\n')) {
+        const t = tidyPoint('', l.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, ''));
+        if (t.text.length > 8) alt.push(t);
+        if (alt.length >= (long ? 12 : hi)) break;
+      }
+      pts = alt.map((p, i) => ({ n: i + 1, ...p }));
     }
-    throw e;
+    if (!pts.length) throw new GeminiError('empty');
+    await cachePut(ck, pts);
+    return pts;
   } finally { clearTimeout(timer); if (searchAbort === ctl) searchAbort = null; }
 }
