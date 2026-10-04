@@ -1,0 +1,25 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <!-- BIND_ACCESSIBILITY_SERVICE is what lets only Android itself bind to it; the user turns it on in Settings > Accessibility -->
+    <service
+      android:name="expo.modules.sheetaccess.SheetAccessibilityService"
+      android:exported="true"
+      android:label="@string/sheet_access_label"
+      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+      <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService"/>
+      </intent-filter>
+      <meta-data android:name="android.accessibilityservice" android:resource="@xml/sheet_accessibility_config"/>
+    </service>
+    <!-- the user turns this on in Settings > Notification access -->
+    <service
+      android:name="expo.modules.sheetaccess.SheetNotificationListener"
+      android:exported="true"
+      android:label="@string/sheet_access_label"
+      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+      <intent-filter>
+        <action android:name="android.service.notification.NotificationListenerService"/>
+      </intent-filter>
+    </service>
+  </application>
+</manifest>
