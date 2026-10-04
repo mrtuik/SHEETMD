@@ -32,6 +32,7 @@ class SheetForegroundService : Service() {
     @Volatile var onAction: ((String) -> Unit)? = null
     @Volatile var running = false
     @Volatile var micOn = false          // our own speech recogniser is listening
+    @Volatile var keepAlive = false      // the headless JS task that keeps timers running in the background has been started
   }
 
   private var wake: PowerManager.WakeLock? = null
@@ -135,6 +136,7 @@ class SheetForegroundService : Service() {
       catch (e2: Exception) { running = false; stopSelf() }
     }
     running = true
+    if (!keepAlive) { try { startService(Intent(this, SheetKeepAliveService::class.java)); keepAlive = true } catch (e: Exception) { } }   // JS timers keep ticking in the background
     syncBubble()
     return START_NOT_STICKY
   }
@@ -154,6 +156,7 @@ class SheetForegroundService : Service() {
   override fun onDestroy() {
     running = false
     micOn = false
+    if (keepAlive) { keepAlive = false; try { stopService(Intent(this, SheetKeepAliveService::class.java)) } catch (e: Exception) { } }
     try { stopService(bubbleIntent()) } catch (e: Exception) { }
     try { unregisterReceiver(receiver) } catch (e: Exception) {}
     try { wake?.release() } catch (e: Exception) {}
