@@ -32,23 +32,23 @@ export type MenuHandlers = {
   last: () => string[];                 // last chat messages, newest last
   hide: () => void;                     // Assistant mode off
 };
-type Item = { id: string; label: string; glyph: string; open?: boolean };
+type Item = { id: string; label: string; icon: string; open?: boolean };      // icon = assets/icons/ic_tuik_<icon>.png
 let H: MenuHandlers | null = null;
 let torchOn = false;
 let timer: any = null;
 
 const menu = (): Item[] => [
-  { id: 'talk', label: 'Talk', glyph: '●' },
-  { id: 'type', label: 'Type a command', glyph: '✎' },
-  { id: 'stop', label: 'Stop everything', glyph: '■' },
-  { id: 'pp', label: H?.playing() ? 'Pause' : 'Play', glyph: H?.playing() ? '❚❚' : '▶' },
-  { id: 'next', label: 'Next', glyph: '»' },
-  { id: 'prev', label: 'Previous', glyph: '«' },
-  { id: 'topics', label: 'Topics', glyph: '☰', open: true },
-  { id: 'quick', label: 'Quick actions', glyph: '⚡', open: true },
-  { id: 'last', label: 'Last messages', glyph: '≡', open: true },
-  { id: 'open', label: 'Open Sheet.md', glyph: '↗' },
-  { id: 'hide', label: 'Hide bubble', glyph: '✕' },
+  { id: 'talk', label: 'Talk', icon: 'mic' },
+  { id: 'type', label: 'Type a command', icon: 'type' },
+  { id: 'stop', label: 'Stop everything', icon: 'stop' },
+  { id: 'pp', label: H?.playing() ? 'Pause' : 'Play', icon: H?.playing() ? 'pause' : 'play' },
+  { id: 'next', label: 'Next', icon: 'next' },
+  { id: 'prev', label: 'Previous', icon: 'prev' },
+  { id: 'topics', label: 'Topics', icon: 'topics', open: true },
+  { id: 'quick', label: 'Quick actions', icon: 'quick', open: true },
+  { id: 'last', label: 'Last messages', icon: 'messages', open: true },
+  { id: 'open', label: 'Open Sheet.md', icon: 'open' },
+  { id: 'hide', label: 'Hide bubble', icon: 'close' },
 ];
 const list = (title: string, items: Item[]) => { try { dev?.bubbleList(title, JSON.stringify(items)); } catch {} };
 const pushMenu = () => { try { dev?.setBubbleMenu(JSON.stringify(menu())); } catch {} };
@@ -77,15 +77,15 @@ const onAction = async (e: any) => {
     case 'hide': H.hide(); break;
     case 'topics': {
       let n: string[] = []; try { n = await H.topics(); } catch {}
-      list('Topics', n.slice(0, 8).map((x) => ({ id: 'topic:' + x, label: x, glyph: '☰' })));
+      list('Topics', n.slice(0, 8).map((x) => ({ id: 'topic:' + x, label: x, icon: 'topics' })));
       break;
     }
-    case 'last': list('Last messages', H.last().map((t) => ({ id: '', label: t, glyph: '' }))); break;
+    case 'last': list('Last messages', H.last().map((t) => ({ id: '', label: t, icon: '' }))); break;
     case 'quick': list('Quick', [
-      { id: 'q:torch', label: torchOn ? 'Flashlight off' : 'Flashlight on', glyph: '☀' },
-      { id: 'q:volup', label: 'Volume up', glyph: '+' },
-      { id: 'q:voldown', label: 'Volume down', glyph: '−' },
-      { id: 'q:timer', label: '5 minute timer', glyph: '◷' },
+      { id: 'q:torch', label: torchOn ? 'Flashlight off' : 'Flashlight on', icon: 'torch' },
+      { id: 'q:volup', label: 'Volume up', icon: 'plus' },
+      { id: 'q:voldown', label: 'Volume down', icon: 'minus' },
+      { id: 'q:timer', label: '5 minute timer', icon: 'timer' },
     ]); break;
     case 'q:torch': if (await tool('torch', { on: !torchOn })) torchOn = !torchOn; break;
     case 'q:volup': await tool('set_volume', { level: 'up' }); break;
