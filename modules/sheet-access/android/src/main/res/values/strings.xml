@@ -1,0 +1,4 @@
+<resources>
+  <string name="sheet_access_label">Sheet.md assistant</string>
+  <string name="sheet_access_desc">Lets the Sheet.md voice assistant read what is on the screen and tap, type, scroll and press Back / Home when you ask it to. It never works inside banking or payment apps and never types into password fields.</string>
+</resources>
