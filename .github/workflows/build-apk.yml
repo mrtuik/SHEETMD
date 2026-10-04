@@ -123,6 +123,9 @@ jobs:
         run: |
           mkdir -p android/app/src/main/res/drawable
           cp assets/icons/ic_tuik_notif_*.png android/app/src/main/res/drawable/ 2>/dev/null || true
+          # bubble menu icons: every other ic_tuik_*.png, in drawable-nodpi so Android does not scale the 512 px files up
+          mkdir -p android/app/src/main/res/drawable-nodpi
+          for f in assets/icons/ic_tuik_*.png; do case "$f" in *notif_*) ;; *) cp "$f" android/app/src/main/res/drawable-nodpi/ ;; esac; done
       - name: Fix duplicate android.support classes (old voice lib)
         run: |
           echo "android.useAndroidX=true" >> android/gradle.properties
