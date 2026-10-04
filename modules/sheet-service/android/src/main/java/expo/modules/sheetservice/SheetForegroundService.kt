@@ -146,7 +146,7 @@ class SheetForegroundService : Service() {
   private fun bubbleIntent() = Intent().setClassName(this, "expo.modules.sheetdevice.OverlayService")
   private fun syncBubble() {
     try {
-      val on = getSharedPreferences("sheet_device", Context.MODE_PRIVATE).getBoolean("assistant_on", true)
+      val on = getSharedPreferences("sheet_device", Context.MODE_PRIVATE).getBoolean("assistant_on2", true)
       if (on && Settings.canDrawOverlays(this)) startService(bubbleIntent()) else stopService(bubbleIntent())
     } catch (e: Exception) { }
   }
