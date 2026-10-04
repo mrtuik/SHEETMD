@@ -41,12 +41,12 @@ class SheetServiceModule : Module() {
     }
 
     // Start, or update the notification of, the foreground service
-    Function("update") { title: String, text: String, playing: Boolean, mic: Boolean ->
+    Function("update") { title: String, text: String, playing: Boolean, mic: Boolean, hold: Boolean ->
       val ctx = appContext.reactContext?.applicationContext
       if (ctx != null) {
         val i = Intent(ctx, SheetForegroundService::class.java)
           .putExtra("title", title).putExtra("text", text)
-          .putExtra("playing", playing).putExtra("mic", mic)
+          .putExtra("playing", playing).putExtra("mic", mic).putExtra("hold", hold)
         try {
           if (SheetForegroundService.running) ctx.startService(i)
           else ContextCompat.startForegroundService(ctx, i)
