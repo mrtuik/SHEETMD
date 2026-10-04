@@ -4,7 +4,9 @@ import android.animation.ValueAnimator
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -13,6 +15,7 @@ import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -30,16 +33,20 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONArray
 
 // One row of the bubble menu. The list is DRIVEN FROM JS (setBubbleMenu / bubbleList); `open` = JS will answer with a list.
-data class MenuItem(val id: String, val label: String, val glyph: String, val open: Boolean)
+// icon = file name part: assets/icons/ic_tuik_<icon>.png (copied to res/drawable-nodpi by the build). No emoji, no text glyphs.
+data class MenuItem(val id: String, val label: String, val icon: String, val open: Boolean)
 
 // The assistant bubble: the APP ICON with a state RING (idle grey / listening pulsing blue / thinking spinning arc / speaking green + wave),
 // drawn with WindowManager (TYPE_APPLICATION_OVERLAY). Started by the foreground service while Assistant mode is on.
@@ -60,7 +67,7 @@ class OverlayService : Service() {
       val a = JSONArray(json)
       (0 until a.length()).mapNotNull { i ->
         val o = a.optJSONObject(i) ?: return@mapNotNull null
-        MenuItem(o.optString("id"), o.optString("label"), o.optString("glyph"), o.optBoolean("open", false))
+        MenuItem(o.optString("id"), o.optString("label"), o.optString("icon"), o.optBoolean("open", false))
       }
     } catch (e: Exception) { emptyList() }
     fun setMenu(json: String) { menu = parse(json); main.post { inst?.menuChanged() } }
@@ -178,8 +185,9 @@ class OverlayService : Service() {
     val w = Math.min(dp(280f).toInt(), sw - dp(24f).toInt())
     val card = LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
-      background = GradientDrawable().apply { setColor(Color.parseColor("#F2161616")); cornerRadius = dp(18f) }
+      background = GradientDrawable().apply { setColor(Color.parseColor("#F2121214")); cornerRadius = dp(24f); setStroke(dp(1f).toInt(), Color.parseColor("#33FFFFFF")) }
       setPadding(dp(6f).toInt(), dp(6f).toInt(), dp(6f).toInt(), dp(6f).toInt())
+      alpha = 0f; scaleX = 0.92f; scaleY = 0.92f
       setOnTouchListener { _, e -> if (e.action == MotionEvent.ACTION_OUTSIDE) { closedAt = System.currentTimeMillis(); closePanel() }; false }
     }
     val sv = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
@@ -192,6 +200,7 @@ class OverlayService : Service() {
     try { wm.addView(card, plp) } catch (e: Exception) { panel = null; body = null; return }
     bubble?.setPanelOpen(true)
     showMenu()
+    card.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(170).setInterpolator(DecelerateInterpolator()).start()      // soft pop-in
   }
 
   fun closePanel() {
@@ -206,23 +215,63 @@ class OverlayService : Service() {
 
   fun menuChanged() { if (panel != null && panelMode == "menu") showMenu() }
 
-  private fun row(glyph: String, label: String, onClick: (() -> Unit)?, muted: Boolean = false): View {
+  private val iconCache = HashMap<String, Bitmap>()
+  // assets/icons/ic_tuik_<name>.png -> res/drawable-nodpi (build step). Decoded small (512 px -> 128 px) and tinted in code, so any one-colour PNG works.
+  private fun iconBmp(name: String): Bitmap? {
+    if (name.isEmpty()) return null
+    iconCache[name]?.let { return it }
+    val id = resources.getIdentifier("ic_tuik_$name", "drawable", packageName)
+    if (id == 0) return null
+    val b = try { BitmapFactory.decodeResource(resources, id, BitmapFactory.Options().apply { inSampleSize = 4 }) } catch (e: Exception) { null } ?: return null
+    iconCache[name] = b
+    return b
+  }
+
+  private fun chip(icon: String, tint: Int, bg: Int): View {
+    val c = FrameLayout(this).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(bg) } }
+    val bmp = iconBmp(icon)
+    if (bmp != null) c.addView(ImageView(this).apply { setImageBitmap(bmp); setColorFilter(tint); scaleType = ImageView.ScaleType.FIT_CENTER },
+      FrameLayout.LayoutParams(dp(18f).toInt(), dp(18f).toInt(), Gravity.CENTER))
+    else c.addView(View(this).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(tint) } },        // icon file not added yet: a small dot
+      FrameLayout.LayoutParams(dp(6f).toInt(), dp(6f).toInt(), Gravity.CENTER))
+    return c
+  }
+
+  private fun row(icon: String, label: String, onClick: (() -> Unit)?, muted: Boolean = false, accent: Boolean = false): View {
     val r = LinearLayout(this).apply {
       orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-      minimumHeight = dp(44f).toInt(); setPadding(dp(8f).toInt(), dp(6f).toInt(), dp(8f).toInt(), dp(6f).toInt())
+      minimumHeight = dp(48f).toInt(); setPadding(dp(8f).toInt(), dp(7f).toInt(), dp(10f).toInt(), dp(7f).toInt())
     }
+    if (icon.isNotEmpty()) r.addView(
+      chip(icon, if (accent) Color.parseColor("#FF8A80") else Color.WHITE, if (accent) Color.parseColor("#33FF5252") else Color.parseColor("#1FFFFFFF")),
+      LinearLayout.LayoutParams(dp(34f).toInt(), dp(34f).toInt()))
     r.addView(TextView(this).apply {
-      text = glyph; gravity = Gravity.CENTER; setTextColor(Color.parseColor("#8AB4F8")); setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f); typeface = Typeface.DEFAULT_BOLD
-    }, LinearLayout.LayoutParams(dp(30f).toInt(), -2))
-    r.addView(TextView(this).apply {
-      text = label; setTextColor(if (muted) Color.parseColor("#B0B0B0") else Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+      text = label; setTextColor(if (muted) Color.parseColor("#9AA0A6") else Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
       maxLines = 4; ellipsize = TextUtils.TruncateAt.END
-    }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6f).toInt() })
+    }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = if (icon.isNotEmpty()) dp(12f).toInt() else dp(4f).toInt() })
     if (onClick != null) {
-      r.background = GradientDrawable().apply { setColor(Color.TRANSPARENT); cornerRadius = dp(12f) }
+      val mask = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(14f) }
+      r.background = RippleDrawable(ColorStateList.valueOf(Color.parseColor("#33FFFFFF")), null, mask)
       r.setOnClickListener { onClick() }
     }
     return r
+  }
+
+  private fun statusText() = when (state) {
+    "listening" -> "Listening..."; "thinking" -> "Thinking..."; "speaking" -> "Speaking"; "screen" -> "Working on the screen"
+    else -> "Ready - say tuik"
+  }
+
+  private fun header(): View {
+    val h = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12f).toInt(), dp(8f).toInt(), dp(12f).toInt(), dp(8f).toInt()) }
+    h.addView(TextView(this).apply { text = "Sheet.md"; setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f); typeface = Typeface.DEFAULT_BOLD })
+    h.addView(TextView(this).apply { text = statusText(); setTextColor(Color.parseColor("#8AB4F8")); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f) })
+    return h
+  }
+
+  private fun divider(): View = View(this).also {
+    it.setBackgroundColor(Color.parseColor("#22FFFFFF"))
+    it.layoutParams = LinearLayout.LayoutParams(-1, dp(1f).toInt()).apply { setMargins(dp(8f).toInt(), 0, dp(8f).toInt(), dp(4f).toInt()) }
   }
 
   private fun fill(items: List<View>) {
@@ -234,28 +283,29 @@ class OverlayService : Service() {
   private fun showMenu() {
     panelMode = "menu"
     setFocusable(false)
-    val items = if (menu.isEmpty()) listOf(row("", "Menu is loading…", null, true)) else menu.map { m ->
-      row(m.glyph, m.label, {
+    val rows = if (menu.isEmpty()) listOf(row("", "Menu is loading...", null, true)) else menu.map { m ->
+      row(m.icon, m.label, {
         when (m.id) {
           "type" -> showType()
           "open" -> { closePanel(); openAppNow() }
           else -> {
             onAction?.invoke(m.id, "")
-            if (m.open) fill(listOf(row("", "Loading…", null, true))) else closePanel()
+            if (m.open) fill(listOf(row("", "Loading...", null, true))) else closePanel()
           }
         }
-      })
+      }, false, m.id == "stop" || m.id == "hide")
     }
-    fill(items)
+    fill(listOf(header(), divider()) + rows)
   }
 
   fun showList(title: String, items: List<MenuItem>) {
     if (panel == null) return
     panelMode = "list"
     val rows = ArrayList<View>()
-    rows.add(row("‹", "Back · $title", { showMenu() }, true))
+    rows.add(row("back", title, { showMenu() }, false))
+    rows.add(divider())
     if (items.isEmpty()) rows.add(row("", "Nothing here yet.", null, true))
-    items.forEach { m -> rows.add(row(m.glyph, m.label, if (m.id.isEmpty()) null else ({ onAction?.invoke(m.id, ""); closePanel() }), m.id.isEmpty())) }
+    items.forEach { m -> rows.add(row(m.icon, m.label, if (m.id.isEmpty()) null else ({ onAction?.invoke(m.id, ""); closePanel() }), m.id.isEmpty())) }
     fill(rows)
   }
 
@@ -264,7 +314,7 @@ class OverlayService : Service() {
     val et = EditText(this).apply {
       hint = "Type a command…"; setHintTextColor(Color.parseColor("#888888")); setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
       setSingleLine(true); imeOptions = EditorInfo.IME_ACTION_SEND; inputType = InputType.TYPE_CLASS_TEXT
-      background = GradientDrawable().apply { setColor(Color.parseColor("#2A2A2A")); cornerRadius = dp(12f) }
+      background = GradientDrawable().apply { setColor(Color.parseColor("#26FFFFFF")); cornerRadius = dp(16f) }
       setPadding(dp(12f).toInt(), dp(10f).toInt(), dp(12f).toInt(), dp(10f).toInt())
       setOnEditorActionListener { v, id, _ ->
         if (id == EditorInfo.IME_ACTION_SEND) {
@@ -274,7 +324,7 @@ class OverlayService : Service() {
         } else false
       }
     }
-    fill(listOf(row("‹", "Back", { showMenu() }, true), et))
+    fill(listOf(row("back", "Type a command", { showMenu() }, false), divider(), et))
     setFocusable(true)                                          // the keyboard needs a focusable window: only while this field is open
     et.requestFocus()
     et.postDelayed({ try { (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(et, InputMethodManager.SHOW_IMPLICIT) } catch (e: Exception) {} }, 120)
@@ -294,6 +344,8 @@ class OverlayService : Service() {
     val h = Math.min(b.measuredHeight + dp(12f).toInt(), dp(360f).toInt())
     val bs = dp(56f).toInt(); val gap = dp(6f).toInt(); val edge = dp(6f).toInt()
     plp.height = h
+    val below = lp.y + bs / 2 < sh / 2
+    p.pivotX = if (lp.x + bs / 2 < sw / 2) 0f else w.toFloat(); p.pivotY = if (below) 0f else h.toFloat()
     plp.x = (if (lp.x + bs / 2 < sw / 2) lp.x else lp.x + bs - w).coerceIn(edge, Math.max(edge, sw - w - edge))
     plp.y = (if (lp.y + bs / 2 < sh / 2) lp.y + bs + gap else lp.y - h - gap).coerceIn(edge, Math.max(edge, sh - h - edge))
     try { wm.updateViewLayout(p, plp) } catch (e: Exception) {}
@@ -301,7 +353,12 @@ class OverlayService : Service() {
 
   fun applyVisibility() {
     val show = !appFg
+    val comesBack = show && bubble?.visibility != View.VISIBLE
     bubble?.visibility = if (show) View.VISIBLE else View.GONE
+    if (comesBack) bubble?.let { b ->                                   // the bubble pops back when you leave the app
+      b.alpha = 0f; b.scaleX = 0.5f; b.scaleY = 0.5f
+      b.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(OvershootInterpolator(1.6f)).start()
+    }
     if (!show) { toastView?.visibility = View.GONE; handler.removeCallbacks(hideToast); closePanel() }    // the panel follows the bubble
     bubble?.setMode(state)
   }
