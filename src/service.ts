@@ -1,8 +1,9 @@
 import { requireNativeModule } from 'expo';
 const M: any = (() => { try { return requireNativeModule('SheetService'); } catch { return null; } })();
 
-export const updateService = (title: string, text: string, playing: boolean, mic: boolean) => {
-  try { M?.update(title, text, playing, mic); } catch {}
+// hold = Assistant mode is on: the service keeps the microphone type so the bubble / "tuik" still hear you in the background
+export const updateService = (title: string, text: string, playing: boolean, mic: boolean, hold = false) => {
+  try { M?.update(title, text, playing, mic, hold); } catch {}
 };
 export const stopService = () => { try { M?.stop(); } catch {} };
 // Silences the recognizer's start/stop "tung tung" beep (notification + system streams) while the mic is on
