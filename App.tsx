@@ -1177,7 +1177,7 @@ function Main() {
         <View style={st.tpWrap}>
           {showTopics && (
             <View style={st.tpPanel}>
-              <TextInput style={st.tpSearch} value={topicQ} onChangeText={setTopicQ} placeholder="Search topics" placeholderTextColor="#000000" autoCapitalize="none" autoCorrect={false} />
+              <TextInput style={st.tpSearch} value={topicQ} onChangeText={setTopicQ} placeholder="Search topics" placeholderTextColor="#A3A3A3" autoCapitalize="none" autoCorrect={false} />
               <ScrollView style={{ maxHeight: Math.min(300, Math.round(winH * 0.38)) }} nestedScrollEnabled keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
                 {(() => {
                   const q = topicQ.trim().toLowerCase();
@@ -1820,7 +1820,7 @@ function Main() {
             </View>
             <View style={{ paddingVertical: 8, gap: 6 }}>
               <Text style={st.val}>Apps to announce (names, comma separated; empty = none)</Text>
-              <TextInput style={st.tpSearch} value={announceApps} onChangeText={saveAnnounceApps} placeholder="WhatsApp, Messages" placeholderTextColor="#000000" autoCapitalize="none" autoCorrect={false} />
+              <TextInput style={st.tpSearch} value={announceApps} onChangeText={saveAnnounceApps} placeholder="WhatsApp, Messages" placeholderTextColor="#A3A3A3" autoCapitalize="none" autoCorrect={false} />
             </View>
             {!notifOk && <TouchableOpacity style={st.line} onPress={notifOpenSettings}><Text style={[st.txt, { flex: 1 }]}>Allow notification access</Text></TouchableOpacity>}
             <View style={st.sep} />
@@ -2086,7 +2086,7 @@ const st = StyleSheet.create({
   ptLine: { color: C.tx, fontSize: 15.5, lineHeight: 24, marginBottom: 4 },
   actRow: { flexDirection: 'row', alignItems: 'center', gap: 2, paddingTop: 4, paddingLeft: 0 },
   actBtn: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
-  actOn: { borderWidth: 1.5, borderColor: C.tx },
+  actOn: { backgroundColor: C.surf },
   cardHead: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2 },
   cardT: { flex: 1, fontWeight: '700', fontSize: 16, color: C.tx },
   ptRow: { flexDirection: 'row', gap: 10, paddingVertical: 7, paddingHorizontal: 8, borderRadius: 10 },
@@ -2102,12 +2102,12 @@ const st = StyleSheet.create({
   hint: { color: C.sec, fontSize: 14, lineHeight: 20, fontStyle: 'italic', marginTop: 2 },
 
   tpWrap: { alignItems: 'flex-end', marginBottom: 8 },
-  tpBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, height: 38, paddingHorizontal: 14, borderRadius: 19, backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.tx,
+  tpBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, height: 38, paddingHorizontal: 14, borderRadius: 19, backgroundColor: C.bg, borderWidth: 1, borderColor: C.bd,
     elevation: 5, shadowColor: '#000', shadowOpacity: 0.12, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } },
   tpBtnT: { fontSize: 14, fontWeight: '700', color: C.tx },
-  tpPanel: { width: '86%', backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.tx, borderRadius: 20, padding: 10, marginBottom: 8, gap: 8,
+  tpPanel: { width: '86%', backgroundColor: C.bg, borderWidth: 1, borderColor: C.bd, borderRadius: 20, padding: 10, marginBottom: 8, gap: 8,
     elevation: 8, shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 12, shadowOffset: { width: 0, height: 3 } },
-  tpSearch: { height: 40, borderWidth: 1.5, borderColor: C.tx, borderRadius: 14, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.bg },
+  tpSearch: { height: 40, borderRadius: 14, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.surf },
   tpRow: { paddingVertical: 11, paddingHorizontal: 12, borderRadius: 12 },
   tpRowT: { fontSize: 15, fontWeight: '600', color: C.tx },
   tpEmpty: { fontSize: 14, color: C.tx, padding: 12 },
@@ -2138,7 +2138,7 @@ const st = StyleSheet.create({
   promoT: { flex: 1, fontSize: 16, fontWeight: '700', color: C.tx },
   promoX: { width: 30, height: 30, alignItems: 'center', justifyContent: 'center' },
   promoRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 },
-  promoBtn: { flex: 1, height: 44, borderRadius: 22, borderWidth: 1.5, borderColor: '#CFCDC6', backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
+  promoBtn: { flex: 1, height: 44, borderRadius: 22, borderWidth: 1, borderColor: C.bd, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
   promoBtnT: { fontSize: 16, fontWeight: '600', color: C.tx },
   promoGhost: { height: 44, paddingHorizontal: 12, alignItems: 'center', justifyContent: 'center' },
 
@@ -2166,7 +2166,7 @@ const st = StyleSheet.create({
   line: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, minHeight: 56 },
   sep: { height: 1, backgroundColor: C.bd },
   val: { fontSize: 13, color: C.sec, marginTop: 1 },
-  step: { width: 40, height: 40, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
+  step: { width: 40, height: 40, borderRadius: 20, borderWidth: 1, borderColor: C.bd, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
   seg: { flexDirection: 'row', backgroundColor: C.surf, borderRadius: 16, padding: 4 },
   segI: { flex: 1, height: 40, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
   segOn: { backgroundColor: C.acc },
@@ -2180,16 +2180,16 @@ const st = StyleSheet.create({
   mTile: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center' },
   badge: { paddingHorizontal: 10, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
   badgeT: { fontSize: 12, fontWeight: '700' },
-  dd: { height: 46, borderWidth: 1.5, borderColor: C.tx, borderRadius: 14, paddingHorizontal: 14, backgroundColor: C.bg, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  dd: { height: 46, borderWidth: 1, borderColor: C.bd, borderRadius: 14, paddingHorizontal: 14, backgroundColor: C.surf, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   ddT: { flex: 1, fontSize: 15, fontWeight: '600', color: C.tx },
-  ddList: { borderWidth: 1.5, borderColor: C.tx, borderRadius: 14, backgroundColor: C.bg, overflow: 'hidden' },
+  ddList: { borderWidth: 1, borderColor: C.bd, borderRadius: 14, backgroundColor: C.bg, overflow: 'hidden' },
   ddItem: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, paddingHorizontal: 14 },
   keyRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  keyInput: { flex: 1, height: 46, borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.bg },
-  miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1.5, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
+  keyInput: { flex: 1, height: 46, borderWidth: 1, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, fontSize: 15, color: C.tx, backgroundColor: C.bg },
+  miniBtn: { height: 40, paddingHorizontal: 18, borderRadius: 20, borderWidth: 1, borderColor: C.bd, alignItems: 'center', justifyContent: 'center' },
   dlgBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'center', paddingHorizontal: 24 },
   dlg: { backgroundColor: C.bg, borderRadius: 20, padding: 18, gap: 14, elevation: 16 },
-  dlgInput: { borderWidth: 1.5, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.tx },
+  dlgInput: { borderWidth: 1, borderColor: C.bd, borderRadius: 12, paddingHorizontal: 12, height: 48, fontSize: 16, color: C.tx },
   dlgRow: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
   dlgBtn: { height: 42, paddingHorizontal: 20, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surf },
   cmdRow: { paddingVertical: 10 },
