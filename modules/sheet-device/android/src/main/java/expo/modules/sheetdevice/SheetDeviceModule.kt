@@ -226,7 +226,7 @@ class SheetDeviceModule : Module() {
       val c = ctx
       if (c != null) go(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + c.packageName)))
     }
-    Function("isAssistantOn") { prefs()?.getBoolean("assistant_on", false) ?: false }
+    Function("isAssistantOn") { prefs()?.getBoolean("assistant_on", true) ?: true }       // default ON: the bubble needs no manual switch
     // ON only saves the choice: the foreground service (SheetService.update from JS) starts the bubble. OFF removes it at once.
     Function("setAssistantMode") { on: Boolean ->
       prefs()?.edit()?.putBoolean("assistant_on", on)?.apply()
@@ -236,7 +236,7 @@ class SheetDeviceModule : Module() {
     Function("bubbleState") { s: String -> OverlayService.applyState(s) }
     Function("bubbleToast") { heard: String, reply: String -> OverlayService.showToast(heard, reply) }
     // bubble menu: JS owns the content. setBubbleMenu = the main list; bubbleList = a sub-list (topics, quick, last messages)
-    // both take JSON [{id, label, glyph, open?}]
+    // both take JSON [{id, label, icon, open?}]
     Function("setBubbleMenu") { json: String -> OverlayService.setMenu(json) }
     Function("bubbleList") { title: String, json: String -> OverlayService.showList(title, json) }
   }
