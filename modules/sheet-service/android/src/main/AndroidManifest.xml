@@ -7,6 +7,7 @@
   <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
   <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
   <application>
+    <service android:name="expo.modules.sheetservice.SheetKeepAliveService" android:exported="false"/>
     <service
       android:name="expo.modules.sheetservice.SheetForegroundService"
       android:exported="false"
