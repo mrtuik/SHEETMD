@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Modal, StyleSheet, ScrollView, Pressable, Switch,
   Platform, PermissionsAndroid, AppState, StatusBar, Linking, Image, Keyboard, Alert, useWindowDimensions,
-  Animated, Easing, ActivityIndicator, ToastAndroid, Share,
+  Animated, Easing, ActivityIndicator, ToastAndroid, Share, AppRegistry,
 } from 'react-native';
 import LottieView from 'lottie-react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -72,6 +72,9 @@ const COMMANDS: [string, string][] = [
 const Icon = ({ n, size = 22, color = C.tx, style }: { n: IconName; size?: number; color?: string; style?: any }) => (
   <Image source={ICONS[n]} style={[{ width: size, height: size, tintColor: color }, style]} resizeMode="contain" />
 );
+
+// Keeps JS timers running while the app is in the background (started by SheetForegroundService -> SheetKeepAliveService). Never resolves on purpose.
+AppRegistry.registerHeadlessTask('SheetKeepAlive', () => () => new Promise<void>(() => {}));
 
 export default function App() {
   return <SafeAreaProvider><Main /></SafeAreaProvider>;
