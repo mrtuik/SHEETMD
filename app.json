@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "Sheet.md",
+    "slug": "sheet-md",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "newArchEnabled": false,
+    "android": {
+      "package": "com.metuik.sheetmd",
+      "permissions": [
+        "RECORD_AUDIO",
+        "WAKE_LOCK",
+        "CALL_PHONE",
+        "READ_CONTACTS",
+        "SEND_SMS",
+        "ACCESS_COARSE_LOCATION",
+        "SYSTEM_ALERT_WINDOW",
+        "com.android.alarm.permission.SET_ALARM"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#FFFFFF"
+      }
+    },
+    "plugins": [
+      "expo-sqlite",
+      [
+        "@react-native-voice/voice",
+        {
+          "microphonePermission": "Sheet.md needs the mic for voice commands."
+        }
+      ],
+      "./plugins/withSpeechQueries"
+    ],
+    "icon": "./assets/icon.png"
+  }
+}
