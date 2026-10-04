@@ -122,7 +122,10 @@ class SheetForegroundService : Service() {
     var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
     // Android 14: the microphone service type throws a SecurityException without the RECORD_AUDIO permission -> only ask for it when granted
     val micGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-    if ((intent?.getBooleanExtra("mic", false) ?: false) && micGranted && Build.VERSION.SDK_INT >= 30) {
+    // "hold" = Assistant mode is on: keep the microphone type ALWAYS (it can only be gained while the app is visible; Android 14 refuses it when
+    // the service is started from the background, and then the mic hears nothing). So the app, once opened, keeps the mic for the bubble / "tuik".
+    val wantMic = (intent?.getBooleanExtra("mic", false) ?: false) || (intent?.getBooleanExtra("hold", false) ?: false)
+    if (wantMic && micGranted && Build.VERSION.SDK_INT >= 30) {
       type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
     }
     try {
@@ -141,7 +144,7 @@ class SheetForegroundService : Service() {
   private fun bubbleIntent() = Intent().setClassName(this, "expo.modules.sheetdevice.OverlayService")
   private fun syncBubble() {
     try {
-      val on = getSharedPreferences("sheet_device", Context.MODE_PRIVATE).getBoolean("assistant_on", false)
+      val on = getSharedPreferences("sheet_device", Context.MODE_PRIVATE).getBoolean("assistant_on", true)
       if (on && Settings.canDrawOverlays(this)) startService(bubbleIntent()) else stopService(bubbleIntent())
     } catch (e: Exception) { }
   }
