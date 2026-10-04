@@ -226,10 +226,10 @@ class SheetDeviceModule : Module() {
       val c = ctx
       if (c != null) go(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + c.packageName)))
     }
-    Function("isAssistantOn") { prefs()?.getBoolean("assistant_on", true) ?: true }       // default ON: the bubble needs no manual switch
+    Function("isAssistantOn") { prefs()?.getBoolean("assistant_on2", true) ?: true }       // default ON: the bubble needs no manual switch
     // ON only saves the choice: the foreground service (SheetService.update from JS) starts the bubble. OFF removes it at once.
     Function("setAssistantMode") { on: Boolean ->
-      prefs()?.edit()?.putBoolean("assistant_on", on)?.apply()
+      prefs()?.edit()?.putBoolean("assistant_on2", on)?.apply()
       val c = ctx
       if (!on && c != null) c.stopService(Intent().setClassName(c, "expo.modules.sheetdevice.OverlayService"))
     }
