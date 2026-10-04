@@ -31,7 +31,7 @@ import { pickAndImport } from './src/importer';
 import { startListening, stopListening, restartListening, markHandled, subscribeLevel, subscribeLive } from './src/listener';
 import { updateService, stopService, onServiceAction, batteryUnrestricted, askBatteryUnrestricted } from './src/service';
 import { splitWake } from './src/wake';
-import { Stt, sttState, subscribeStt, initStt, downloadStt, deleteStt, setSttGoogle, setSttAec, setSttGain } from './src/stt';
+import { Stt, sttActive, sttState, subscribeStt, initStt, downloadStt, deleteStt, setSttGoogle, setSttAec, setSttGain } from './src/stt';
 import { ICONS, IconName } from './src/icons';
 import {
   VOICES, ttsState, subscribeTts, initTts, startVoiceDownload,
@@ -257,6 +257,10 @@ function Main() {
       await loadGemini(); setHasKey(hasGeminiKey()); setGemModel(gem.model);
       await loadCloud(); setProv(cloud.provider); syncDrafts(cloud.provider); setCloudTick((n) => n + 1);
       setAssistOn(assistantOn()); setOverlayOk(overlayGranted()); listFacts().then(setFacts).catch(() => {});
+      if (assistantOn() && !overlayGranted() && (await getMeta('overlay_asked').catch(() => '')) !== '1') {      // the bubble is ON by default: ask for its one permission once
+        setMeta('overlay_asked', '1').catch(() => {});
+        Alert.alert('Floating bubble', "The bubble needs 'Display over other apps'. Turn it on for Sheet.md on the next screen, then come back.", [{ text: 'Later', style: 'cancel' }, { text: 'Open settings', onPress: askOverlay }]);
+      }
       setSmartOn((await getMeta('smart').catch(() => '1')) !== '0');
       setFastTopic((await getMeta('fast_topic').catch(() => '1')) !== '0');
       setAnnounceOn((await getMeta('announce').catch(() => '')) === '1'); setAnnounceApps((await getMeta('announce_apps').catch(() => '')) || ''); setNotifOk(notifEnabled());
@@ -915,6 +919,12 @@ function Main() {
   const listeningRef = useRef(false); listeningRef.current = listening;
   useEffect(() => onBubbleTap(() => { const was = listeningRef.current; micRef.current(); if (!was) armRef.current(14000); }), []);
   useEffect(() => { bubbleListening(listening); }, [listening]);
+  // Assistant mode is ON by default: the mic starts by itself when the app opens, so "tuik" works from the background without touching the bubble
+  useEffect(() => {
+    if (!assistantOn()) return;
+    const t = setTimeout(() => { if (!listeningRef.current && (sttState.google || sttActive())) micRef.current(); }, 2500);
+    return () => clearTimeout(t);
+  }, []);
   // bubble menu (chevron on the bubble): registered once; every action calls the same functions as the voice commands
   useEffect(() => registerBubbleMenu({
     talk: () => { const was = listeningRef.current; micRef.current(); if (!was) armRef.current(14000); },
@@ -988,8 +998,8 @@ function Main() {
     const pt = s.points[s.idx];
     const text = (s.status === 'idle' && working) ? working : s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : assistOn && !listening ? 'Assistant ready: tap the bubble' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
       : `${s.topic} — point ${pt?.n ?? 0}/${s.points.length}${s.status === 'paused' ? ' (paused)' : ''}`;
-    updateService('Sheet.md', text, s.status === 'reading', listening);
-  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn, !!working, assistOn]);
+    updateService('Sheet.md', text, s.status === 'reading', listening, assistOn);      // assistOn = keep the microphone type: the bubble / "tuik" hear you in the background
+  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn, !!working, assistOn, overlayOk]);
 
   // keep the point being read in view (stops as soon as you scroll yourself)
   useEffect(() => {
