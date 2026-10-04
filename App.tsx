@@ -786,6 +786,14 @@ function Main() {
   // ---- WAKE WORD "tuik": app in background / phone locked -> a command only counts after "tuik" -------------------------
   const [awakeUI, setAwakeUI] = useState(false);
   const wakeRef = useRef<{ until: number; paused: boolean; timer: any; fresh: number }>({ until: 0, paused: false, timer: null, fresh: 0 });
+  // SESSION: say "tuik" ONCE in the background and for the next 5 minutes every command works without "tuik" (each command renews it).
+  // "tuik off" / "agent off" ends it. Not used while the app reads word by word (the mic would hear its own words).
+  const SESSION_MS = 5 * 60 * 1000;
+  const sessionRef = useRef(0);
+  const sessionTimer = useRef<any>(null);
+  const [sessionOn, setSessionOn] = useState(false);
+  const endSession = (say = true) => { clearTimeout(sessionTimer.current); sessionRef.current = 0; setSessionOn(false); if (say) bubbleReply('Session over: say tuik'); };
+  const keepSession = () => { sessionRef.current = Date.now() + SESSION_MS; setSessionOn(true); clearTimeout(sessionTimer.current); sessionTimer.current = setTimeout(() => endSession(), SESSION_MS + 500); };
   const disarm = (resumeReading: boolean) => {
     const w = wakeRef.current; clearTimeout(w.timer); w.timer = null;
     const was = w.paused; w.until = 0; w.paused = false; setAwakeUI(false);
@@ -809,6 +817,8 @@ function Main() {
     const wordMode = R.state.wordGap > 0 && R.state.status === 'reading';
     const bg = (R.state.wakeOn && AppState.currentState !== 'active') || wordMode;
     const clearArm = () => { clearTimeout(w.timer); w.timer = null; w.paused = false; w.until = 0; setAwakeUI(false); };
+    if (cut.some((c) => c.hit && /^(off|band|bondho)\b/i.test(c.rest || '')) || alts.some((a) => /\b(agent|session)\s+(off|band|bondho)\b/i.test(a))) { endSession(false); bubbleReply('Session off'); disarm(false); return null; }
+    if (cut.some((c) => c.hit) && R.state.wakeOn && AppState.currentState !== 'active' && !wordMode) keepSession();     // "tuik" in the background opens a session
     const withRest = cut.filter((c) => c.hit && c.rest).map((c) => c.rest);
     if (withRest.length) {                                           // "tuik pause" / "...reading tuik pause"
       const slowFast = withRest.some((r) => ['slower', 'faster'].includes(parse(r).t));
@@ -824,8 +834,10 @@ function Main() {
       return alts.filter(Boolean).length ? alts : null;
     }
     const talking = !!choicesRef.current || !!qRef.current;          // options waiting / question being dictated: already in a conversation
-    if (Date.now() < w.until || talking) {
+    const inSession = Date.now() < sessionRef.current && !wordMode;
+    if (Date.now() < w.until || inSession || talking) {
       const known = alts.some((a) => parse(a).t !== 'unknown');
+      if (known && inSession) keepSession();                          // a command renews the 5 minutes
       if (known) {
         const slowFast = alts.some((a) => ['slower', 'faster'].includes(parse(a).t));
         const resumeAfter = slowFast && w.paused;
@@ -840,7 +852,7 @@ function Main() {
   // and never when it is the app's own voice (reading, a spoken reply) or a lone word: so room noise can never start a model call.
   const agentVoice = (t: string) => {
     const w = wakeRef.current;
-    const called = Date.now() < w.until || Date.now() - w.fresh < 4000;
+    const called = Date.now() < w.until || Date.now() - w.fresh < 4000 || Date.now() < sessionRef.current;
     if (!called || !agentReady() || choicesRef.current || qRef.current || choiceSpeaking.current) return;
     if (ttsState.activeSpeaker !== 'none' || ownVoice(t) || heardSelf(t) || echoOfReply(t) || !looksLikeRequest(t)) return;
     disarm(false);
@@ -996,10 +1008,10 @@ function Main() {
   useEffect(() => {
     if (!listening && s.status === 'idle' && !working && !assistOn) { stopService(); return; }      // Assistant mode keeps the service (and the bubble) alive
     const pt = s.points[s.idx];
-    const text = (s.status === 'idle' && working) ? working : s.status === 'idle' ? (awakeUI ? 'Listening… say your command' : assistOn && !listening ? 'Assistant ready: tap the bubble' : s.wakeOn ? 'Say “tuik” then a command' : 'Listening for commands')
+    const text = (s.status === 'idle' && working) ? working : s.status === 'idle' ? (sessionOn ? 'Session on · just say your command' : awakeUI ? 'Listening… say your command' : assistOn && !listening ? 'Ready · tap the bubble' : s.wakeOn ? 'Listening · say “tuik”' : 'Listening for commands')
       : `${s.topic} — point ${pt?.n ?? 0}/${s.points.length}${s.status === 'paused' ? ' (paused)' : ''}`;
     updateService('Sheet.md', text, s.status === 'reading', listening, assistOn);      // assistOn = keep the microphone type: the bubble / "tuik" hear you in the background
-  }, [s.status, s.idx, s.topic, listening, awakeUI, s.wakeOn, !!working, assistOn, overlayOk]);
+  }, [s.status, s.idx, s.topic, listening, awakeUI, sessionOn, s.wakeOn, !!working, assistOn, overlayOk]);
 
   // keep the point being read in view (stops as soon as you scroll yourself)
   useEffect(() => {
